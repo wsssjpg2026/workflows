@@ -1,0 +1,8 @@
+{
+  "name": "workflows",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test spec-delivery/workflow.test.ts"
+  }
+}

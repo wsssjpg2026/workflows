@@ -69,6 +69,16 @@ L1生成的`ExecutionPlan`包含`capabilities:{framework,mainModel,modelRouting,
 
 检查、清理等确定性 job 使用受控命令执行，不占用一个虚构的“模型角色”。所有真实模型工作包括计划复核、作者双轴自检、独立五路审查与置信度复核，都显式派发并计入预算。
 
+## 运行单元测试
+
+在仓库根执行：
+
+```bash
+node --test spec-delivery/workflow.test.ts
+```
+
+需要 Node.js 24+：测试与被测的 `core.ts` 依赖原生类型剥离（type stripping）直接运行 `.ts`，无需预编译或安装额外依赖。当前共 16 项测试，覆盖 `core.ts` 的状态转换（派发、资源预留、候选 SHA 门禁、审查置信度、CI 边界与恢复）。
+
 ## 完成与限制
 
 流程遵循依赖调度，先计划与实现，再进行作者自检、独立 review/修复循环、fresh 完整审查和独立验收。冲突修复或基线更新后，重新自检、验证和审查；只有当前候选达到关闭工单条件才合并。

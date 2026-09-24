@@ -17,6 +17,7 @@ export * from './spec-delivery/core.ts';
 
 const home = path.dirname(fileURLToPath(import.meta.url));
 const rolesPath = path.join(home, 'spec-delivery', 'roles.md');
+const workflowVersion = '0.1.0';
 const active = (j: engine.Job) => j.status === 'leased' || j.status === 'running';
 const sha = (x: string) => createHash('sha256').update(x).digest('hex');
 function read<T>(file: string): T { return JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -278,7 +279,8 @@ function renderZcode(s: engine.State, statePath: string) {
 async function main(argv: string[]) {
   const [op, file, extra, fourth] = argv;
   if (!op || op === 'help') return { workflow: 'spec-delivery', input: ['spec', 'targetBranch', 'models.L1', 'models.L2', 'models.L3'],
-    readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['init <input.json>', 'inspect <state>', 'plan <state> <plan.json>', 'next <state>', 'bind <state> <jobId> <binding.json>', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'resolve <state> <decisions.json>', 'resume <state>', 'zcode <state>'] };
+    readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['init <input.json>', 'inspect <state>', 'plan <state> <plan.json>', 'next <state>', 'bind <state> <jobId> <binding.json>', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'resolve <state> <decisions.json>', 'resume <state>', 'zcode <state>', 'version'] };
+  if (op === 'version') return { workflow: 'spec-delivery', version: workflowVersion };
   engine.ensure(file, '缺少输入文件/状态路径');
   if (op === 'init') return initialize(read<engine.Inputs>(file));
   if (op === 'execute') { engine.ensure(extra, '需要 command jobId'); return executeCommand(path.resolve(file), extra); }

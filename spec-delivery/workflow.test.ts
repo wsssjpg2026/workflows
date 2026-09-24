@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import * as e from './core.ts';
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function fixture(human = false): e.State {
   const s: e.State = { schema: 1, id: 'isolated-test', revision: 0,
@@ -155,4 +160,19 @@ test('对账保留用户暂停状态，不自动启动资源清理', () => {
   t.phase='done'; t.worktree='/fixture/worktree'; s.tickets.push(t); s.facts.issueStates[100]='CLOSED';
   s.specAudit={model:'large',complete:true,status:'complete',base:'A',evidencePath:'/fixture'}; s.status='paused';
   e.reconcileFacts(s,structuredClone(s.facts)); assert.equal(s.status,'paused'); assert.throws(()=>e.reserve(s));
+});
+test('version 子命令输出 workflow 与 version 字段且退出码为 0', () => {
+  const r = spawnSync(process.execPath, ['spec-delivery.workflow.ts', 'version'], { cwd: repoRoot, encoding: 'utf8' });
+  assert.equal(r.status, 0);
+  const parsed = JSON.parse(r.stdout);
+  assert.equal(parsed.workflow, 'spec-delivery');
+  assert.equal(typeof parsed.version, 'string');
+  assert.ok(parsed.version.length > 0);
+});
+test('help 的 commands 列表包含 version', () => {
+  const r = spawnSync(process.execPath, ['spec-delivery.workflow.ts', 'help'], { cwd: repoRoot, encoding: 'utf8' });
+  assert.equal(r.status, 0);
+  const parsed = JSON.parse(r.stdout);
+  assert.ok(Array.isArray(parsed.commands));
+  assert.ok(parsed.commands.includes('version'));
 });

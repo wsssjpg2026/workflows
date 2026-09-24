@@ -48,6 +48,7 @@ TypeScript 核心维护依赖、持久化状态、派发、资源预留和候选
 | `resolve <state> <decisions.json>` | L1用新事实和持久交接解除无在途任务的局部阻断，回到认领或重规划 |
 | `resume <state>` | 用户明确要求继续后，先核对在途任务，再恢复父级调度；不自动解除工单阻断 |
 | `zcode <state>` | 将已预留的同模型agent jobs生成原生批次脚本和 `CreateWorkflow` 参数；该命令本身不启动ZCode |
+| `version` | 输出工作流标识与版本号的 JSON，核对当前交付包版本；不接收状态文件参数 |
 
 表中 `<entry>` 指相邻的 TS 入口；后续各子命令同样由该入口执行。`next` 返回 `jobs[]` 和 `packetPath`；主控读取packet，按其 `executor` 分别执行自身认领、真实模型派发或 `execute`。Result与action对照见 [角色回执](roles.md#结果回执与动作字段)，无需用户手填。
 
@@ -77,7 +78,7 @@ L1生成的`ExecutionPlan`包含`capabilities:{framework,mainModel,modelRouting,
 node --test spec-delivery/workflow.test.ts
 ```
 
-需要 Node.js 24+：测试与被测的 `core.ts` 依赖原生类型剥离（type stripping）直接运行 `.ts`，无需预编译或安装额外依赖。当前共 16 项测试，覆盖 `core.ts` 的状态转换（派发、资源预留、候选 SHA 门禁、审查置信度、CI 边界与恢复）。
+需要 Node.js 24+：测试与被测的 `core.ts` 依赖原生类型剥离（type stripping）直接运行 `.ts`，无需预编译或安装额外依赖。当前共 18 项测试：16 项覆盖 `core.ts` 的状态转换（派发、资源预留、候选 SHA 门禁、审查置信度、CI 边界与恢复），2 项为 CLI 子进程测试，覆盖入口的 `version` 与 `help` 子命令输出。
 
 ## 完成与限制
 

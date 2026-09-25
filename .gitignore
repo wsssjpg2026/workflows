@@ -1,0 +1,7 @@
+# Node 依赖（任意层级）
+node_modules/
+
+# 仓库根运行时产物（根目录锚定，不影响 .agents/ 下其它内容）
+/.agents/workflow-runs/
+/.agents/worktrees/
+/.agents/harness-test/

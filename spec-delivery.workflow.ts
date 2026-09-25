@@ -39,8 +39,8 @@ function localHead(t: engine.Ticket) { return git(t.worktree, 'rev-parse', 'HEAD
 function clean(t: engine.Ticket) { return git(t.worktree, 'status', '--porcelain') === ''; }
 function allowCompletion(s: engine.State) { engine.ensure(s.status !== 'retired', '已退役运行不能接收执行结果'); }
 function requireProtocol(s: engine.State) {
-  engine.ensure(s.protocol === 2, '旧版运行须先核对并停止在途任务，再执行 upgrade；inspect/metrics 可直接读取');
-  engine.ensure(s.status !== 'retired', '运行已退役；只允许 inspect/metrics，保留账本和资源');
+  engine.ensure(s.protocol === 2, '旧版运行须先核对并停止在途任务，再执行 upgrade；inspect/metrics/summary 可直接读取');
+  engine.ensure(s.status !== 'retired', '运行已退役；只允许 inspect/metrics/summary，保留账本和资源');
 }
 function lock(file: string) {
   const dir = file + '.lock';
@@ -85,23 +85,50 @@ function archiveResult(statePath:string,j:engine.Job) {
   const file=resultPaths(statePath,j.id).result;
   if(j.result && !fs.existsSync(file))write(file,j.result);
 }
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
 /**
- * 离线只读投影：先核对路径指向可读的普通文件，再读文件、解析、校验 schema，最后复用纯函数 summarize。
+ * schema:1 账本的形状门禁：只放行 summarize 实际读取且类型正确的字段，
+ * 避免对合法 JSON 但形状损坏（截断、改写）的账本输出编造的摘要。
+ * 类型不符一律抛出，由统一入口转成非零退出；不做逐字段枚举式的完整校验。
+ */
+function ensureSummaryShape(raw: Record<string, unknown>): engine.State {
+  const bad = (detail: string): never => { throw new Error(`状态文件结构不符合 schema 1：${detail}`); };
+  if (typeof raw.spec !== 'number') bad('spec 必须是数字');
+  if (typeof raw.status !== 'string' || !raw.status) bad('status 必须是非空字符串');
+  if (!isRecord(raw.inputs) || typeof raw.inputs.targetBranch !== 'string') bad('inputs.targetBranch 必须是字符串');
+  if (!Array.isArray(raw.tickets)) bad('tickets 必须是数组');
+  for (const t of raw.tickets) if (!isRecord(t) || typeof t.phase !== 'string') bad('tickets 的元素必须是带字符串 phase 的对象');
+  if (!Array.isArray(raw.jobs)) bad('jobs 必须是数组');
+  for (const j of raw.jobs) if (!isRecord(j) || typeof j.status !== 'string') bad('jobs 的元素必须是带字符串 status 的对象');
+  if (raw.validationOwner !== undefined && raw.validationOwner !== null && typeof raw.validationOwner !== 'string') bad('validationOwner 必须是字符串');
+  return raw as unknown as engine.State;
+}
+/**
+ * 离线只读投影：先按真实故障分类核对路径与可读性，再读文件、解析、校验 schema 与形状，最后复用纯函数 summarize。
  * 不取锁、不调用 gh/git、不写状态或 history，也不参与锁恢复；失败一律抛出由统一入口转成非零退出。
- * 故障文案按事实区分：路径不存在（悬空符号链接被 existsSync 跟随链接后同判为不存在）、不是普通文件（目录等）、文件不可读、内容不是合法 JSON，
- * 不让可读性故障被误报成 JSON 语法问题。
+ * 故障文案按事实区分：路径不存在（ENOENT/ENOTDIR/ELOOP，含悬空符号链接）、不是普通文件（目录等）、
+ * 不可读（EACCES/EPERM/EIO 等，statSync 与 readFileSync 都附原始 errno，父目录不可搜索时不误报为不存在）、
+ * 内容不是合法 JSON、结构不符合 schema 1，不让可读性或形状故障被误报成 JSON 语法问题。
  */
 function summarizeLedger(statePath: string) {
-  if (!fs.existsSync(statePath)) throw new Error(`状态文件不存在：${statePath}`);
-  engine.ensure(fs.statSync(statePath).isFile(), `状态文件不是普通文件：${statePath}`);
+  let stats: fs.Stats;
+  try { stats = fs.statSync(statePath); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR' || code === 'ELOOP') throw new Error(`状态文件不存在：${statePath}`);
+    throw new Error(`状态文件不可读：${statePath}；${(error as Error).message}`);
+  }
+  engine.ensure(stats.isFile(), `状态文件不是普通文件：${statePath}`);
   let raw: unknown;
   try { raw = JSON.parse(fs.readFileSync(statePath, 'utf8')); }
   catch (error) {
     if (error instanceof SyntaxError) throw new Error(`状态文件不是合法 JSON：${(error as Error).message}`);
     throw new Error(`状态文件不可读：${statePath}；${(error as Error).message}`);
   }
-  engine.ensure(raw && typeof raw === 'object' && !Array.isArray(raw) && (raw as engine.State).schema === 1, '不支持的状态版本');
-  return summarize(raw as engine.State);
+  engine.ensure(isRecord(raw) && raw.schema === 1, '不支持的状态版本');
+  return summarize(ensureSummaryShape(raw as Record<string, unknown>));
 }
 export function observe(s: engine.State, jobs?: engine.Job[]): engine.LiveFacts {
   const before = { ...gh.observationMetrics };
@@ -556,7 +583,7 @@ export async function main(argv: string[]): Promise<unknown> {
     const s = read<engine.State>(statePath); engine.ensure(s.schema === 1, '不支持的状态版本');
     if (op === 'inspect') return { ...s, rolesPath };
     if (op === 'metrics') return metrics(s);
-    engine.ensure(s.status !== 'retired', '已退役运行只允许 inspect/metrics，不能自动复活');
+    engine.ensure(s.status !== 'retired', '已退役运行只允许 inspect/metrics/summary，不能自动复活');
     if (op === 'upgrade') {
       engine.ensure(extra && !s.jobs.some(active), '升级前先对账并确认所有在途任务已停止或完整提交');
       const proof=read<{evidencePath:string}>(extra);safeFile(proof.evidencePath);

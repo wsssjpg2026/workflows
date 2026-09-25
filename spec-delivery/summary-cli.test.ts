@@ -2,7 +2,7 @@
  * #14：离线只读 `summary <state.json>` 的真 CLI 子进程回归。
  *
  * 全部 fixture 隔离在临时目录：不读写任何真实运行账本、不访问 GitHub、不执行 git。
- * PATH 前置失败式假 `gh`/`git`：被杀即记录并以码 99 退出，于是"完全离线"可被证伪。
+ * PATH 前置失败式假 `gh`/`git`：被调即记录并以码 99 退出，于是"完全离线"可被证伪。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -251,6 +251,85 @@ test('不可读文件：权限故障与 JSON 语法故障分开陈述，且无�
     try { fs.chmodSync(denied, 0o600); } catch { /* 文件可能未创建 */ }
     fs.rmSync(f.dir, { recursive: true, force: true });
   }
+});
+
+test('父目录不可搜索：按不可读陈述而非不存在，恢复权限后同一路径可读', { skip: process.getuid?.() === 0 }, () => {
+  const f = setup('parent-denied', JSON.stringify(ledger('running', 2)));
+  const blocked = path.join(f.dir, 'noperm');
+  try {
+    fs.mkdirSync(blocked);
+    const statePath = path.join(blocked, 'state.json');
+    fs.writeFileSync(statePath, JSON.stringify(ledger('running', 2)));
+    const before = digest(f.dir);
+    fs.chmodSync(blocked, 0o000);
+    const denied = f.call('summary', statePath);
+    assert.notEqual(denied.status, 0);
+    assert.equal(denied.stdout.trim(), '', '父目录不可搜索却产生伪成功输出');
+    assert.match(denied.stderr, /状态文件不可读/, `EACCES 未按不可读陈述：${denied.stderr}`);
+    assert.doesNotMatch(denied.stderr, /状态文件不存在/, '一直存在的文件被误报为不存在');
+    assert.equal(calls(f), '');
+    fs.chmodSync(blocked, 0o700);
+    assert.equal(digest(f.dir), before, '失败路径改动了 fixture（锁、history 或临时文件）');
+    // 权限恢复后同一路径立即读通：证明文件始终存在且内容合法，前一次失败是访问权限而非缺失。
+    const allowed = f.call('summary', statePath);
+    assert.equal(allowed.status, 0, `恢复权限后仍失败：${allowed.stderr}`);
+    assert.deepEqual(JSON.parse(allowed.stdout), reference(statePath));
+    assert.equal(digest(f.dir), before, '读取成功路径改动了 fixture');
+  } finally {
+    try { fs.chmodSync(blocked, 0o700); } catch { /* 可能未创建 */ }
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test('schema:1 但账本形状损坏：非零退出、明确 stderr、无编造摘要', () => {
+  const cases: [string, unknown][] = [
+    ['tickets-string', { ...ledger('running', 2), tickets: 'xx' }],
+    ['jobs-string', { ...ledger('running', 2), jobs: 'yy' }],
+    ['tickets-elements', { ...ledger('running', 2), tickets: [1, 2] }],
+    ['jobs-elements', { ...ledger('running', 2), jobs: [{ status: 1 }] }],
+    ['tickets-missing', (() => { const s = ledger('running', 2) as Record<string, unknown>; delete s.tickets; return s; })()],
+    ['jobs-missing', (() => { const s = ledger('running', 2) as Record<string, unknown>; delete s.jobs; return s; })()],
+    ['inputs-missing', (() => { const s = ledger('running', 2) as Record<string, unknown>; delete s.inputs; return s; })()],
+    ['target-branch-missing', { ...ledger('running', 2), inputs: { spec: 12 } }],
+    ['spec-string', { ...ledger('running', 2), spec: '12' }],
+  ];
+  for (const [name, value] of cases) {
+    const f = setup(`shape-${name}`, JSON.stringify(value));
+    try {
+      const before = digest(f.dir);
+      const r = f.call('summary', f.statePath);
+      assert.notEqual(r.status, 0, `${name} 应为非零退出，实际却输出：${r.stdout}`);
+      assert.match(r.stderr, /状态文件结构不符合 schema 1/, `${name} 错误文案不明确：${r.stderr}`);
+      assert.equal(r.stdout.trim(), '', `${name} 产生了编造摘要`);
+      assert.equal(calls(f), '', `${name} 调用了 gh/git`);
+      assert.equal(digest(f.dir), before, `${name} 在失败路径改动了 fixture`);
+    } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+  }
+});
+
+test('旧账本与退役门禁文案把 summary 与 inspect/metrics 并列', () => {
+  // 旧账本（无 protocol）：plan 在 requireProtocol 处被挡。
+  const legacy = setup('gate-legacy', JSON.stringify(ledger('running', undefined)));
+  try {
+    const r = legacy.call('plan', legacy.statePath, path.join(legacy.dir, 'plan.json'));
+    assert.notEqual(r.status, 0);
+    assert.equal(r.stdout.trim(), '');
+    assert.match(r.stderr, /inspect\/metrics\/summary/, `旧账本文案未含 summary：${r.stderr}`);
+  } finally { fs.rmSync(legacy.dir, { recursive: true, force: true }); }
+
+  // 退役 + protocol:2：drive 走 requireProtocol 的退役分支，plan 走主流程的退役分支。
+  const retired = setup('gate-retired', JSON.stringify(ledger('retired', 2)));
+  try {
+    const planned = retired.call('plan', retired.statePath, path.join(retired.dir, 'plan.json'));
+    assert.notEqual(planned.status, 0);
+    assert.equal(planned.stdout.trim(), '');
+    assert.match(planned.stderr, /已退役运行只允许 inspect\/metrics\/summary/, `退役主流程文案未含 summary：${planned.stderr}`);
+
+    const driven = retired.call('drive', retired.statePath);
+    assert.notEqual(driven.status, 0);
+    assert.equal(driven.stdout.trim(), '');
+    assert.match(driven.stderr, /运行已退役；只允许 inspect\/metrics\/summary/, `退役 requireProtocol 文案未含 summary：${driven.stderr}`);
+  } finally { fs.rmSync(retired.dir, { recursive: true, force: true }); }
 });
 
 test('schema 不受支持（schema:2 与缺失 schema）：非零退出且无输出', () => {

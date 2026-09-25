@@ -1,10 +1,16 @@
 /** 可移植的调度内核。语义判断由 L1/2/3 提供；转换、预算和证据版本由代码约束。 */
+import { createHash } from 'node:crypto';
 export type Tier = 'L1' | 'L2' | 'L3';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export interface Inputs { spec: number | string; targetBranch: string; models: Record<Tier, string> }
 export interface Policy { agents: number; issues: number; tests: number; noProgress: number; rounds: number }
 export interface Capabilities { framework: string; mainModel: string; modelRouting: 'per_agent' | 'per_run'; models: string[] }
-export interface Finding { id: string; description: string; evidence: string; confidence?: number; confirmed?: boolean; advisory?: boolean }
+export interface Finding {
+  id: string; description: string; evidence: string; confidence?: number; confirmed?: boolean; advisory?: boolean;
+  identity?: { path: string; rule: string; trigger: string };
+  sources?: string[];
+  assessment?: { factual: string; responsibility: string; severity: string; rationale: string };
+}
 export interface TicketPlan {
   number: number; kind: 'software' | 'human'; dependencies: number[]; criteria: string[];
   visual: boolean;
@@ -14,8 +20,8 @@ export interface TicketPlan {
   deferredDependencies?: { issue: number; target: number; kind: 'acceptance_only'; records: string[] }[];
 }
 export interface ExecutionPlan { capabilities: Capabilities; policy: Policy; tickets: TicketPlan[]; specCriteria: string[]; evidencePath: string }
-export type Phase = 'claim' | 'plan' | 'plan_check' | 'implement' | 'self' | 'verify' | 'publish' | 'review' | 'fresh' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'done' | 'human' | 'blocked';
-export type Action = 'claim' | 'plan' | 'plan-check' | 'implement' | 'self-standards' | 'self-spec' | 'verify' | 'publish' | 'review-lens' | 'confirm' | 'review-report' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'spec-audit' | 'spec-close';
+export type Phase = 'claim' | 'plan' | 'plan_check' | 'implement' | 'queued' | 'self' | 'verify' | 'publish' | 'review' | 'fresh' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'done' | 'human' | 'blocked';
+export type Action = 'claim' | 'plan' | 'plan-check' | 'implement' | 'self-standards' | 'self-spec' | 'verify' | 'publish' | 'review-lens' | 'confirm' | 'adjudicate' | 'review-report' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'spec-audit' | 'spec-close';
 export interface Evidence { head: string; base: string; path: string }
 export interface Ticket extends TicketPlan {
   key: string; phase: Phase; epoch: number; round: number; stalls: number; escalations: number;
@@ -24,6 +30,7 @@ export interface Ticket extends TicketPlan {
   evidence: Partial<Record<'self' | 'tests' | 'regular' | 'fresh' | 'accept' | 'visual', Evidence>>;
   lastProblem: string; reason: string; closeout: boolean;
   cleaned: boolean;
+  queueOrder?: number; queueSkips?: number; baseInvalidations?: number;
 }
 export interface LivePR { number: number; head: string; base: string; baseRef: string; state: string; draft: boolean; mergeable: string; checks: {id: string; status: string}[] }
 export interface LiveFacts { base: string; issueStates: Record<string, string>; prs: Record<string, LivePR>; at: string }
@@ -43,25 +50,65 @@ export interface Job {
   tier: Tier; model: string; executor: 'agent' | 'main' | 'command'; fresh: boolean; contextKey: string;
   head: string; base: string; tests: number; status: 'leased' | 'running' | 'done' | 'cancelled';
   nativeId: string; result?: Result; finding?: Finding;
+  timing?: { leasedAt: string; boundAt?: string; startedAt?: string; resultAt?: string; completedAt?: string; cancelledAt?: string };
+  usage?: { inputTokens?: number; outputTokens?: number; cost?: number; currency?: string; modelMs?: number };
+  dispute?: { previous: string; current: string };
+  testExecution?: { pid: number; granted: boolean; startedAt: string };
 }
 export interface State {
   schema: 1; id: string; revision: number; inputs: Inputs; spec: number;
+  protocol?: 2;
   repo: { root: string; slug: string; host: string; defaultBranch: string };
-  status: 'planning' | 'running' | 'waiting_human' | 'blocked' | 'complete' | 'paused';
+  status: 'planning' | 'running' | 'waiting_human' | 'blocked' | 'complete' | 'paused' | 'retired';
   policy?: Policy; capabilities?: Capabilities; specCriteria: string[]; planEvidence: string;
   tickets: Ticket[]; jobs: Job[]; facts: LiveFacts; auditEpoch: number; specAudit?: Result;
-  events: { revision: number; message: string }[];
+  validationOwner?: string; queueSequence?: number;
+  telemetry?: { ghInvocations: number; retries: number; observationMs: number };
+  retired?: { at: string; evidencePath: string; reason: string };
+  events: { revision: number; message: string; at?: string }[];
 }
 export const lenses = ['规范', '明显缺陷', 'Git 历史', '历史 PR 评论', '代码注释'];
 export function ensure(condition: unknown, message: string): asserts condition { if (!condition) throw new Error(message); }
-export function event(s: State, message: string) { s.revision++; s.events.push({ revision: s.revision, message }); }
+export function event(s: State, message: string) { s.revision++; s.events.push({ revision: s.revision, message, at: new Date().toISOString() }); }
 export function freshEvidence(t: Ticket, key: keyof Ticket['evidence']) {
   const e = t.evidence[key]; return !!e && e.head === t.head && e.base === t.base && !!e.path;
 }
 export function ticket(s: State, key: string) { const t = s.tickets.find(t => t.key === key); ensure(t, `未知工单 ${key}`); return t; }
 const busy = (j: Job) => j.status === 'leased' || j.status === 'running';
-const tierFor = (a: Action): Tier => ['claim', 'plan', 'plan-check', 'replan', 'spec-audit', 'spec-close', 'verify', 'cleanup'].includes(a) ? 'L1' : ['implement', 'self-standards', 'self-spec', 'publish'].includes(a) ? 'L3' : 'L2';
-const hasTests = (a: Action) => ['implement', 'verify', 'confirm', 'integrate'].includes(a) ? 1 : 0;
+const tierFor = (a: Action): Tier => ['claim', 'plan', 'plan-check', 'replan', 'adjudicate', 'spec-audit', 'spec-close', 'verify', 'cleanup'].includes(a) ? 'L1' : ['implement', 'self-standards', 'self-spec', 'publish'].includes(a) ? 'L3' : 'L2';
+// agent 的测试按实际执行申请，不能在整段读代码/推理时间占住测试批次。
+const hasTests = (a: Action) => a === 'verify' ? 1 : 0;
+const validationPhases: Phase[] = ['queued', 'integrate', 'self', 'verify', 'publish', 'review', 'fresh', 'accept', 'merge'];
+function enqueue(s: State, t: Ticket) {
+  t.queueOrder ??= (s.queueSequence = (s.queueSequence || 0) + 1);
+  t.queueSkips ??= 0;
+}
+/** 一个目标分支的完整验证区间互斥；队外仍可计划与实现。 */
+function admit(s: State) {
+  const owner = s.tickets.find(t => t.key === s.validationOwner);
+  if (owner && !['done', 'close', 'cleanup', 'human', 'blocked'].includes(owner.phase)) return;
+  if (owner && s.jobs.some(j => j.ticket === owner.key && busy(j))) return;
+  s.validationOwner = undefined;
+  // 升级旧账本时先排空已有验证 actors，不能在它们运行时启动另一票的合并。
+  const occupied = new Set(s.jobs.filter(j => busy(j) && validationPhases.includes(s.tickets.find(t => t.key === j.ticket)?.phase as Phase)).map(j => j.ticket));
+  if (occupied.size > 1) return;
+  const ready = s.tickets.filter(t => validationPhases.includes(t.phase) && (!occupied.size || occupied.has(t.key)));
+  for (const t of ready) enqueue(s, t);
+  const dependents = (t: Ticket) => s.tickets.filter(x => x.phase !== 'done' && x.dependencies.includes(t.number)).length;
+  ready.sort((a, b) => {
+    const agedA = (a.queueSkips || 0) >= s.policy!.noProgress, agedB = (b.queueSkips || 0) >= s.policy!.noProgress;
+    return Number(agedB) - Number(agedA) || (agedA ? 0 : dependents(b) - dependents(a)) || a.queueOrder! - b.queueOrder!;
+  });
+  const first = ready[0]; if (!first) return;
+  s.validationOwner = first.key;
+  for (const t of ready.slice(1)) t.queueSkips = (t.queueSkips || 0) + 1;
+  first.queueSkips = 0;
+  if (first.phase === 'queued') {
+    if (first.base !== s.facts.base) resetCandidate(first, first.head, s.facts.base, 'integrate');
+    else first.phase = 'self';
+  }
+  event(s, `${first.key} 进入最终验证队列的队首`);
+}
 export function buildTicket(p: TicketPlan, base: string, closeout = false): Ticket {
   return { ...p, key: closeout ? `spec-final-${p.number}` : String(p.number), phase: p.kind === 'human' ? 'human' : 'claim',
     epoch: 1, round: 0, stalls: 0, escalations: 0, head: '', base, pr: 0, branch: '', worktree: '',
@@ -134,7 +181,7 @@ export function ciAllowed(pr: LivePR, r?: Result) {
 }
 export function mergeGate(s: State, t: Ticket) {
   const live = s.facts.prs[String(t.pr)];
-  return !!live && live.state === 'OPEN' && !live.draft && live.head === t.head && live.base === t.base &&
+  return s.validationOwner === t.key && !!live && live.state === 'OPEN' && !live.draft && live.head === t.head && live.base === t.base &&
     live.baseRef === s.inputs.targetBranch && s.facts.base === t.base && live.mergeable === 'MERGEABLE' &&
     ['self', 'tests', 'regular', 'fresh', 'accept'].every(k => freshEvidence(t, k as keyof Ticket['evidence'])) &&
     (!t.visual || freshEvidence(t, 'visual')) && ciAllowed(live, jobsAt(s, t, 'accept').find(j => j.status === 'done')?.result);
@@ -149,12 +196,36 @@ function advanceGroups(s: State, t: Ticket) {
     }
   }
 }
-interface Candidate { t?: Ticket; action: Action; part?: string; finding?: Finding }
+export function findingKey(f: Finding) {
+  const raw = f.identity ? [f.identity.path, f.identity.rule, f.identity.trigger] : [f.description, f.evidence];
+  return createHash('sha256').update(JSON.stringify(raw.map(x => x.trim().replace(/\s+/g, ' ')))).digest('hex').slice(0, 24);
+}
+function reviewFindings(jobs: Job[]) {
+  const groups = new Map<string, Finding>();
+  for (const j of jobs) for (const f of j.result?.findings || []) {
+    const id = findingKey(f), source = `${j.id}/${f.id}`;
+    const existing = groups.get(id);
+    if (existing) existing.sources!.push(source);
+    else groups.set(id, { ...f, id, sources: [source] });
+  }
+  return [...groups.values()];
+}
+function disputes(s: State, t: Ticket, current: Job[]) {
+  return current.flatMap(j => {
+    const previous = s.jobs.findLast(p => p.ticket === t.key && p.epoch !== t.epoch && p.status === 'done' &&
+      ['confirm', 'adjudicate'].includes(p.action) && p.head === j.head && p.base === j.base && p.part === j.part);
+    return previous && (previous.result!.findings![0].confidence! >= 50) !== (j.result!.findings![0].confidence! >= 50)
+      ? [{ t, action: 'adjudicate' as Action, part: j.part, finding: j.finding, dispute: { previous: previous.id, current: j.id } }] : [];
+  });
+}
+interface Candidate { t?: Ticket; action: Action; part?: string; finding?: Finding; dispute?: Job['dispute'] }
 function candidates(s: State): Candidate[] {
   const out: Candidate[] = [];
+  admit(s);
   for (const t of s.tickets) {
     advanceGroups(s, t);
     if (['done', 'human', 'blocked'].includes(t.phase)) continue;
+    if (validationPhases.includes(t.phase) && s.validationOwner !== t.key) continue;
     if (t.phase === 'claim' && !dependencyReady(s, t)) continue;
     if (t.phase === 'self') { out.push({ t, action: 'self-standards' }, { t, action: 'self-spec' }); continue; }
     if (t.phase === 'review' || t.phase === 'fresh') {
@@ -162,10 +233,14 @@ function candidates(s: State): Candidate[] {
       if (rs.filter(j => j.status === 'done').length !== lenses.length) {
         lenses.forEach((_, n) => out.push({ t, action: 'review-lens', part: String(n) })); continue;
       }
-      const fs = rs.flatMap(j => (j.result!.findings || []).map((f, n) => ({ ...f, id: `${j.part}-${n}` })));
+      const fs = reviewFindings(rs);
       const cs = jobsAt(s, t, 'confirm');
       if (cs.filter(j => j.status === 'done').length !== fs.length) {
         fs.forEach(f => out.push({ t, action: 'confirm', part: f.id, finding: f })); continue;
+      }
+      const ds = disputes(s, t, cs);
+      if (ds.some(d => !jobsAt(s, t, 'adjudicate').some(j => j.part === d.part && j.status === 'done'))) {
+        out.push(...ds); continue;
       }
       out.push({ t, action: 'review-report' }); continue;
     }
@@ -192,7 +267,7 @@ export function reserve(s: State): Job[] {
     if (attempts.some(j => j.status !== 'cancelled')) continue;
     const id = `${s.id}:${key}:${epoch}:${c.action}:${part}:try-${attempts.length + 1}`;
     const active = s.jobs.filter(busy);
-    const command = ['verify', 'cleanup'].includes(c.action);
+    const command = ['verify', 'cleanup', 'close', 'spec-close'].includes(c.action);
     const executor = command ? 'command' : c.action === 'claim' ? 'main' : 'agent';
     if (active.filter(j => j.executor === 'agent').length + 1 + (executor === 'agent' ? 1 : 0) > s.policy.agents) continue;
     if (active.reduce((n, j) => n + j.tests, 0) + hasTests(c.action) > s.policy.tests) continue;
@@ -202,11 +277,11 @@ export function reserve(s: State): Job[] {
     // 所有合并、关闭以及 spec 终结共用一个提交通道。
     if (['merge', 'close', 'spec-close'].includes(c.action) && active.some(j => ['merge', 'close', 'spec-close'].includes(j.action))) continue;
     const tier = tierFor(c.action);
-    const fresh = c.t?.phase === 'fresh' || ['plan', 'plan-check', 'accept', 'replan', 'spec-audit'].includes(c.action);
+    const fresh = c.t?.phase === 'fresh' || ['plan', 'plan-check', 'accept', 'replan', 'spec-audit', 'adjudicate'].includes(c.action);
     const continuity = ['implement', 'publish'].includes(c.action) ? 'author' : ['review-lens', 'confirm', 'review-report'].includes(c.action) ? `review-${part}` : c.action;
     const j: Job = { id, ticket: key, epoch, action: c.action, part, tier, model: s.inputs.models[tier], executor, fresh,
       contextKey: `${s.id}:${key}:${continuity}${fresh ? `:fresh-${epoch}` : ''}`, head: c.t?.head || '', base: c.t?.base || s.facts.base,
-      tests: hasTests(c.action), status: 'leased', nativeId: '', finding: c.finding };
+      tests: hasTests(c.action), status: 'leased', nativeId: '', finding: c.finding, dispute: c.dispute, timing: { leasedAt: new Date().toISOString() } };
     s.jobs.push(j); created.push(j);
   }
   if (created.length) event(s, `已预留 ${created.length} 个任务，含所有显式审查 actors`);
@@ -217,9 +292,12 @@ export function bind(s: State, id: string, ref: { nativeId: string; model: strin
   const j = s.jobs.find(j => j.id === id); ensure(j && busy(j), '任务不是待执行状态');
   ensure(ref.model === j.model && !!ref.nativeId, '实际派发模型或宿主任务身份不匹配');
   ensure(!j.nativeId || j.nativeId === ref.nativeId, '同一租约不能重复绑定另一任务');
-  j.nativeId = ref.nativeId; j.status = 'running'; event(s, `已绑定 ${j.action} 的原生任务`);
+  j.nativeId = ref.nativeId; j.status = 'running';
+  j.timing ??= { leasedAt: '' }; j.timing.boundAt ??= new Date().toISOString();
+  event(s, `已绑定 ${j.action} 的原生任务`);
 }
 export function submit(s: State, id: string, r: Result) {
+  ensure(s.status !== 'retired', '已退役运行不能接收执行结果');
   const paused = s.status === 'paused';
   const j = s.jobs.find(j => j.id === id); ensure(j, '未知任务');
   if (j.status === 'done') { ensure(JSON.stringify(j.result) === JSON.stringify(r), '重复回执内容不一致'); return; }
@@ -228,7 +306,7 @@ export function submit(s: State, id: string, r: Result) {
   const allowed: Record<Action, string[]> = {
     claim: ['claimed'], plan: ['planned'], 'plan-check': ['pass', 'changes'], implement: ['implemented', 'replan'],
     'self-standards': ['reviewed'], 'self-spec': ['reviewed'], verify: ['pass', 'fail'], publish: ['published'],
-    'review-lens': ['reviewed'], confirm: ['confirmed'], 'review-report': ['posted'],
+    'review-lens': ['reviewed'], confirm: ['confirmed'], adjudicate: ['confirmed'], 'review-report': ['posted'],
     accept: ['ready', 'gap', 'conflict', 'waiting_ci', 'needs_human', 'blocked'], integrate: ['implemented', 'replan'],
     replan: ['planned'], merge: ['merged', 'waiting_merge'], close: ['closed'], cleanup: ['cleaned'],
     'spec-audit': ['complete', 'needs_closeout', 'waiting_human', 'blocked'], 'spec-close': ['closed'],
@@ -237,14 +315,15 @@ export function submit(s: State, id: string, r: Result) {
   const t = j.ticket === '$spec' ? undefined : ticket(s, j.ticket);
   ensure(!t || t.epoch === j.epoch, '候选已经更新，回执失效');
   j.result = r; j.status = 'done';
+  j.timing ??= { leasedAt: '' }; j.timing.completedAt = new Date().toISOString();
   if (!r.complete) {
     if (t) { t.phase = 'blocked'; t.reason = `${j.action}: ${r.status}`; }
     else if (!paused) s.status = 'blocked';
     event(s, `${j.action} 未完整执行，不能视为通过`); return;
   }
   const live = t?.pr ? s.facts.prs[String(t.pr)] : undefined;
-  if (t && !['claim', 'cleanup', 'close', 'merge', 'implement', 'integrate'].includes(j.action) &&
-      (s.facts.base !== j.base || (['review-lens', 'confirm', 'review-report', 'accept'].includes(j.action) && live?.state === 'OPEN' && live.head !== j.head))) {
+  if (t && !['claim', 'plan', 'plan-check', 'replan', 'cleanup', 'close', 'merge', 'implement', 'integrate'].includes(j.action) &&
+      (s.facts.base !== j.base || (['review-lens', 'confirm', 'adjudicate', 'review-report', 'accept'].includes(j.action) && live?.state === 'OPEN' && live.head !== j.head))) {
     t.phase = 'blocked'; t.reason = 'stale'; event(s, `${j.action} 完成时版本已变，不能保留通过结论`); return;
   }
   if (t && !['claim', 'plan', 'plan-check', 'replan', 'cleanup', 'close'].includes(j.action)) {
@@ -269,7 +348,7 @@ export function submit(s: State, id: string, r: Result) {
       ensure(t, '缺少工单');
       if (r.status === 'replan') { problem(s, t, String(data.reason || '实现边界改变'), 'replan'); break; }
       ensure(r.status === 'implemented' && r.handoffPath, '代码修改后必须交接，再进行作者自检');
-      resetCandidate(t, r.head!, r.base!, 'self');
+      resetCandidate(t, r.head!, r.base!, s.validationOwner === t.key ? 'self' : 'queued'); enqueue(s, t);
       if (data.visualEvidence) t.evidence.visual = { head: t.head, base: t.base, path: String(data.visualEvidence) }; break;
     case 'self-standards': case 'self-spec':
       ensure(t && Array.isArray(r.findings), '双轴自检必须分别返回完整 findings（允许空数组）'); advanceGroups(s, t); break;
@@ -283,13 +362,18 @@ export function submit(s: State, id: string, r: Result) {
       ensure(Number(data.pr) > 0 && data.commentUrl, '需要 PR 以及作者完成评论');
       t.pr = Number(data.pr); t.phase = 'review'; t.epoch++; break;
     case 'review-lens': ensure(Array.isArray(r.findings), '每一路审查必须明确返回 findings'); break;
-    case 'confirm':
+    case 'confirm': case 'adjudicate':
       ensure(Array.isArray(r.findings) && r.findings.length === 1, '逐项独立核实必须返回一个问题');
+      ensure(r.findings[0].id === j.part, '复核必须保留原问题身份');
+      r.findings[0].identity = j.finding?.identity;
+      r.findings[0].sources = j.finding?.sources;
       ensure(Number.isFinite(r.findings[0].confidence) && r.findings[0].confidence! >= 0 && r.findings[0].confidence! <= 100, '缺少 0–100 置信评分');
+      if (j.action === 'adjudicate') ensure(r.findings[0].assessment?.rationale, '裁决必须解释同候选判定分歧，不能用重复抽样代替证据');
       ensure(r.findings[0].confidence! < 50 || r.findings[0].confirmed === true, '>=50 的问题必须被独立证据确认'); break;
     case 'review-report': {
       ensure(t && data.commentUrl && r.handoffPath, '审查必须留下完成评论和持久交接');
-      const cs = jobsAt(s, t, 'confirm').flatMap(x => x.result?.findings || []);
+      const cs = jobsAt(s, t, 'confirm').flatMap(x =>
+        (jobsAt(s, t, 'adjudicate').find(d => d.part === x.part)?.result || x.result)?.findings || []);
       const blockers = cs.filter(f => f.confidence! >= 50);
       if (blockers.length) problem(s, t, blockers.map(f => f.description).sort().join('|'), 'implement');
       else if (t.phase === 'review') { t.evidence.regular = evidence(); t.phase = 'fresh'; t.epoch++; }
@@ -312,7 +396,7 @@ export function submit(s: State, id: string, r: Result) {
       break;
     case 'replan':
       ensure(t && data.planPath && data.checksPath, '独立 L1 重规划需要计划与验证清单');
-      t.planPath = String(data.planPath); t.checksPath = String(data.checksPath); t.escalations++; t.stalls = 0; t.round = 0;
+      t.planPath = String(data.planPath); t.checksPath = String(data.checksPath); t.escalations++; t.stalls = 0; t.round = 0; t.baseInvalidations = 0;
       t.phase = 'plan_check'; t.epoch++; break;
     case 'merge':
       if (r.status === 'waiting_merge') { ensure(t, '缺少工单'); t.phase = 'blocked'; t.reason = 'waiting_merge'; break; }
@@ -348,6 +432,7 @@ export function submit(s: State, id: string, r: Result) {
 /** 外部状态变化时撤销旧结论。仍在运行的任务必须先由宿主确认停止，不能擅自释放写锁。 */
 export function reconcileFacts(s: State, facts: LiveFacts) {
   s.facts = facts;
+  if (s.status === 'retired') return;
   if (s.specAudit && s.specAudit.base !== facts.base) { s.specAudit = undefined; s.auditEpoch++; }
   for (const t of s.tickets) {
     if (t.phase === 'human' && facts.issueStates[String(t.number)] === 'CLOSED') t.phase = 'done';
@@ -364,7 +449,18 @@ export function reconcileFacts(s: State, facts: LiveFacts) {
     if (p && p.head !== t.head && (['review', 'fresh', 'accept', 'merge'].includes(t.phase) || t.reason === 'stale')) {
       resetCandidate(t, p.head, facts.base, 'integrate'); t.reason = '已发布候选被外部更新；先同步再验证';
     }
-    else if (t.base !== facts.base) { resetCandidate(t, t.head, facts.base, t.worktree ? 'integrate' : 'claim'); t.reason = '目标分支已前进'; }
+    else if (t.base !== facts.base) {
+      if (!t.worktree) { resetCandidate(t, t.head, facts.base, 'claim'); }
+      else if (s.validationOwner === t.key || (validationPhases.includes(t.phase) && t.phase !== 'queued') || t.reason === 'stale') {
+        t.baseInvalidations = (t.baseInvalidations || 0) + 1;
+        resetCandidate(t, t.head, facts.base, 'integrate'); enqueue(s, t);
+        if (t.baseInvalidations >= s.policy!.noProgress) {
+          t.phase = t.escalations ? 'blocked' : 'replan'; t.reason = '基线反复失效；L1 调整队列和并发后重新规划';
+          s.validationOwner = undefined;
+        } else t.reason = '目标分支已前进；撤销旧组合证据';
+      }
+      // 计划、实现与排队中的候选保留原基线，等到队首一次性集成最新目标。
+    }
     if (t.phase === 'blocked' && t.reason === 'waiting_ci' && p && ciAllowed(p)) { t.phase = 'accept'; t.epoch++; }
     if (t.phase === 'merge' && p?.mergeable === 'CONFLICTING') resetCandidate(t, t.head, facts.base, 'integrate');
   }

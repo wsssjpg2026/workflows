@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { isAbsolute, resolve } from "node:path";
 
-/** 只读事实适配器：不缓存、不重试，不以权限/API 失败代替空结果。 */
+/** 只读事实适配器：批量取易变事实；仅对瞬时读取错误有界重试。 */
 export type Repo = { root: string; slug: string; host: string; defaultBranch: string };
 export type IssueFact = {
   number: number;
@@ -38,6 +38,7 @@ export type PrFact = {
 type JsonObject = Record<string, unknown>;
 const MAX_OUTPUT = 32 * 1024 * 1024;
 const COMMAND_TIMEOUT = 120_000;
+export const observationMetrics = { ghInvocations: 0, retries: 0, elapsedMs: 0 };
 
 function fail(message: string): never {
   throw new Error(`GitHub observation: ${message}`);
@@ -86,16 +87,51 @@ function command(executable: "git" | "gh", argv: string[], cwd: string): string 
   // 环境中的 GH_REPO 不能把当前工作区悄悄指向另一仓库；禁用调试输出来避免打印认证头。
   const env: NodeJS.ProcessEnv = { ...process.env, GH_PROMPT_DISABLED: "1", GH_PAGER: "cat", GH_DEBUG: "" };
   delete env.GH_REPO;
-  try {
-    return execFileSync(executable, argv, {
+  for (let attempt = 0; ; attempt++) {
+    const started = Date.now();
+    if (executable === 'gh') observationMetrics.ghInvocations++;
+    try { return execFileSync(executable, argv, {
       cwd, env, shell: false, encoding: "utf8", timeout: COMMAND_TIMEOUT,
       maxBuffer: MAX_OUTPUT, stdio: ["ignore", "pipe", "pipe"],
     });
-  } catch (error) {
+    } catch (error) {
     const e = error as { stderr?: string | Buffer; message?: string; status?: number | null; signal?: string | null };
     const detail = String(e.stderr || e.message || "command failed").trim().slice(0, 2000);
-    return fail(`${executable} ${argv.join(" ")} failed (status ${e.status ?? "none"}, signal ${e.signal ?? "none"}): ${detail}`);
+      if (executable === 'gh' && attempt < 2 && /\bEOF\b|ECONNRESET|ETIMEDOUT|HTTP (429|50[234])|TLS handshake timeout/i.test(detail)) {
+        observationMetrics.retries++; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100 * 2 ** attempt); continue;
+      }
+      return fail(`${executable} ${argv.join(" ")} failed (status ${e.status ?? "none"}, signal ${e.signal ?? "none"}): ${detail}`);
+    } finally { observationMetrics.elapsedMs += Date.now() - started; }
   }
+}
+
+/** 一次 GraphQL 读取状态，不重复拉 issue 正文/评论或已经完成的 PR 的 CI。 */
+export function snapshot(repo: Repo, target: string, issueNumbers: number[], prNumbers: number[]) {
+  validateRepo(repo);
+  const issues = [...new Set(issueNumbers)], prs = [...new Set(prNumbers)];
+  for (const n of [...issues, ...prs]) integer(n, 'observation number');
+  const [owner, name] = repo.slug.split('/');
+  const fields = [
+    'target:ref(qualifiedName:$target){target{oid}}',
+    ...issues.map(n => `i${n}:issue(number:${n}){number state}`),
+    ...prs.map(n => `p${n}:pullRequest(number:${n}){number url state headRefOid baseRefOid baseRefName headRefName isDraft mergeable mergeCommit{oid}}`),
+  ];
+  const query = `query($owner:String!,$name:String!,$target:String!){repository(owner:$owner,name:$name){${fields.join('\n')}}}`;
+  const raw = object(parseJSON(command('gh', ['api', '--hostname', repo.host, 'graphql', '-f', `query=${query}`, '-f', `owner=${owner}`, '-f', `name=${name}`, '-f', `target=refs/heads/${target}`], repo.root), 'snapshot'), 'snapshot');
+  if (raw.errors) fail('GraphQL observation is incomplete: ' + JSON.stringify(raw.errors));
+  const r = object(object(raw.data, 'snapshot.data').repository, 'snapshot.repository');
+  const base = sha(object(object(r.target, 'target ref').target, 'target commit').oid, 'target.oid');
+  const issueStates: Record<string, string> = {}, result: Record<string, PrFact> = {};
+  for (const n of issues) { const i = object(r[`i${n}`], `issue ${n}`); if (i.number !== n) fail('issue identity mismatch'); issueStates[n] = issueState(String(i.state).toLowerCase()); }
+  for (const n of prs) {
+    const p = object(r[`p${n}`], `PR ${n}`); if (p.number !== n) fail('PR identity mismatch');
+    const state = p.state === 'MERGED' ? 'MERGED' : issueState(String(p.state).toLowerCase());
+    result[n] = { number: n, url: string(p.url, 'PR url'), head: sha(p.headRefOid, 'head'), base: sha(p.baseRefOid, 'base'),
+      baseRef: string(p.baseRefName, 'baseRef'), headRef: string(p.headRefName, 'headRef'), state, draft: boolean(p.isDraft, 'draft'),
+      mergeable: p.mergeable === 'MERGEABLE' ? 'MERGEABLE' : p.mergeable === 'CONFLICTING' ? 'CONFLICTING' : 'UNKNOWN', checks: [],
+      mergedHead: state === 'MERGED' ? sha(object(p.mergeCommit, 'mergeCommit').oid, 'mergeCommit.oid') : '' };
+  }
+  return { base, issueStates, prs: result, at: new Date().toISOString() };
 }
 
 function slug(value: string): string {

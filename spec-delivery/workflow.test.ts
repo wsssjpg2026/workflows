@@ -156,3 +156,72 @@ test('对账保留用户暂停状态，不自动启动资源清理', () => {
   s.specAudit={model:'large',complete:true,status:'complete',base:'A',evidencePath:'/fixture'}; s.status='paused';
   e.reconcileFacts(s,structuredClone(s.facts)); assert.equal(s.status,'paused'); assert.throws(()=>e.reserve(s));
 });
+
+test('并行完成的候选排队验证，前一票合并不重审队外候选', () => {
+  const s=fixture();
+  const a=s.tickets[0]; a.phase='implement'; a.worktree='/fixture/a'; a.head='A';
+  const b=e.buildTicket({number:102,kind:'software',dependencies:[],criteria:['b'],visual:false},'A');
+  b.phase='implement'; b.worktree='/fixture/b'; b.head='A'; s.tickets.push(b); s.policy!.tests=2;
+  for(const j of e.reserve(s)) finish(s,j);
+  const js=e.reserve(s);
+  assert.equal(new Set(js.map(j=>j.ticket)).size,1,'只有队首可以进入自检和最终验证');
+  assert.equal(js.length,2,'保留两轴独立自检');
+  const waiting=s.tickets.find(t=>t.key!==js[0].ticket)!;
+  e.reconcileFacts(s,{...structuredClone(s.facts),base:'B'});
+  assert.equal(waiting.head,'A1');
+  assert.equal(s.jobs.some(j=>j.ticket===waiting.key&&j.action==='integrate'),false,'队外不反复集成');
+});
+
+test('队首外部基线变化必须集成，反复失效进入有限重规划', () => {
+  const s=fixture(); until(s,()=>s.tickets[0].phase==='review');
+  e.reconcileFacts(s,{...structuredClone(s.facts),base:'B'});
+  assert.equal(e.reserve(s)[0].action,'integrate');
+  const j=s.jobs.at(-1)!; finish(s,j);
+  e.reconcileFacts(s,{...structuredClone(s.facts),base:'C'});
+  assert.equal(s.tickets[0].phase,'replan');
+  assert.equal(s.tickets[0].baseInvalidations,2);
+});
+test('spec 审计在途时继续调度不会重复审计或误判工单', () => {
+  const s=fixture(); s.tickets[0].phase='done';
+  const j=e.reserve(s)[0]; e.bind(s,j.id,{nativeId:'audit',model:j.model});
+  assert.deepEqual(e.reserve(s),[]);
+});
+
+test('多个视角的同一问题只复核一次，并保留所有原始发现', () => {
+  const s=fixture(); s.policy!.tests=2; until(s,()=>s.tickets[0].phase==='review');
+  for(const j of e.reserve(s)) {
+    e.bind(s,j.id,{nativeId:j.id,model:j.model}); const r=response(s,j);
+    if(['0','2'].includes(j.part)) r.findings=[{id:j.part,description:'README test count is outdated',evidence:'README:80',identity:{path:'README.md',rule:'test-count',trigger:'tests-added'}}];
+    e.submit(s,j.id,r);
+  }
+  const js=e.reserve(s); assert.equal(js.length,1); assert.equal(js[0].action,'confirm');
+  assert.equal(s.jobs.filter(j=>j.action==='review-lens'&&j.result?.findings?.length).length,2);
+});
+
+test('同一候选 regular 与 fresh 判定分歧交 L1 裁决，不能直接签发通过', () => {
+  const s=fixture(); until(s,()=>s.tickets[0].phase==='fresh',{finding:25});
+  until(s,()=>s.jobs.some(j=>j.action==='confirm'&&j.fresh&&j.status==='done'),{finding:50});
+  const j=e.reserve(s)[0]; assert.equal(j.action,'adjudicate'); assert.equal(j.tier,'L1'); assert.equal(j.fresh,true);
+  e.bind(s,j.id,{nativeId:j.id,model:j.model});
+  const r: e.Result={model:j.model,complete:true,status:'confirmed',head:j.head,base:j.base,evidencePath:'/fixture/judgement',findings:[{id:j.part,description:'same verified defect',evidence:'proof',confidence:50,confirmed:true,assessment:{factual:'reproduced',responsibility:'introduced by this candidate',severity:'minor',rationale:'the earlier exclusion confused responsibility with severity'}}]};
+  e.submit(s,j.id,r); const report=e.reserve(s)[0]; assert.equal(report.action,'review-report'); finish(s,report);
+  assert.equal(s.tickets[0].phase,'implement');
+});
+
+test('五工单回放：十组五路审查完成交付，队列无基线反复失效',()=>{
+  const s=fixture();s.policy={agents:8,issues:3,tests:3,noProgress:3,rounds:4};
+  s.tickets=[101,102,103,104,105].map(number=>e.buildTicket({number,kind:'software',dependencies:number===102?[101]:number===103?[102]:[],criteria:['done'],visual:false},'A'));
+  for(const t of s.tickets)s.facts.issueStates[t.number]='OPEN';
+  for(let step=0;step<150&&s.status!=='complete';step++) {
+    e.reconcileFacts(s,structuredClone(s.facts));const js=e.reserve(s);assert.ok(js.length,'scheduler must progress');
+    for(const j of js) {
+      e.bind(s,j.id,{nativeId:j.id,model:j.model});const r=response(s,j);const t=s.tickets.find(t=>t.key===j.ticket);
+      if(j.action==='publish') {delete s.facts.prs[201];const pr=200+t!.number;r.data={pr,commentUrl:'https://example/pr'};s.facts.prs[pr]={number:pr,head:t!.head,base:t!.base,baseRef:'main',state:'OPEN',draft:false,mergeable:'MERGEABLE',checks:[{id:'ci',status:'pass'}]};}
+      if(j.action==='merge')s.facts.base=`merge-${t!.number}`;
+      e.submit(s,j.id,r);
+    }
+  }
+  assert.equal(s.status,'complete');assert.equal(s.jobs.filter(j=>j.action==='review-lens').length,50);
+  assert.equal(s.tickets.reduce((n,t)=>n+(t.baseInvalidations||0),0),0);
+  assert.ok(s.jobs.filter(j=>j.action==='integrate').length<=4);
+});

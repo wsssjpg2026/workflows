@@ -1,0 +1,9 @@
+{
+  "name": "spec-delivery-workflow",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test spec-delivery/*.test.ts"
+  },
+  "engines": { "node": ">=24" }
+}

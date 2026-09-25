@@ -86,15 +86,19 @@ function archiveResult(statePath:string,j:engine.Job) {
   if(j.result && !fs.existsSync(file))write(file,j.result);
 }
 /**
- * 离线只读投影：读文件、解析、校验 schema，然后复用纯函数 summarize。
+ * 离线只读投影：先核对路径指向可读的普通文件，再读文件、解析、校验 schema，最后复用纯函数 summarize。
  * 不取锁、不调用 gh/git、不写状态或 history，也不参与锁恢复；失败一律抛出由统一入口转成非零退出。
+ * 故障文案按事实区分：路径不存在、不是普通文件（目录等，含悬空符号链接）、文件不可读、内容不是合法 JSON，
+ * 不让可读性故障被误报成 JSON 语法问题。
  */
 function summarizeLedger(statePath: string) {
+  if (!fs.existsSync(statePath)) throw new Error(`状态文件不存在：${statePath}`);
+  engine.ensure(fs.statSync(statePath).isFile(), `状态文件不是普通文件：${statePath}`);
   let raw: unknown;
   try { raw = JSON.parse(fs.readFileSync(statePath, 'utf8')); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error(`状态文件不存在：${statePath}`);
-    throw new Error(`状态文件不是合法 JSON：${(error as Error).message}`);
+    if (error instanceof SyntaxError) throw new Error(`状态文件不是合法 JSON：${(error as Error).message}`);
+    throw new Error(`状态文件不可读：${statePath}；${(error as Error).message}`);
   }
   engine.ensure(raw && typeof raw === 'object' && !Array.isArray(raw) && (raw as engine.State).schema === 1, '不支持的状态版本');
   return summarize(raw as engine.State);

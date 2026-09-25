@@ -16,16 +16,17 @@ import * as e from './core.ts';
 import { summarize } from './summary.ts';
 
 const entry = fileURLToPath(new URL('../spec-delivery.workflow.ts', import.meta.url));
-const HEAD = '31313c1849a93db1af1b3c537a8e7469374c7c57';
+// 仅用于填充 fixture 的 head/base 字段（summarize 不读它们）；不用真实候选 SHA，避免写死的基线过期后误导读者。
+const FIXTURE_HEAD = 'fixture-head';
 
 const ticket = (number: number, phase: e.Phase): e.Ticket => {
-  const t = e.buildTicket({ number, kind: 'software', dependencies: [], criteria: [`#${number}`], visual: false }, HEAD);
-  t.phase = phase; t.head = HEAD; t.base = HEAD;
+  const t = e.buildTicket({ number, kind: 'software', dependencies: [], criteria: [`#${number}`], visual: false }, FIXTURE_HEAD);
+  t.phase = phase; t.head = FIXTURE_HEAD; t.base = FIXTURE_HEAD;
   return t;
 };
 const job = (id: string, status: e.Job['status'], executor: e.Job['executor'] = 'agent'): e.Job => ({
   id, ticket: '14', epoch: 1, action: 'implement', part: '', tier: 'L3', model: 'm', executor, fresh: false,
-  contextKey: `ctx-${id}`, head: HEAD, base: HEAD, tests: 0, status, nativeId: '',
+  contextKey: `ctx-${id}`, head: FIXTURE_HEAD, base: FIXTURE_HEAD, tests: 0, status, nativeId: '',
 });
 
 /** 最小但完整的合法账本；`protocol: undefined` 表示无 protocol 字段的旧账本。 */
@@ -39,7 +40,7 @@ function ledger(status: e.State['status'], protocol: 2 | undefined): e.State {
     specCriteria: ['summary 可离线读取账本'], planEvidence: '/fixture/plan.md',
     tickets: [ticket(13, 'done'), ticket(14, 'human'), ticket(15, 'blocked'), ticket(16, 'claim')],
     jobs: [job('a', 'leased'), job('b', 'running'), job('c', 'leased', 'command'), job('d', 'done'), job('e', 'cancelled')],
-    facts: { base: HEAD, issueStates: { 12: 'OPEN' }, prs: {}, at: '2026-01-01T00:00:00.000Z' },
+    facts: { base: FIXTURE_HEAD, issueStates: { 12: 'OPEN' }, prs: {}, at: '2026-01-01T00:00:00.000Z' },
     auditEpoch: 1, validationOwner: '14',
     events: [{ revision: 7, message: 'fixture', at: '2026-01-01T00:00:00.000Z' }],
   };
@@ -203,6 +204,55 @@ test('JSON 损坏：非零退出、stderr 说明解析失败、原文件字节�
   } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
 });
 
+test('非 JSON 故障不被误报为 JSON 语法错误：目录、悬空符号链接、不可读文件各有明确 stderr', () => {
+  // 目录：不存在 JSON 语法问题，错误必须指出「不是普通文件」。
+  const dirFixture = setup('dir', JSON.stringify(ledger('running', 2)));
+  const nested = path.join(dirFixture.dir, 'nested');
+  try {
+    fs.mkdirSync(nested);
+    const before = digest(dirFixture.dir);
+    const r = dirFixture.call('summary', nested);
+    assert.notEqual(r.status, 0);
+    assert.equal(r.stdout.trim(), '', '目录输入产生伪成功输出');
+    assert.match(r.stderr, /状态文件不是普通文件/, `目录输入的错误文案不明确：${r.stderr}`);
+    assert.doesNotMatch(r.stderr, /不是合法 JSON/, '目录输入被误报成 JSON 语法错误');
+    assert.ok(r.stderr.includes(nested), `stderr 未指明传入路径：${r.stderr}`);
+    assert.equal(calls(dirFixture), '');
+    assert.equal(digest(dirFixture.dir), before, '目录路径查询改动了 fixture');
+  } finally { fs.rmSync(dirFixture.dir, { recursive: true, force: true }); }
+
+  // 悬空符号链接：路径不存在，必须与 JSON 语法错误分开陈述。
+  const linkFixture = setup('symlink', JSON.stringify(ledger('running', 2)));
+  const dangling = path.join(linkFixture.dir, 'dangling.json');
+  try {
+    fs.symlinkSync(path.join(linkFixture.dir, 'nowhere.json'), dangling);
+    const r = linkFixture.call('summary', dangling);
+    assert.notEqual(r.status, 0);
+    assert.equal(r.stdout.trim(), '');
+    assert.match(r.stderr, /状态文件不存在/);
+    assert.ok(r.stderr.includes(dangling), `stderr 未指明传入路径：${r.stderr}`);
+    assert.doesNotMatch(r.stderr, /不是合法 JSON/);
+  } finally { fs.rmSync(linkFixture.dir, { recursive: true, force: true }); }
+});
+
+test('不可读文件：权限故障与 JSON 语法故障分开陈述，且无伪成功输出', { skip: process.getuid?.() === 0 }, () => {
+  const f = setup('denied', JSON.stringify(ledger('running', 2)));
+  const denied = path.join(f.dir, 'denied.json');
+  try {
+    fs.writeFileSync(denied, JSON.stringify(ledger('running', 2)));
+    fs.chmodSync(denied, 0o000);
+    const r = f.call('summary', denied);
+    assert.notEqual(r.status, 0);
+    assert.equal(r.stdout.trim(), '', '不可读文件产生伪成功输出');
+    assert.match(r.stderr, /状态文件不可读/, `权限故障文案不明确：${r.stderr}`);
+    assert.doesNotMatch(r.stderr, /不是合法 JSON/, '权限故障被误报成 JSON 语法错误');
+    assert.equal(calls(f), '');
+  } finally {
+    try { fs.chmodSync(denied, 0o600); } catch { /* 文件可能未创建 */ }
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
 test('schema 不受支持（schema:2 与缺失 schema）：非零退出且无输出', () => {
   const cases: [string, unknown][] = [
     ['schema2', { ...ledger('running', 2), schema: 2 }],
@@ -245,9 +295,42 @@ test('help 的 commands 列出 summary <state.json>，version 行为不变', () 
     const parsed = JSON.parse(help.stdout);
     assert.ok(Array.isArray(parsed.commands), 'help.commands 不是数组');
     assert.ok(parsed.commands.includes('summary <state.json>'), `help.commands 缺少 summary：${help.stdout}`);
+    assert.equal(parsed.version, '0.2.0', 'version 号被改动');
     const version = f.call('version');
     assert.equal(version.status, 0, version.stderr);
     assert.equal(JSON.parse(version.stdout).version, parsed.version);
+    assert.equal(calls(f), '');
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+
+  // help/version 在状态文件校验之前返回：旧账本、任意损坏输入下仍保持既有行为。
+  const legacy = setup('help-legacy', '{"schema":1,');
+  try {
+    const help = legacy.call('help');
+    assert.equal(help.status, 0, help.stderr);
+    assert.ok(JSON.parse(help.stdout).commands.includes('summary <state.json>'));
+    const version = legacy.call('version');
+    assert.equal(version.status, 0, version.stderr);
+    assert.equal(JSON.parse(version.stdout).version, JSON.parse(help.stdout).version);
+    assert.equal(calls(legacy), '');
+  } finally { fs.rmSync(legacy.dir, { recursive: true, force: true }); }
+});
+
+test('同族只读命令 inspect/metrics 对同一 fixture 行为不变，且不写状态', () => {
+  const state = ledger('running', 2);
+  const f = setup('readonly-peers', JSON.stringify(state, null, 2) + '\n');
+  try {
+    const before = digest(f.dir);
+    const inspect = f.call('inspect', f.statePath);
+    assert.equal(inspect.status, 0, `inspect 退出码非 0；stderr=${inspect.stderr}`);
+    assert.equal(JSON.parse(inspect.stdout).id, state.id);
+    const m = f.call('metrics', f.statePath);
+    assert.equal(m.status, 0, `metrics 退出码非 0；stderr=${m.stderr}`);
+    const parsed = JSON.parse(m.stdout);
+    assert.equal(parsed.run, state.id);
+    assert.equal(parsed.jobs, state.jobs.length);
+    assert.deepEqual(parsed.byStatus, { leased: 2, running: 1, done: 1, cancelled: 1 });
+    assert.equal(fs.readFileSync(f.statePath, 'utf8'), JSON.stringify(state, null, 2) + '\n', 'inspect/metrics 改写了状态文件');
+    assert.equal(digest(f.dir), before, 'inspect/metrics 在 fixture 目录留下新增或改动');
     assert.equal(calls(f), '');
   } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
 });

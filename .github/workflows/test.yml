@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - codex/test-deepseek-harness
+  push:
+    branches:
+      - codex/test-deepseek-harness
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (Node 24)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Run tests
+        run: npm test

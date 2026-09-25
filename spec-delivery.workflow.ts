@@ -88,7 +88,7 @@ function archiveResult(statePath:string,j:engine.Job) {
 /**
  * 离线只读投影：先核对路径指向可读的普通文件，再读文件、解析、校验 schema，最后复用纯函数 summarize。
  * 不取锁、不调用 gh/git、不写状态或 history，也不参与锁恢复；失败一律抛出由统一入口转成非零退出。
- * 故障文案按事实区分：路径不存在、不是普通文件（目录等，含悬空符号链接）、文件不可读、内容不是合法 JSON，
+ * 故障文案按事实区分：路径不存在（悬空符号链接被 existsSync 跟随链接后同判为不存在）、不是普通文件（目录等）、文件不可读、内容不是合法 JSON，
  * 不让可读性故障被误报成 JSON 语法问题。
  */
 function summarizeLedger(statePath: string) {

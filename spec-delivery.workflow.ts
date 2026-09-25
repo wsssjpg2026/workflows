@@ -14,6 +14,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import * as engine from './spec-delivery/core.ts';
 import * as gh from './spec-delivery/github.ts';
 import { normalizeResult, resultPaths, metrics } from './spec-delivery/host.ts';
+import { summarize } from './spec-delivery/summary.ts';
 export * from './spec-delivery/core.ts';
 
 const home = path.dirname(fileURLToPath(import.meta.url));
@@ -83,6 +84,20 @@ function save(file: string, s: engine.State) {
 function archiveResult(statePath:string,j:engine.Job) {
   const file=resultPaths(statePath,j.id).result;
   if(j.result && !fs.existsSync(file))write(file,j.result);
+}
+/**
+ * 离线只读投影：读文件、解析、校验 schema，然后复用纯函数 summarize。
+ * 不取锁、不调用 gh/git、不写状态或 history，也不参与锁恢复；失败一律抛出由统一入口转成非零退出。
+ */
+function summarizeLedger(statePath: string) {
+  let raw: unknown;
+  try { raw = JSON.parse(fs.readFileSync(statePath, 'utf8')); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error(`状态文件不存在：${statePath}`);
+    throw new Error(`状态文件不是合法 JSON：${(error as Error).message}`);
+  }
+  engine.ensure(raw && typeof raw === 'object' && !Array.isArray(raw) && (raw as engine.State).schema === 1, '不支持的状态版本');
+  return summarize(raw as engine.State);
 }
 export function observe(s: engine.State, jobs?: engine.Job[]): engine.LiveFacts {
   const before = { ...gh.observationMetrics };
@@ -503,8 +518,10 @@ export async function main(argv: string[]): Promise<unknown> {
   const [op, file, extra, fourth] = argv;
   if(op==='version')return {workflow:'spec-delivery',version:workflowVersion};
   if (!op || op === 'help') return { workflow: 'spec-delivery', input: ['spec', 'targetBranch', 'models.L1', 'models.L2', 'models.L3'],
-    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','init <input.json>', 'inspect <state>', 'plan <state> <plan.json>', 'drive <state>', 'next <state>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'stage <state> <jobId> <result-json>', 'collect <state>', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'test <state> <jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'metrics <state>', 'resume <state>', 'zcode <state>'] };
+    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan <state> <plan.json>', 'drive <state>', 'next <state>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'stage <state> <jobId> <result-json>', 'collect <state>', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'test <state> <jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'metrics <state>', 'resume <state>', 'zcode <state>'] };
   engine.ensure(file, '缺少输入文件/状态路径');
+  // summary 在 lock() 之前返回：既不创建/等待/恢复/删除状态锁，也不进入任何写路径或协议门禁。
+  if (op === 'summary') return summarizeLedger(path.resolve(file));
   if (op === 'init') return initialize(read<engine.Inputs>(file));
   if (op === 'execute') { engine.ensure(extra, '需要 command jobId'); return executeCommand(path.resolve(file), extra); }
   if (op === 'test') {engine.ensure(extra && fourth,'需要 jobId 与测试请求文件');return runTest(path.resolve(file),extra,read(fourth));}

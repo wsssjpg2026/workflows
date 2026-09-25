@@ -56,6 +56,48 @@
 
 作者双轴、L2 五视角 regular/fresh 和独立验收均保留；问题确认门槛仍为 **≥50**。同一候选的判定跨过门槛时，由新的 L1 依据原始证据裁决。CI 未配置或有证据的计费未启动才可按角色规则豁免；实际执行失败不可豁免，并回到 L3 修复。CI 仍在正常执行时保留队首、等待状态事件；长期环境阻断由 L1 对账、重规划或释放队首，不能改成通过。
 
+## summary：离线只读摘要
+
+`summary` 是运行账本的离线只读摘要：把调度状态压成紧凑投影，适合快速查看当前运行，或归档一份不需要完整历史的快照。它与完整账本和运行指标的用途不同：
+
+| 命令 | 用途 |
+| --- | --- |
+| `summary <state>` | 离线只读摘要：工单与任务计数、运行状态，适合快速查看和归档快照 |
+| `inspect <state>` | 完整账本：全部工单、jobs、事件、facts 等内部细节，用于诊断与对账 |
+| `metrics <state>` | 运行指标：阶段数量、候选失效、队列与观测指标，用于复盘调度表现 |
+
+用法：`node spec-delivery.workflow.ts summary <state.json>`。入口为 [spec-delivery.workflow.ts](../spec-delivery.workflow.ts)，输出一个 JSON 对象，主要字段：
+
+- `schemaVersion`：摘要契约版本，当前恒为 `1`；
+- `spec`：spec 编号；`targetBranch`：目标分支；`status`：运行状态（`planning`、`running`、`blocked`、`paused`、`waiting_human`、`complete`、`retired` 等）；
+- `tickets`：`{total, done, human, blocked, pending}`；
+- `jobs`：`{active, leased, running}`；
+- `validationOwner`：当前持有验证队列的工单 key，没有则为 `null`。
+
+计数语义：`pending = total - done - human - blocked`，即不处于 `done`、`human`、`blocked` 的工单（认领、计划、计划复核、实现、排队、自检、验证、发布、审查、验收、集成、重规划、合并、关闭、清理等阶段）都计入 `pending`；`active = leased + running`，只统计当前持有租约或正在执行的 job，`done`、`cancelled` 等终态不计入。恒等式为 `tickets.total = done + human + blocked + pending`。
+
+与 `inspect`/`metrics` 相同，`summary` 豁免版本门禁：没有 `upgrade` 的旧账本和已经 `retire` 的账本都可直接读取。它只读取状态文件并输出摘要，不创建、等待或恢复锁，不进入写路径，不调用 GitHub，也不改变状态、历史或租约。
+
+路径不存在、不是普通文件、不可读、内容不是合法 JSON 或结构不符合 `schema 1` 时，命令以非零退出并在 stderr 给出对应错误；可读性故障不会被说成 JSON 语法问题。
+
+下面是合成数据，只用于说明输出形状，**不是本轮运行的实测结果**（spec 编号、目标分支与工单号都是虚构的，不要引用其中数值）：
+
+```json
+{
+  "schemaVersion": 1,
+  "spec": 42,
+  "targetBranch": "codex/example-target",
+  "status": "running",
+  "tickets": { "total": 6, "done": 2, "human": 1, "blocked": 1, "pending": 2 },
+  "jobs": { "active": 2, "leased": 1, "running": 1 },
+  "validationOwner": "17"
+}
+```
+
+示例形状与真实 `summary` CLI 在合成 fixture 上的输出一致；请以自己账本的实际输出为准。
+
+宿主配置仍只需用户提供 spec、目标分支和 L1/L2/L3 三个模型，其它安排由 L1 决定（见上文「启动只需五项」）。运行记录方面，用 `record-host <state> <observations.json>` 保存真实的宿主任务身份（`nativeId`）与阶段时间；未取得的模型时间、token、费用保持未知，绑定时间不能当作模型开始时间（见上文「完成、指标与验证」）。
+
 ## 中断、迁移与退役
 
 `inspect <state>` 查看账本。先查询原生执行者和子进程，再提交 `reconcile <state> <host-status.json>`：数组项为 `{jobId,nativeId,state,evidencePath,userStopped?}`，state 为 `running/stopped/lost/completed`。真实运行保留租约；完成则提交原结果；确认终止才取消。中断测试/命令需核对整个进程树，并提供 `processTreeStopped:true` 及证据；父进程消失本身不证明测试已停止。命令要恢复同一 job 时指定 `commandDisposition:"recover"`；选择 `"cancel"` 或省略则取消租约，保留已有结果、意图和资源，随后可退役或改模型。

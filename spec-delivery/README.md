@@ -96,7 +96,7 @@
 
 示例形状与真实 `summary` CLI 在合成 fixture 上的输出一致；请以自己账本的实际输出为准。
 
-宿主配置仍只需用户提供 spec、目标分支和 L1/L2/L3 三个模型，其它安排由 L1 决定（见上文「启动只需五项」）。运行记录方面，用 `record-host <state> <observations.json>` 保存真实的宿主任务身份（`nativeId`）与阶段时间；未取得的模型时间、token、费用保持未知，绑定时间不能当作模型开始时间（见上文「完成、指标与验证」）。
+宿主配置仍只需用户提供 spec、目标分支和 L1/L2/L3 三个模型，其它安排由 L1 决定（见上文「启动只需五项」）。运行记录方面，用 `record-host <state> <observations.json>` 保存真实的宿主任务身份（`nativeId`）与阶段时间；未取得的模型时间、token、费用保持未知，绑定时间不能当作模型开始时间（见下文「完成、指标与验证」）。
 
 ## 中断、迁移与退役
 
@@ -104,7 +104,7 @@
 
 确定性命令先保存结果再提交状态。同一 job 的命令进程已退出且结果存在时，`execute/drive` 使用原结果恢复；不会重跑已完成验证。认领使用预期基线 SHA 创建 branch/worktree，并用稳定评论标记对账。若命令退出但没有结果，`drive` 返回 `recoveryRequired`；L1 先确认其子进程和不确定远端动作，再用上述 recover 对账授权恢复。锁等待有界；锁的恢复者自身异常退出时，L1 核对 `.lock.recovery` 的持有者后恢复，不能删仍在使用的锁。
 
-旧版运行可以直接 `inspect/metrics`，也可用 `bind/stage/collect/submit` 登记原租约已经完成的结果；继续新派发前先对账并排空在途任务，再执行 `upgrade <state> <evidence.json>`，内容为 `{evidencePath}`。迁移保留全部原结果和已完成工单，未完成验证从队列重新获取证据，不混用旧版部分审查。查看已完成的历史运行无需迁移。
+旧版运行可以直接 `inspect/metrics/summary`，也可用 `bind/stage/collect/submit` 登记原租约已经完成的结果；继续新派发前先对账并排空在途任务，再执行 `upgrade <state> <evidence.json>`，内容为 `{evidencePath}`。迁移保留全部原结果和已完成工单，未完成验证从队列重新获取证据，不混用旧版部分审查。查看已完成的历史运行无需迁移。
 
 `reconfigure <state> <models.json>` 在无在途任务时调整路由，文件为 `{models,capabilities,evidencePath}`；保留已完成任务的原模型与证据，仅新派发使用新模型。`retire <state> <reason.json>` 需要 `{reason,evidencePath}`，要求已停止所有任务；保留证据和未交付资源，常规调度无法复活它。
 

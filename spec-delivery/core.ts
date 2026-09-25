@@ -53,7 +53,8 @@ export interface Job {
   timing?: { leasedAt: string; boundAt?: string; startedAt?: string; resultAt?: string; completedAt?: string; cancelledAt?: string };
   usage?: { inputTokens?: number; outputTokens?: number; cost?: number; currency?: string; modelMs?: number };
   dispute?: { previous: string; current: string };
-  testExecution?: { pid: number; granted: boolean; startedAt: string };
+  testExecution?: { pid: number; granted: boolean; startedAt: string; worktree?: string; evidenceDirectory?: string };
+  commandRecovery?: { nativeId: string; evidencePath: string; at: string };
 }
 export interface State {
   schema: 1; id: string; revision: number; inputs: Inputs; spec: number;
@@ -86,6 +87,7 @@ function enqueue(s: State, t: Ticket) {
 /** 一个目标分支的完整验证区间互斥；队外仍可计划与实现。 */
 function admit(s: State) {
   const owner = s.tickets.find(t => t.key === s.validationOwner);
+  if (owner?.reason === 'waiting_ci' && s.facts.prs[owner.pr]?.checks.some(c=>c.status==='pending')) return;
   if (owner && !['done', 'close', 'cleanup', 'human', 'blocked'].includes(owner.phase)) return;
   if (owner && s.jobs.some(j => j.ticket === owner.key && busy(j))) return;
   s.validationOwner = undefined;
@@ -158,10 +160,10 @@ function dependencyReady(s: State, t: Ticket) {
     (t.externalDependencies || []).every(key => s.facts.issueStates[key] === 'CLOSED');
 }
 function resetCandidate(t: Ticket, head: string, base: string, phase: Phase) {
-  t.head = head; t.base = base; t.evidence = {}; t.epoch++; t.phase = phase;
+  t.head = head; t.base = base; t.evidence = {}; t.epoch++; t.phase = phase; t.reason = '';
 }
 function problem(s: State, t: Ticket, signature: string, next: Phase) {
-  t.round++; t.stalls = signature === t.lastProblem ? t.stalls + 1 : 0; t.lastProblem = signature;
+  t.round++; t.stalls = signature === t.lastProblem ? t.stalls + 1 : 0; t.lastProblem = signature; t.reason = signature;
   ensure(s.policy, '缺少策略');
   if (t.round >= s.policy.rounds || t.stalls >= s.policy.noProgress) {
     t.phase = t.escalations ? 'blocked' : 'replan'; t.reason = signature;
@@ -213,6 +215,7 @@ function reviewFindings(jobs: Job[]) {
 function disputes(s: State, t: Ticket, current: Job[]) {
   return current.flatMap(j => {
     const previous = s.jobs.findLast(p => p.ticket === t.key && p.epoch !== t.epoch && p.status === 'done' &&
+      p.result?.complete && p.result.status === 'confirmed' && p.result.findings?.length === 1 && Number.isFinite(p.result.findings[0].confidence) &&
       ['confirm', 'adjudicate'].includes(p.action) && p.head === j.head && p.base === j.base && p.part === j.part);
     return previous && (previous.result!.findings![0].confidence! >= 50) !== (j.result!.findings![0].confidence! >= 50)
       ? [{ t, action: 'adjudicate' as Action, part: j.part, finding: j.finding, dispute: { previous: previous.id, current: j.id } }] : [];
@@ -251,6 +254,7 @@ function candidates(s: State): Candidate[] {
   // 中途人工技术前置或外部依赖也可能使整张图暂无可运行节点。
   // 交给独立 L1 给出明确人工交接/阻断结论，不能空轮询或假定软件都完成。
   if (out.length === 0 && !s.jobs.some(busy)) {
+    if (s.tickets.some(t=>t.reason==='waiting_ci' && s.facts.prs[t.pr]?.checks.some(c=>c.status==='pending'))) return out;
     if (!s.specAudit) out.push({ action: 'spec-audit' });
     else if (s.specAudit.status === 'complete' && s.facts.issueStates[String(s.spec)] !== 'CLOSED') out.push({ action: 'spec-close' });
   }
@@ -451,7 +455,7 @@ export function reconcileFacts(s: State, facts: LiveFacts) {
     }
     else if (t.base !== facts.base) {
       if (!t.worktree) { resetCandidate(t, t.head, facts.base, 'claim'); }
-      else if (s.validationOwner === t.key || (validationPhases.includes(t.phase) && t.phase !== 'queued') || t.reason === 'stale') {
+      else if (s.validationOwner === t.key || (validationPhases.includes(t.phase) && t.phase !== 'queued') || ['stale','waiting_ci'].includes(t.reason)) {
         t.baseInvalidations = (t.baseInvalidations || 0) + 1;
         resetCandidate(t, t.head, facts.base, 'integrate'); enqueue(s, t);
         if (t.baseInvalidations >= s.policy!.noProgress) {
@@ -462,6 +466,9 @@ export function reconcileFacts(s: State, facts: LiveFacts) {
       // 计划、实现与排队中的候选保留原基线，等到队首一次性集成最新目标。
     }
     if (t.phase === 'blocked' && t.reason === 'waiting_ci' && p && ciAllowed(p)) { t.phase = 'accept'; t.epoch++; }
+    if (t.phase === 'blocked' && t.reason === 'waiting_ci' && p?.checks.some(c=>c.status==='failed')) {
+      problem(s,t,`CI 执行失败：${p.checks.filter(c=>c.status==='failed').map(c=>c.id).sort().join(',')}`,'implement');
+    }
     if (t.phase === 'merge' && p?.mergeable === 'CONFLICTING') resetCandidate(t, t.head, facts.base, 'integrate');
   }
   if (s.status === 'blocked' && s.tickets.some(t => !['done', 'human', 'blocked'].includes(t.phase))) {
@@ -473,5 +480,5 @@ export function reconcileFacts(s: State, facts: LiveFacts) {
       t.phase = 'cleanup'; if (s.status !== 'paused') s.status = 'running';
     }
   }
-  if (s.status === 'running' && s.specAudit?.status === 'complete' && facts.issueStates[String(s.spec)] === 'CLOSED' && s.tickets.every(t => t.phase === 'done')) s.status = 'complete';
+  if (s.status === 'running' && !s.jobs.some(busy) && s.specAudit?.status === 'complete' && facts.issueStates[String(s.spec)] === 'CLOSED' && s.tickets.every(t => t.phase === 'done')) s.status = 'complete';
 }

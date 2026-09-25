@@ -50,19 +50,19 @@
 
 ## 测试与 GitHub 观测
 
-所有 agent 的测试/构建/重型核验通过 `test <state> <jobId> <request.json>` 执行，请求格式 `{argv,timeoutSeconds,env?,reason}`。cwd 为任务 worktree。测试配额按实际执行占用；不足时等待，不改用未登记的旁路命令。退出码、日志和失败证据保留，完成后释放配额。确定性 `verify` 直接使用核心预留的配额。该协议依赖宿主和角色遵守，无法限制框架外的任意 shell 进程。
+所有 agent 的测试/构建/重型核验通过 `test <state> <jobId> <request.json>` 执行，请求格式 `{argv,timeoutSeconds,env?,reason}`。cwd 为任务 worktree。测试配额按实际执行占用；不足时等待，不改用未登记的旁路命令。退出码、候选、日志和失败证据保留，完成后释放配额。最终 spec 审计的测试会临时建立冻结目标 SHA 的 detached worktree，完成后清理干净的审计目录；`candidateStable:false` 的结果不能用于验收。确定性 `verify` 直接使用核心预留的配额。该协议依赖宿主和角色遵守，无法限制框架外的任意 shell 进程。
 
 普通观测批量读取目标 SHA、issue 状态和 PR 候选；正文、评论、依赖由需要它们的角色读取。验收、合并和最终审计重新获取适用 CI，合并 actor 操作前调用 `guard <state> <jobId>`。只读瞬时网络故障有界重试，权限/不完整响应明确失败；外部写操作先查状态，不盲目重试。
 
-作者双轴、L2 五视角 regular/fresh 和独立验收均保留；问题确认门槛仍为 **≥50**。同一候选的判定跨过门槛时，由新的 L1 依据原始证据裁决。CI 未配置或有证据的计费未启动才可按角色规则豁免；实际执行失败不可豁免。
+作者双轴、L2 五视角 regular/fresh 和独立验收均保留；问题确认门槛仍为 **≥50**。同一候选的判定跨过门槛时，由新的 L1 依据原始证据裁决。CI 未配置或有证据的计费未启动才可按角色规则豁免；实际执行失败不可豁免，并回到 L3 修复。CI 仍在正常执行时保留队首、等待状态事件；长期环境阻断由 L1 对账、重规划或释放队首，不能改成通过。
 
 ## 中断、迁移与退役
 
-`inspect <state>` 查看账本。先查询原生执行者和子进程，再提交 `reconcile <state> <host-status.json>`：数组项为 `{jobId,nativeId,state,evidencePath,userStopped?}`，state 为 `running/stopped/lost/completed`。真实运行保留租约；完成则提交原结果；确认终止才取消。中断测试需核对整个进程树，父进程消失本身不证明测试已停止。
+`inspect <state>` 查看账本。先查询原生执行者和子进程，再提交 `reconcile <state> <host-status.json>`：数组项为 `{jobId,nativeId,state,evidencePath,userStopped?}`，state 为 `running/stopped/lost/completed`。真实运行保留租约；完成则提交原结果；确认终止才取消。中断测试/命令需核对整个进程树，并提供 `processTreeStopped:true` 及证据；父进程消失本身不证明测试已停止。命令要恢复同一 job 时指定 `commandDisposition:"recover"`；选择 `"cancel"` 或省略则取消租约，保留已有结果、意图和资源，随后可退役或改模型。
 
-确定性命令先保存结果再提交状态。同一 job 的命令进程已退出且结果存在时，`execute/drive` 使用原结果恢复；不会重跑已完成验证。认领使用预期基线 SHA 创建 branch/worktree，并用稳定评论标记对账。若命令退出但没有结果，先确认其子进程和不确定远端动作再恢复。锁等待有界；锁的恢复者自身异常退出时，L1 核对 `.lock.recovery` 的持有者后恢复，不能删仍在使用的锁。
+确定性命令先保存结果再提交状态。同一 job 的命令进程已退出且结果存在时，`execute/drive` 使用原结果恢复；不会重跑已完成验证。认领使用预期基线 SHA 创建 branch/worktree，并用稳定评论标记对账。若命令退出但没有结果，`drive` 返回 `recoveryRequired`；L1 先确认其子进程和不确定远端动作，再用上述 recover 对账授权恢复。锁等待有界；锁的恢复者自身异常退出时，L1 核对 `.lock.recovery` 的持有者后恢复，不能删仍在使用的锁。
 
-旧版运行可以直接 `inspect/metrics`；继续运行前先对账并停止在途任务，再执行 `upgrade <state> <evidence.json>`，内容为 `{evidencePath}`。迁移保留全部原结果和已完成工单，未完成验证从队列重新获取证据，不混用旧版部分审查。查看已完成的历史运行无需迁移。
+旧版运行可以直接 `inspect/metrics`，也可用 `bind/stage/collect/submit` 登记原租约已经完成的结果；继续新派发前先对账并排空在途任务，再执行 `upgrade <state> <evidence.json>`，内容为 `{evidencePath}`。迁移保留全部原结果和已完成工单，未完成验证从队列重新获取证据，不混用旧版部分审查。查看已完成的历史运行无需迁移。
 
 `reconfigure <state> <models.json>` 在无在途任务时调整路由，文件为 `{models,capabilities,evidencePath}`；保留已完成任务的原模型与证据，仅新派发使用新模型。`retire <state> <reason.json>` 需要 `{reason,evidencePath}`，要求已停止所有任务；保留证据和未交付资源，常规调度无法复活它。
 

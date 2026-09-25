@@ -41,6 +41,8 @@ test('派发只携带有界证据索引，fresh 不接收旧结论',()=>{
     for(let n=0;n<100;n++)x.s.jobs.push({...x.j,id:'old'+n,status:'done',result:{model:x.j.model,complete:true,status:'reviewed',evidencePath:'x',findings:[{id:'x',description:'z'.repeat(20000),evidence:'e'}]}});
     const p=packet(x.s,{...x.j,action:'publish',fresh:false},x.file);
     assert.ok(Buffer.byteLength(JSON.stringify(p))<16000);assert.ok(fs.existsSync(p.historyIndexPath));
-    const f=packet(x.s,{...x.j,action:'review-lens',fresh:true},x.file);assert.deepEqual(f.prior,[]);assert.equal(f.historyIndexPath,'');
+    assert.ok(p.prior.every(item=>fs.existsSync(item.resultPath)));
+    x.s.tickets.push({key:'101',lastProblem:'old review says bug',reason:'earlier conclusion',evidence:{}} as any);
+    const f=packet(x.s,{...x.j,action:'review-lens',fresh:true},x.file);assert.deepEqual(f.prior,[]);assert.equal(f.historyIndexPath,'');assert.equal(f.blockingReason,'');
   } finally {fs.rmSync(x.root,{recursive:true,force:true});}
 });

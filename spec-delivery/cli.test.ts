@@ -7,7 +7,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import * as e from './core.ts';
-import { stageResult } from '../spec-delivery.workflow.ts';
+import { packet, stageResult } from '../spec-delivery.workflow.ts';
 const entry=fileURLToPath(new URL('../spec-delivery.workflow.ts',import.meta.url));
 const git=(cwd:string,...args:string[])=>execFileSync('git',args,{cwd,encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
 function setup() {
@@ -48,7 +48,8 @@ test('原命令进程终止后复用已落盘结果，不重跑验证命令',()=
     x.t.phase='verify';x.s.validationOwner=x.t.key;x.s.jobs=[];const j=e.reserve(x.s)[0];e.bind(x.s,j.id,{nativeId:'command:2147483647:1',model:j.model});
     const dir=path.join(x.run,'commands');fs.mkdirSync(dir);fs.writeFileSync(path.join(dir,createHash('sha256').update(j.id).digest('hex').slice(0,20)+'.json'),JSON.stringify({result:{model:j.model,complete:true,status:'pass',head:j.head,base:j.base,evidencePath:path.join(x.root,'evidence.md')}}));
     fs.writeFileSync(x.statePath,JSON.stringify(x.s));const r=x.call('execute',x.statePath,j.id);assert.equal(r.status,0,r.stderr);
-    assert.equal(JSON.parse(fs.readFileSync(x.statePath,'utf8')).tickets[0].phase,'publish');
+    const saved=JSON.parse(fs.readFileSync(x.statePath,'utf8'));assert.equal(saved.tickets[0].phase,'publish');
+    const p=packet(saved,{...j,action:'publish',fresh:false},x.statePath);assert.ok(p.prior.length);assert.ok(p.prior.every(item=>fs.existsSync(item.resultPath)));
   } finally {fs.rmSync(x.root,{recursive:true,force:true});}
 });
 test('临时测试配额保留失败证据并释放，模型切换保留已经完成的任务',()=>{
@@ -91,6 +92,9 @@ else if(endpoint.includes('/dependencies/'))console.log('[[]]');
 else console.log(JSON.stringify({number:101,html_url:'https://github.com/example/test/issues/101',title:'Task',body:'Do task',state:'open',assignees:[]}));
 `);
     const first=x.call('execute',x.statePath,j.id);assert.notEqual(first.status,0);
+    const unsafe=x.call('execute',x.statePath,j.id);assert.notEqual(unsafe.status,0,'没有结果时不能只凭父 PID 消失自动重入');
+    const bound=JSON.parse(fs.readFileSync(x.statePath,'utf8')).jobs[0];const proof=path.join(x.run,'stopped.json');fs.writeFileSync(proof,JSON.stringify([{jobId:j.id,nativeId:bound.nativeId,state:'stopped',processTreeStopped:true,commandDisposition:'recover',evidencePath:path.join(x.root,'evidence.md')}]));
+    assert.equal(x.call('reconcile',x.statePath,proof).status,0);
     const second=x.call('execute',x.statePath,j.id);assert.equal(second.status,0,second.stderr);
     const saved=JSON.parse(fs.readFileSync(x.statePath,'utf8'));assert.equal(git(saved.tickets[0].worktree,'rev-parse','HEAD'),target);assert.equal(git(x.root,'rev-parse','HEAD'),x.head);
     assert.equal(JSON.parse(fs.readFileSync(comments,'utf8')).length,1);assert.equal(saved.tickets[0].phase,'plan');
@@ -109,7 +113,38 @@ else if(a.at(-1).includes('/comments?')||a.at(-1).includes('/dependencies/'))con
 else console.log(JSON.stringify({number:100,html_url:'https://github.com/example/test/issues/100',title:'Spec',body:'Spec',state:issue.state,assignees:[]}));
 `);
     assert.notEqual(x.call('execute',x.statePath,j.id).status,0);
+    const bound=JSON.parse(fs.readFileSync(x.statePath,'utf8')).jobs[0];const proof=path.join(x.run,'stopped.json');fs.writeFileSync(proof,JSON.stringify([{jobId:j.id,nativeId:bound.nativeId,state:'stopped',processTreeStopped:true,commandDisposition:'recover',evidencePath:path.join(x.root,'evidence.md')}]));
+    assert.equal(x.call('reconcile',x.statePath,proof).status,0);
     const again=x.call('execute',x.statePath,j.id);assert.equal(again.status,0,again.stderr);
     assert.equal(JSON.parse(fs.readFileSync(remote,'utf8')).closes,1);assert.equal(JSON.parse(fs.readFileSync(x.statePath,'utf8')).status,'complete');
+  } finally {fs.rmSync(x.root,{recursive:true,force:true});}
+});
+test('旧协议的已完成 agent 可以先登记原结果再升级，无需伪造停止',()=>{
+  const x=setup();try {
+    delete x.s.protocol;e.bind(x.s,x.j.id,{nativeId:'old-run/planner',model:x.j.model});fs.writeFileSync(x.statePath,JSON.stringify(x.s));
+    const result=path.join(x.run,'legacy-result.json');fs.writeFileSync(result,JSON.stringify({model:x.j.model,complete:true,status:'planned',evidencePath:path.join(x.root,'evidence.md'),head:x.j.head,base:x.j.base,data:{planPath:path.join(x.root,'plan.json'),checksPath:path.join(x.root,'plan.json')}}));
+    const submitted=x.call('submit',x.statePath,x.j.id,result);assert.equal(submitted.status,0,submitted.stderr);
+    const proof=path.join(x.run,'proof.json');fs.writeFileSync(proof,JSON.stringify({evidencePath:path.join(x.root,'evidence.md')}));
+    const upgraded=x.call('upgrade',x.statePath,proof);assert.equal(upgraded.status,0,upgraded.stderr);
+    const saved=JSON.parse(fs.readFileSync(x.statePath,'utf8'));assert.equal(saved.jobs[0].status,'done');assert.equal(saved.tickets[0].phase,'plan_check');
+  } finally {fs.rmSync(x.root,{recursive:true,force:true});}
+});
+test('最终 spec 核验可在冻结目标 SHA 的隔离目录运行测试，保持主目录不变',()=>{
+  const x=setup();try {
+    fs.writeFileSync(path.join(x.root,'source'),'new target');git(x.root,'add','source');git(x.root,'commit','-m','target advanced');const target=git(x.root,'rev-parse','HEAD');git(x.root,'reset','--hard',x.head);
+    x.s.tickets=[];x.s.jobs=[];x.s.facts.base=target;const j=e.reserve(x.s)[0];fs.writeFileSync(x.statePath,JSON.stringify(x.s));
+    const request=path.join(x.run,'audit-test.json');fs.writeFileSync(request,JSON.stringify({argv:[process.execPath,'-e',"require('assert').equal(require('fs').readFileSync('source','utf8'),'new target')"],timeoutSeconds:5,reason:'cross-ticket acceptance'}));
+    const result=x.call('test',x.statePath,j.id,request);assert.equal(result.status,0,result.stderr);const receipt=JSON.parse(result.stdout);assert.equal(receipt.exitCode,0);assert.equal(receipt.head,target);assert.equal(git(x.root,'rev-parse','HEAD'),x.head);
+    assert.equal(git(x.root,'worktree','list','--porcelain').split('\n').filter(l=>l.startsWith('worktree ')).length,2);
+  } finally {fs.rmSync(x.root,{recursive:true,force:true});}
+});
+test('确认命令进程树已停止后可取消并退役，无须重新执行外部动作',()=>{
+  const x=setup();try {
+    x.t.phase='verify';x.s.jobs=[];const j=e.reserve(x.s)[0];e.bind(x.s,j.id,{nativeId:'command:2147483647:1',model:j.model});fs.writeFileSync(x.statePath,JSON.stringify(x.s));
+    const status=path.join(x.run,'stopped.json');fs.writeFileSync(status,JSON.stringify([{jobId:j.id,nativeId:j.nativeId,state:'stopped',processTreeStopped:true,commandDisposition:'cancel',evidencePath:path.join(x.root,'evidence.md')}]));
+    const cancel=x.call('reconcile',x.statePath,status);assert.equal(cancel.status,0,cancel.stderr);
+    const proof=path.join(x.run,'retire.json');fs.writeFileSync(proof,JSON.stringify({reason:'stop this run',evidencePath:path.join(x.root,'evidence.md')}));
+    const result=x.call('retire',x.statePath,proof);assert.equal(result.status,0,result.stderr);assert.ok(fs.existsSync(x.t.worktree));
+    assert.equal(JSON.parse(fs.readFileSync(x.statePath,'utf8')).jobs[0].status,'cancelled');
   } finally {fs.rmSync(x.root,{recursive:true,force:true});}
 });

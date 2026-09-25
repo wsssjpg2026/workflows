@@ -36,6 +36,7 @@ function git(root: string, ...argv: string[]) { return command(root, 'git', argv
 function safeFile(file: string) { engine.ensure(file && fs.statSync(file).isFile(), `工件不存在：${file}`); return file; }
 function localHead(t: engine.Ticket) { return git(t.worktree, 'rev-parse', 'HEAD'); }
 function clean(t: engine.Ticket) { return git(t.worktree, 'status', '--porcelain') === ''; }
+function allowCompletion(s: engine.State) { engine.ensure(s.status !== 'retired', '已退役运行不能接收执行结果'); }
 function requireProtocol(s: engine.State) {
   engine.ensure(s.protocol === 2, '旧版运行须先核对并停止在途任务，再执行 upgrade；inspect/metrics 可直接读取');
   engine.ensure(s.status !== 'retired', '运行已退役；只允许 inspect/metrics，保留账本和资源');
@@ -78,6 +79,10 @@ function save(file: string, s: engine.State) {
   // 先保存完整历史，再原子替换当前状态；重复提交不会覆盖历史证据。
   write(path.join(path.dirname(file), 'history', `${String(s.revision).padStart(6, '0')}-${randomUUID()}.json`), s);
   write(file, s);
+}
+function archiveResult(statePath:string,j:engine.Job) {
+  const file=resultPaths(statePath,j.id).result;
+  if(j.result && !fs.existsSync(file))write(file,j.result);
 }
 export function observe(s: engine.State, jobs?: engine.Job[]): engine.LiveFacts {
   const before = { ...gh.observationMetrics };
@@ -152,8 +157,8 @@ export function packet(s: engine.State, j: engine.Job, statePath: string) {
   const prior = s.jobs.filter(x => x.ticket === j.ticket && x.status === 'done' && x.result &&
     (j.action === 'review-report' ? x.epoch === j.epoch && ['review-lens', 'confirm', 'adjudicate'].includes(x.action)
       : !j.fresh && (authored || ['review-lens', 'confirm', 'review-report'].includes(x.action))))
-    .map(x => ({ action: x.action, epoch: x.epoch, head: x.head, base: x.base, status: x.result!.status,
-      resultPath: path.join(path.dirname(statePath), 'jobs', sha(x.id).slice(0, 20), 'result.json') }));
+    .map(x => { archiveResult(statePath,x); return { action: x.action, epoch: x.epoch, head: x.head, base: x.base, status: x.result!.status,
+      resultPath: resultPaths(statePath,x.id).result }; });
   // 旧结果保持完整归档；每次派发只带当前轮的索引，完整历史按需读取。
   const relevant = prior.filter(x => x.epoch === j.epoch || x.head === j.head);
   const priorPath = path.join(out, 'prior-index.json');
@@ -164,6 +169,7 @@ export function packet(s: engine.State, j: engine.Job, statePath: string) {
     repo: s.repo, spec: s.spec, issue: t?.number || s.spec, targetBranch: s.inputs.targetBranch,
     branch: t?.branch || '', worktree: t?.worktree || '', pr: t?.pr || 0, expectedHead: j.head, expectedBase: j.base,
     criteria: t?.criteria || s.specCriteria, visualRequired: t?.visual || false, closeout: t?.closeout || false,
+    blockingReason: j.fresh && ['review-lens','confirm'].includes(j.action) ? '' : t?.reason || t?.lastProblem || '',
     planPath: j.fresh && j.action !== 'plan-check' ? '' : t?.planPath || '', checksPath: t?.checksPath || '',
     handoffPath: j.fresh ? '' : authored ? t?.handoffPath || '' : t?.reviewHandoff || '',
     sourceUrl: `https://${s.repo.host}/${s.repo.slug}/issues/${t?.number || s.spec}`,
@@ -311,9 +317,15 @@ function closeIssue(s:engine.State,j:engine.Job,statePath:string):engine.Result 
   write(evidencePath,{jobId:j.id,issue:number,state:issue.state,base:s.facts.base,acceptance:t?.evidence.accept || s.specAudit});
   return {model:j.model,complete:true,status:'closed',base:j.base,evidencePath};
 }
+function commandReceipt(statePath:string,id:string) {return path.join(path.dirname(statePath),'commands',sha(id).slice(0,20)+'.json');}
+function hasCommandReceipt(statePath:string,j:engine.Job) {
+  const file=commandReceipt(statePath,j.id);
+  return fs.existsSync(file) && !!read<{result?:engine.Result}>(file).result;
+}
+function canRecoverCommand(statePath:string,j:engine.Job) {return hasCommandReceipt(statePath,j) || j.commandRecovery?.nativeId===j.nativeId;}
 function executeCommand(statePath: string, id: string) {
   let release = lock(statePath); let s: engine.State; let j: engine.Job;
-  const receiptPath=path.join(path.dirname(statePath),'commands',sha(id).slice(0,20)+'.json');
+  const receiptPath=commandReceipt(statePath,id);
   try {
     s = read<engine.State>(statePath); requireProtocol(s); engine.ensure(s.status === 'running', 'workflow 未运行；暂停后不能执行命令任务');
     const found = s.jobs.find(job => job.id === id);
@@ -321,7 +333,10 @@ function executeCommand(statePath: string, id: string) {
     if(j.nativeId) {
       const pid=Number(j.nativeId.match(/^command:(\d+):/)?.[1]);
       engine.ensure(pid && !processAlive(pid), '原命令进程仍可能执行，不能重入');
+      engine.ensure(canRecoverCommand(statePath,j),'无命令结果；先 reconcile 核对整个进程树及不确定外部动作，不能只凭父 PID 消失重跑');
+      if(j.commandRecovery)safeFile(j.commandRecovery.evidencePath);
       j.nativeId=''; j.status='leased';
+      delete j.commandRecovery;
     }
     s.facts = observe(s,[j]); engine.bind(s, j.id, { nativeId: `command:${process.pid}:${s.revision}`, model: j.model });
     save(statePath, s);
@@ -335,7 +350,7 @@ function executeCommand(statePath: string, id: string) {
   try {
     const latest = read<engine.State>(statePath); latest.facts = observe(latest,[j]);
     if(j.action==='claim') validateResult(latest,j,r);
-    engine.submit(latest, j.id, r); save(statePath, latest);
+    engine.submit(latest, j.id, r); archiveResult(statePath,latest.jobs.find(x=>x.id===j.id)!); save(statePath, latest);
     return { statePath, status: latest.status, revision: latest.revision, result: r };
   } finally { release(); }
 }
@@ -393,7 +408,7 @@ return {conclusion:reportText,findings:[],verified:[],notCovered:["原生身份�
 export function consumeStaged(statePath: string, ids?: string[]) {
   const release = lock(statePath);
   try {
-    let s = read<engine.State>(statePath); requireProtocol(s);
+    let s = read<engine.State>(statePath); allowCompletion(s);
     const jobs = s.jobs.filter(j => active(j) && j.nativeId && j.executor === 'agent' && (!ids || ids.includes(j.id)) && fs.existsSync(resultPaths(statePath, j.id).ready));
     if (!jobs.length) return { submitted: [], rejected: [] };
     s.facts = observe(s, jobs);
@@ -413,7 +428,7 @@ export function consumeStaged(statePath: string, ids?: string[]) {
 export function stageResult(statePath: string, id: string, value: unknown) {
   const release = lock(statePath);
   try {
-    const s = read<engine.State>(statePath), j = s.jobs.find(j => j.id === id); requireProtocol(s);
+    const s = read<engine.State>(statePath), j = s.jobs.find(j => j.id === id); allowCompletion(s);
     engine.ensure(j && j.executor === 'agent' && (active(j) || j.status === 'done'), '只能接收已登记的 agent 任务结果');
     const r = normalizeResult(s, j, value), files = resultPaths(statePath, id);
     if(j.status==='done') engine.ensure(JSON.stringify(j.result)===JSON.stringify(r),'已完成任务的回执不能改变');
@@ -429,7 +444,7 @@ export function stageResult(statePath: string, id: string, value: unknown) {
 export function bindBatch(statePath: string, binding: {runId:string; model:string; jobs:{jobId:string; actorName:string}[]}) {
   const release = lock(statePath);
   try {
-    const s = read<engine.State>(statePath); requireProtocol(s);
+    const s = read<engine.State>(statePath); allowCompletion(s);
     engine.ensure(binding.runId && binding.jobs.length && new Set(binding.jobs.map(j=>j.jobId)).size === binding.jobs.length, '需要真实 runId 与不重复的任务清单');
     for (const item of binding.jobs) {
       engine.ensure(item.actorName, '需要原生 actor 的稳定名称');
@@ -444,25 +459,41 @@ export function bindBatch(statePath: string, binding: {runId:string; model:strin
 }
 function runTest(statePath:string,id:string,request:{argv:string[];timeoutSeconds:number;env?:Record<string,string>;reason:string}) {
   engine.ensure(Array.isArray(request.argv) && request.argv.length && request.argv.every(x=>typeof x==='string') && request.argv[0] && Number.isFinite(request.timeoutSeconds) && request.timeoutSeconds>0 && request.reason,'测试需要 argv 数组、有限超时与核验目的');
-  let release=lock(statePath); let worktree='';
+  const executionId=randomUUID(), out=path.join(path.dirname(statePath),'experiments',`${sha(id).slice(0,16)}-${executionId}`);
+  let release=lock(statePath); let worktree='', base=''; let audit:engine.State|undefined;
   try {
     const s=read<engine.State>(statePath), j=s.jobs.find(j=>j.id===id); requireProtocol(s);
     engine.ensure(s.status==='running' && j && j.executor==='agent' && active(j),'只能为在途 agent 任务申请测试');
     engine.ensure(!j.testExecution,'此任务已有测试进程或未对账的中断；先核对整个进程树，不自动回收配额');
     engine.ensure(j.tests || s.jobs.filter(active).reduce((n,x)=>n+x.tests,0)<s.policy!.tests,'测试配额暂不可用；等待测试完成后重试，不改用旁路执行');
-    j.testExecution={pid:process.pid,granted:j.tests===0,startedAt:new Date().toISOString()};j.tests=1;
-    worktree=engine.ticket(s,j.ticket).worktree;engine.ensure(worktree,'任务尚无 worktree');
+    if(j.ticket==='$spec') {
+      engine.ensure(j.action==='spec-audit','仅 spec 审计可申请最终组合测试');
+      audit=s;worktree=path.join(s.repo.root,'.agents','worktrees',`spec-${s.spec}-audit-${executionId}`);
+    } else worktree=engine.ticket(s,j.ticket).worktree;
+    engine.ensure(worktree,'任务尚无 worktree');base=j.base;
+    j.testExecution={pid:process.pid,granted:j.tests===0,startedAt:new Date().toISOString(),worktree,evidenceDirectory:out};j.tests=1;
     engine.event(s,`${j.ticket} 获得测试配额`);save(statePath,s);
   } finally {release();}
-  const out=path.join(path.dirname(statePath),'experiments',`${sha(id).slice(0,16)}-${randomUUID()}`);
   let a:number|undefined,b:number|undefined;
   try {
+    if(audit) {
+      try {git(audit.repo.root,'cat-file','-e',`${base}^{commit}`);}
+      catch {git(audit.repo.root,'fetch','--no-tags',selectRemote(audit),audit.inputs.targetBranch);}
+      fs.mkdirSync(path.dirname(worktree),{recursive:true});git(audit.repo.root,'worktree','add','--detach',worktree,base);
+    }
+    const head=git(worktree,'rev-parse','HEAD');
     fs.mkdirSync(out,{recursive:true});a=fs.openSync(path.join(out,'stdout.log'),'w');b=fs.openSync(path.join(out,'stderr.log'),'w');
     const r=spawnSync(request.argv[0],request.argv.slice(1),{cwd:worktree,env:{...process.env,...request.env},timeout:request.timeoutSeconds*1000,stdio:['ignore',a,b],shell:false});
-    const receipt={jobId:id,request,exitCode:r.status,signal:r.signal,error:r.error?.message,stdout:path.join(out,'stdout.log'),stderr:path.join(out,'stderr.log'),finishedAt:new Date().toISOString()};
+    const candidateStable=git(worktree,'rev-parse','HEAD')===head && (!audit || git(worktree,'status','--porcelain')==='');
+    const receipt={jobId:id,request,worktree,head,base,candidateStable,exitCode:r.status,signal:r.signal,error:r.error?.message,stdout:path.join(out,'stdout.log'),stderr:path.join(out,'stderr.log'),finishedAt:new Date().toISOString()};
     write(path.join(out,'receipt.json'),receipt);return {...receipt,evidencePath:path.join(out,'receipt.json')};
   } finally {
-    if(a!==undefined)fs.closeSync(a);if(b!==undefined)fs.closeSync(b);release=lock(statePath);
+    if(a!==undefined)fs.closeSync(a);if(b!==undefined)fs.closeSync(b);
+    // 临时审计目录没有 PR/任务分支；有改动或清理失败时保留目录及日志，主控对账。
+    if(audit && fs.existsSync(worktree))try {
+      if(git(worktree,'rev-parse','HEAD')===base && git(worktree,'status','--porcelain')==='')git(audit.repo.root,'worktree','remove',worktree);
+    } catch { /* 回执/测试租约中已记录目录，不能因清理问题覆盖首次测试结果。 */ }
+    release=lock(statePath);
     try {const s=read<engine.State>(statePath),j=s.jobs.find(j=>j.id===id)!;
       if(j.testExecution?.pid===process.pid){if(j.testExecution.granted)j.tests=0;delete j.testExecution;engine.event(s,`${j.ticket} 测试进程结束`);save(statePath,s);}
     } finally {release();}
@@ -486,13 +517,15 @@ export async function main(argv: string[]): Promise<unknown> {
   if (op === 'collect') return consumeStaged(path.resolve(file));
   if (op === 'bind-batch') { engine.ensure(extra, '需要宿主批次绑定文件'); return bindBatch(path.resolve(file),read(extra)); }
   if (op === 'drive') {
+    requireProtocol(read<engine.State>(path.resolve(file)));
     const statePath=path.resolve(file), collected=consumeStaged(statePath), completed:string[]=[];
     const limit=Math.min(32,(read<engine.State>(statePath).policy?.agents || 1));
     for(let n=0;n<limit;n++) {
       const next=await main(['next',statePath]) as {jobs?:engine.Job[]};
       const current=read<engine.State>(statePath);
-      const j=current.jobs.find(j=>j.executor!=='agent' && active(j) && (!j.nativeId || (/^command:\d+:/.test(j.nativeId) && !processAlive(Number(j.nativeId.split(':')[1])))));
-      if(!j) return {...next,collected,completed};
+      const dead=(j:engine.Job)=>/^command:\d+:/.test(j.nativeId) && !processAlive(Number(j.nativeId.split(':')[1]));
+      const j=current.jobs.find(j=>j.executor!=='agent' && active(j) && (!j.nativeId || (dead(j) && canRecoverCommand(statePath,j))));
+      if(!j) return {...next,collected,completed,recoveryRequired:current.jobs.filter(j=>active(j) && j.executor!=='agent' && dead(j) && !canRecoverCommand(statePath,j)).map(j=>({jobId:j.id,nativeId:j.nativeId,reason:'无命令结果，需核对子进程及外部动作后 reconcile'}))};
       executeCommand(statePath,j.id); completed.push(j.id);
     }
     return {...await main(['next',statePath]) as object,collected,completed};
@@ -520,7 +553,7 @@ export async function main(argv: string[]): Promise<unknown> {
       engine.event(s,`迁移为运行协议 2；保留全部原结果和已完成工单。对账依据：${proof.evidencePath}`);
       save(statePath,s);return {statePath,status:s.status,upgraded:true};
     }
-    if(!['reconcile','retire'].includes(op))requireProtocol(s);
+    if(!['bind','submit','reconcile','retire'].includes(op))requireProtocol(s);
     if (op === 'zcode') return renderZcode(s, statePath);
     if (op === 'guard') {
       engine.ensure(s.status === 'running', 'workflow 未运行，禁止合并或关闭');
@@ -575,15 +608,25 @@ export async function main(argv: string[]): Promise<unknown> {
       const j = s.jobs.find(j => j.id === extra); engine.ensure(j, '未知 job'); const r = read<engine.Result>(fourth);
       if (j.status !== 'done') {engine.ensure(!j.testExecution,'测试进程未完成');s.facts = observe(s,[j]); validateResult(s, j, r); }
       engine.submit(s, extra, r);
+      archiveResult(statePath,j);
     } else if (op === 'reconcile') {
       engine.ensure(extra, '需要 L1 查询宿主后生成的 host-status.json');
-      const statuses = read<{jobId:string; nativeId:string; state:'running'|'stopped'|'lost'|'completed'; evidencePath:string; userStopped?:boolean}[]>(extra);
+      const statuses = read<{jobId:string; nativeId:string; state:'running'|'stopped'|'lost'|'completed'; evidencePath:string; userStopped?:boolean;processTreeStopped?:boolean;commandDisposition?:'recover'|'cancel'}[]>(extra);
       for (const observation of statuses) {
         const j = s.jobs.find(j => j.id === observation.jobId); engine.ensure(j && active(j), '只能对账在途任务');
         engine.ensure(j.nativeId === observation.nativeId, '宿主任务身份不符'); safeFile(observation.evidencePath);
         if (observation.userStopped) { s.status = 'paused'; continue; }
         if (observation.state === 'stopped' || observation.state === 'lost') {
           engine.ensure(!j.testExecution || !processAlive(j.testExecution.pid),'测试进程仍在运行，不能释放预算');
+          engine.ensure(!j.testExecution || observation.processTreeStopped===true,'中断测试须核对整个进程树');
+          if(j.executor!=='agent' && /^command:\d+:/.test(j.nativeId) && s.protocol===2) {
+            engine.ensure(!processAlive(Number(j.nativeId.split(':')[1])) && observation.processTreeStopped===true,'命令恢复须确认父进程与整个进程树已停止');
+            if(observation.commandDisposition==='recover') {
+              j.commandRecovery={nativeId:j.nativeId,evidencePath:observation.evidencePath,at:new Date().toISOString()};
+              continue;
+            }
+            delete j.commandRecovery;
+          }
           j.status = 'cancelled';
           j.timing??={leasedAt:''};j.timing.cancelledAt=new Date().toISOString();delete j.testExecution;
           if (j.ticket === '$spec') s.specAudit = undefined;

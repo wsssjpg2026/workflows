@@ -138,16 +138,25 @@ test('外部将 PR 合入另一分支后保留工单和资源', () => {
   const facts=structuredClone(s.facts); facts.prs[201].state='MERGED'; facts.prs[201].baseRef='elsewhere';
   e.reconcileFacts(s,facts); assert.equal(s.tickets[0].phase,'blocked'); assert.equal(s.tickets[0].cleaned,false);
 });
-test('CI 恢复后重新进行最终 spec 验收，不沿用中途阻断审计', () => {
+test('CI 等待保留队首并等待事件，通过后恢复验收，不派空转审计', () => {
   const s=fixture(); until(s,()=>s.tickets[0].phase==='accept');
   const accept=e.reserve(s)[0]; e.bind(s,accept.id,{nativeId:'accept',model:accept.model});
   s.facts.prs[201].checks=[{id:'ci',status:'pending'}];
   e.submit(s,accept.id,response(s,accept)); assert.equal(s.tickets[0].reason,'waiting_ci');
-  const audit=e.reserve(s)[0]; e.bind(s,audit.id,{nativeId:'audit',model:audit.model});
-  const r=response(s,audit); r.status='blocked'; e.submit(s,audit.id,r);
+  assert.deepEqual(e.reserve(s),[]);assert.equal(s.validationOwner,s.tickets[0].key);
   const facts=structuredClone(s.facts); facts.prs[201].checks=[{id:'ci',status:'pass'}];
   e.reconcileFacts(s,facts); assert.equal(s.status,'running'); assert.equal(s.specAudit,undefined);
   until(s,()=>s.status==='complete');
+});
+test('真实 CI 失败回到修复；等待时外部基线变化先集成再验收',()=>{
+  for(const outcome of ['failed','moved']) {
+    const s=fixture();until(s,()=>s.tickets[0].phase==='accept');const j=e.reserve(s)[0];e.bind(s,j.id,{nativeId:'accept',model:j.model});
+    s.facts.prs[201].checks=[{id:'ci',status:'pending'}];e.submit(s,j.id,response(s,j));
+    const facts=structuredClone(s.facts);facts.prs[201].checks=[{id:'ci',status:outcome==='failed'?'failed':'pass'}];
+    if(outcome==='moved'){facts.base='new-base';facts.prs[201].base='new-base';s.validationOwner=undefined;}
+    e.reconcileFacts(s,facts);assert.equal(e.reserve(s)[0].action,outcome==='failed'?'implement':'integrate');
+    assert.equal(s.tickets[0].evidence.accept,undefined);
+  }
 });
 test('对账保留用户暂停状态，不自动启动资源清理', () => {
   const s=fixture(); s.tickets[0].phase='done';
@@ -224,4 +233,11 @@ test('五工单回放：十组五路审查完成交付，队列无基线反复�
   assert.equal(s.status,'complete');assert.equal(s.jobs.filter(j=>j.action==='review-lens').length,50);
   assert.equal(s.tickets.reduce((n,t)=>n+(t.baseInvalidations||0),0),0);
   assert.ok(s.jobs.filter(j=>j.action==='integrate').length<=4);
+});
+test('不完整历史确认没有 findings 时不参与跨轮裁决',()=>{
+  const s=fixture();until(s,()=>s.tickets[0].phase==='review');
+  for(const j of e.reserve(s))finish(s,j,{finding:25});
+  const confirmation=e.reserve(s)[0];finish(s,confirmation,{finding:25});
+  s.jobs.push({...confirmation,id:'old-incomplete',epoch:confirmation.epoch-1,result:{model:confirmation.model,complete:false,status:'interrupted',evidencePath:'/fixture/interrupted'}});
+  assert.equal(e.reserve(s)[0].action,'review-report');
 });

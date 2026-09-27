@@ -401,6 +401,19 @@ export function finishSkillCall(s: State, invocationId: string, outcome: SkillOu
     nonblank(rawOutputPath);
     ensure(evidencePaths.length > 0, '完整技能结论缺少证据');
     evidencePaths.forEach(nonblank);
+    const source=JSON.parse(fs.readFileSync(invocation.sourceArchivePath,'utf8')) as SkillSourceBundle;
+    const contractFile=source.files.find(file=>file.relativePath==='automation-contract.json');
+    if(contractFile) {
+      const contract=JSON.parse(Buffer.from(contractFile.dataBase64,'base64').toString('utf8')) as
+        {requiredEvidenceSchemas?:string[]};
+      ensure(!contract.requiredEvidenceSchemas || Array.isArray(contract.requiredEvidenceSchemas) &&
+        contract.requiredEvidenceSchemas.every(schema=>typeof schema==='string' && schema.trim()),
+        '技能包证据契约无效');
+      for(const schema of contract.requiredEvidenceSchemas || [])
+        ensure(evidencePaths.some(file=>{
+          try{return JSON.parse(fs.readFileSync(file,'utf8')).schema===schema;}catch{return false;}
+        }),`技能包缺少 ${schema} 原始证据账本`);
+    }
     if (invocation.capability === 'handoff')
       ensure(fs.realpathSync(rawOutputPath).startsWith(fs.realpathSync(os.tmpdir()) + path.sep),
         '原始 handoff 必须先写入 OS 临时目录');
@@ -503,16 +516,19 @@ export function migrateSkillBindings(s: State, replacements: Partial<Record<Skil
     if (changed.includes('implementation') || changed.includes('diagnosis') || changed.includes('handoff')) {
       if (!t.worktree || ['claim', 'plan', 'plan_check'].includes(t.phase)) continue;
       t.phase = 'replan'; t.epoch++; t.evidence = {}; t.authorReview=undefined;
+      t.reviewDisagreementId=undefined;
       t.reason = '实现/诊断/交接技能版本迁移；重新批准计划并获取证据';
     } else if (changed.includes('authorReview')) {
       if (!['self', 'verify', 'publish', 'review', 'fresh', 'accept', 'merge'].includes(t.phase) &&
           !(t.phase === 'blocked' && t.reason === 'waiting_ci')) continue;
       t.phase = 'self'; t.epoch++; t.evidence = {}; t.authorReview=undefined;
+      t.reviewDisagreementId=undefined;
       t.reason = '作者自检技能版本迁移；重新审查当前候选';
     } else if (changed.includes('prReview')) {
       if (!['review', 'fresh', 'accept', 'merge'].includes(t.phase) &&
           !(t.phase === 'blocked' && t.reason === 'waiting_ci')) continue;
-      t.phase = 'review'; t.epoch++; delete t.evidence.regular; delete t.evidence.fresh; delete t.evidence.accept;
+      t.phase = 'review'; t.epoch++; t.reviewDisagreementId=undefined;
+      delete t.evidence.regular; delete t.evidence.fresh; delete t.evidence.accept;
       t.reason = 'PR 审查技能版本迁移；重新取得 regular/fresh 证据';
     }
   }

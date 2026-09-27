@@ -1,5 +1,6 @@
 {
   "schema": 1,
+  "requiredEvidenceSchemas": ["code-review-from-claude-observations/v1"],
   "requiredChildren": [
     { "key": "eligibility-start", "tier": "L3", "independent": true },
     { "key": "guideline-paths", "tier": "L3", "independent": true },

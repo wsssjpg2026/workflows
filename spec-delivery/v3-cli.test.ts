@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { normalizeResult, resultPaths } from './host.ts';
+import * as core from './core.ts';
 
 const entry = fileURLToPath(new URL('../spec-delivery.workflow.ts', import.meta.url));
 const sha = (value:string) => createHash('sha256').update(value).digest('hex');
@@ -1307,5 +1308,110 @@ else if(op==='result') {
     assert.equal(comments.filter(c=>c.body.includes(':fresh:')).length,1);
     assert.ok(comments.some(c=>c.body.includes('review holistic report: no issues')));
     assert.ok(comments.some(c=>c.body.includes('fresh holistic report: no issues')));
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('公开 CLI 对 regular 空发现与 fresh 阻断签发真实 L1 分歧裁决并保留原报告',()=>{
+  const x=fixture();
+  try {
+    const {statePath,binding}=approvedImplementation(x);
+    let state=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    let t=state.tickets[0];
+    t.phase='self';t.epoch++;t.pr=101;t.head=x.head;t.base=x.head;t.worktree=x.root;t.branch='main';
+    state.validationOwner=t.key;fs.writeFileSync(statePath,JSON.stringify(state));
+    const replacement=path.join(x.temp,'.agents','skills','code-review-from-claude','SKILL.md');
+    fs.writeFileSync(replacement,'---\nname: alternate-pr-review\n---\n\nProfessional verbal verdict, no score or fixed lenses.\n');
+    const observer=path.join(x.temp,'bin','review-skill-observer');
+    fs.writeFileSync(observer,`#!/usr/bin/env node
+const fs=require('fs');const [op,id,job]=process.argv.slice(2);
+const state=JSON.parse(fs.readFileSync(${JSON.stringify(statePath)},'utf8'));
+if(op==='capabilities')console.log(JSON.stringify({source:'native_host',jobId:job,capability:id,
+  capabilities:{sourceExecution:{allowed:true,acceptsOriginalFiles:true}}}));
+else if(op==='result'){
+  const invocation=state.v3.skillInvocations.find(i=>i.id===id);
+  if(!invocation||invocation.jobId!==job)process.exit(2);
+  const source=JSON.parse(fs.readFileSync(invocation.sourceArchivePath,'utf8'));
+  console.log(JSON.stringify({source:'native_host',invocationId:id,jobId:job,nativeId:invocation.session.nativeId,
+    observationId:invocation.session.observationId,mode:invocation.mode,
+    bindingFingerprint:invocation.bindingFingerprint,terminal:true,
+    loadedFiles:source.files.map(f=>({relativePath:f.relativePath,sha256:f.sha256}))}));
+}else process.exit(2);
+`);
+    fs.chmodSync(observer,0o755);x.env.SPEC_DELIVERY_SKILL_OBSERVER=observer;
+    const invoke=(...args:string[])=>{const result=x.call(...args);assert.equal(result.status,0,result.stderr);return JSON.parse(result.stdout);};
+    const author=invoke('next',statePath).jobs.find((job:{action:string})=>job.action==='author-review');
+    assert.ok(author);
+    x.observe('dispute-author',author.id,'small');
+    fs.writeFileSync(binding,JSON.stringify({nativeId:'dispute-author'}));
+    invoke('bind',statePath,author.id,binding);
+    const authorRequest=path.join(x.temp,'dispute-author-request.json');
+    fs.writeFileSync(authorRequest,JSON.stringify({capability:'authorReview'}));
+    const authorStarted=invoke('skill-start',statePath,author.id,authorRequest);
+    const authorRaw=path.join(x.temp,'dispute-author-report.md');
+    fs.writeFileSync(authorRaw,'Standards: pass\nSpec: pass\n');
+    const authorOutcome=path.join(x.temp,'dispute-author-outcome.json');
+    fs.writeFileSync(authorOutcome,JSON.stringify({status:'pass',blocking:false,
+      rawOutputPath:authorRaw,evidencePaths:[authorRaw]}));
+    const authorFinished=invoke('skill-finish',statePath,authorStarted.invocationId,authorOutcome);
+    invoke('stage',statePath,author.id,JSON.stringify({complete:true,status:'reviewed',head:x.head,base:x.head,
+      evidencePath:authorFinished.result.rawOutputPath,data:{skillInvocationIds:[authorStarted.invocationId]}}));
+    state=JSON.parse(fs.readFileSync(statePath,'utf8'));t=state.tickets[0];
+    assert.ok(t.authorReview);
+    t.phase='review';t.epoch++;t.evidence.tests={head:x.head,base:x.head,path:x.planEvidence};
+    fs.writeFileSync(statePath,JSON.stringify(state));
+    const migration=path.join(x.temp,'review-migration.md');fs.writeFileSync(migration,'Bind a pinned alternative review method');
+    const request=path.join(x.temp,'review-migration.json');
+    fs.writeFileSync(request,JSON.stringify({expectedRevision:state.revision,evidencePath:migration,replacements:{prReview:replacement}}));
+    const migrated=x.call('migrate-skills',statePath,request);assert.equal(migrated.status,0,migrated.stderr);
+    for(const phase of ['review','fresh'] as const) {
+      const j=invoke('next',statePath).jobs.find((job:{action:string})=>job.action==='pr-review');assert.ok(j);
+      x.observe(`dispute-${phase}`,j.id,'middle');
+      fs.writeFileSync(binding,JSON.stringify({nativeId:`dispute-${phase}`}));invoke('bind',statePath,j.id,binding);
+      const skillRequest=path.join(x.temp,`skill-request-${phase}.json`);
+      fs.writeFileSync(skillRequest,JSON.stringify({capability:'prReview'}));
+      const started=invoke('skill-start',statePath,j.id,skillRequest);
+      const raw=path.join(x.temp,`dispute-report-${phase}.md`);
+      fs.writeFileSync(raw,phase==='review'?'No findings; an observation was filtered.\n':'Retained blocking finding.\n');
+      const outcome=path.join(x.temp,`dispute-outcome-${phase}.json`);
+      fs.writeFileSync(outcome,JSON.stringify({status:phase==='review'?'pass':'changes_required',
+        blocking:phase==='fresh',rawOutputPath:raw,evidencePaths:[raw]}));
+      const finished=invoke('skill-finish',statePath,started.invocationId,outcome);
+      invoke('stage',statePath,j.id,JSON.stringify({complete:true,status:'reviewed',
+        evidencePath:finished.result.rawOutputPath,data:{skillInvocationIds:[started.invocationId]}}));
+      const report=invoke('next',statePath).jobs.find((job:{action:string})=>job.action==='review-report');
+      assert.ok(report);invoke('execute',statePath,report.id);
+    }
+    const before=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(before.tickets[0].phase,'fresh');
+    assert.equal(before.v3.reviewDisagreements.length,1);
+    const disagreement=before.v3.reviewDisagreements[0];
+    const next=invoke('next',statePath);
+    const adjudication=next.jobs.find((job:{action:string})=>job.action==='adjudicate');assert.ok(adjudication);
+    assert.equal(adjudication.tier,'L1');assert.equal(adjudication.contextIntent.kind,'independent');
+    const p=JSON.parse(fs.readFileSync(adjudication.packetPath,'utf8'));
+    assert.equal(p.reviewDisagreement.regular.blocking,false);
+    assert.equal(p.reviewDisagreement.fresh.blocking,true);
+    assert.ok(fs.readFileSync(p.reviewDisagreement.regular.reportPath,'utf8').includes('No findings'));
+    assert.ok(fs.readFileSync(p.reviewDisagreement.fresh.reportPath,'utf8').includes('Retained'));
+    assert.ok(p.reviewDisagreement.regular.evidence.length>0);
+    assert.ok(p.reviewDisagreement.fresh.evidence.length>0);
+    x.observe('l1-review-adjudication',adjudication.id,'large');
+    fs.writeFileSync(binding,JSON.stringify({nativeId:'l1-review-adjudication'}));
+    invoke('bind',statePath,adjudication.id,binding);
+    const data={disagreementId:disagreement.id,regularInvocationId:disagreement.regularInvocationId,
+      freshInvocationId:disagreement.freshInvocationId,skillFingerprint:disagreement.skillFingerprint,
+      blocking:false,rationale:'Fresh finding concerns behavior outside this PR; source reports were compared.',
+      skillRuleRefs:['SKILL.md#review-method']};
+    const decisionPath=path.join(x.temp,'adjudication.json');
+    fs.writeFileSync(decisionPath,JSON.stringify({...data,head:x.head,base:x.head,candidateVersion:disagreement.candidateVersion}));
+    invoke('stage',statePath,adjudication.id,JSON.stringify({complete:true,status:'resolved',head:x.head,base:x.head,
+      evidencePath:decisionPath,data}));
+    const after=JSON.parse(fs.readFileSync(statePath,'utf8')) as core.State;
+    assert.equal(after.tickets[0].phase,'accept');
+    assert.equal(after.tickets[0].evidence.fresh?.adjudicationId,adjudication.id);
+    assert.equal(after.v3?.decisionRecords.at(-1)?.kind,'adjudication');
+    assert.equal(after.v3?.decisionRecords.at(-1)?.session.nativeId,'l1-review-adjudication');
+    assert.equal(core.mergeGate(after,after.tickets[0]),false,'裁决没有代替 L2 验收和 CI');
+    assert.equal(after.tickets[0].evidence.accept,undefined);
   } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
 });

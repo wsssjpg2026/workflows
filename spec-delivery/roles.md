@@ -99,9 +99,13 @@ TDD在已约定seam上进行。测试范围以目标仓库有效规范和任务�
 
 `pr-review` job 显式调用当前固定版本的 `prReview` 技能。读取绑定包中的 `SKILL.md`、自动化上下文与契约；通过 `skill-delegate` 登记技能要求的子任务，等待必需子任务完成，再以 `skill-finish` 归档宿主终态、原始报告和专业依据。审查方法、子任务拓扑、筛选规则和报告形式由绑定包决定。
 
-完整审查以 `status:"reviewed"` 和 `data.skillInvocationIds` 引用一次当前候选、当前技能版本的 `prReview` 调用。技能返回 `pass` 且无阻断时，本轮报告发布后进入下一门禁；返回 `changes_required` 时发布原始报告并交回实现修复。`skipped`、`incomplete`、空报告和缺失宿主回执均不能完成一轮审查。`review-report` 是命令 job：核对原始技能产物后，按稳定标记幂等发布原文；actor 不自行改写报告。
+完整审查以 `status:"reviewed"` 和 `data.skillInvocationIds` 引用一次当前候选、当前技能版本的 `prReview` 调用。技能返回 `pass` 且无阻断时，本轮报告发布后进入下一门禁。regular 阻断时发布原文并交回实现修复；fresh 完成后，外围只比较同候选、同技能版本的两轮阻断结论，一致阻断则修复，结论相反则派新的独立 L1 裁决。即使 regular 没有最终 findings 或只有过滤观察，也依据其完整终态比较。`skipped`、`incomplete`、空报告和缺失宿主回执均不能完成一轮审查。`review-report` 是命令 job：核对原始技能产物后，按稳定标记幂等发布原文；actor 不自行改写报告。
 
 regular 可以用真实宿主续接审查侧上下文跟踪修复；fresh 必须使用独立新上下文，从当前 PR diff、工单、规范和测试重新开始，不接收 regular 的结论或作者辩解。两轮证据绑定同一 head/base 和同一技能指纹；候选或技能版本改变就重新取证。审查通过后仍由独立 L2 `accept` 核对工单、CI 和关闭条件。
+
+## 审查分歧裁决 — 独立 L1
+
+`adjudicate` 的 `packet.reviewDisagreement` 给出两轮原始报告、观察与确认附件、来源归档、候选 SHA、技能指纹和相反阻断结论。先独立读取这些原件与归档技能规则；无法稳定匹配具体问题也必须解释总体阻断差异。输出 JSON 裁决产物，写入 `head`、`base`、`candidateVersion`，以及与 `data` 相同的 `disagreementId`、两个 invocation ID、`skillFingerprint`、布尔 `blocking`、非空 `rationale` 和 `skillRuleRefs`。每条规则引用用归档内的相对文件路径，可附 `#` 片段。回执使用 `status:"resolved"`；阻断则回实现修复，解除分歧则进入 L2 验收。裁决保留两轮原件及 L1 会话指纹，不能代替候选版本、CI、人工或合并门禁。
 
 ## PR独立验收 — L2
 
@@ -198,6 +202,7 @@ CI按下列规则处理，无需逐次请求用户批准：
 | `publish` | `published` | `data:{pr,commentUrl}`，pr为正整数；远端必须是当前候选的开放非draft PR |
 | `pr-review` | `reviewed` | `data.skillInvocationIds` 恰好引用一次当前绑定的 `prReview`；原始报告由技能调用归档，结论来自其 `pass`/`changes_required` 及阻断值 |
 | `review-report` | `posted` | v3 由命令发布技能原文并记录 `data.commentUrl`、`data.reviewInvocationId`；不由 actor 填写报告模板 |
+| `adjudicate` | `resolved` | 仅对 `packet.reviewDisagreement` 的当前候选/技能分歧；`data` 包含分歧 ID、两轮 invocation ID、技能指纹、`blocking`、`rationale`、`skillRuleRefs`，JSON 原文还写入 head/base/candidateVersion |
 | `accept` | `ready` | `data.satisfiedCriteria`逐字包含packet全部criteria；附适用CI事实及下述豁免结构 |
 | `accept` | `gap`、`conflict`、`waiting_ci`、`needs_human`、`blocked` | `gap`必须`data.planPath`，并附`reason`；其它状态附具体原因和证据；补充计划先过L1 `plan-check` |
 | `merge` | `merged`、`waiting_merge` | 真实远端合并证据或等待原因；`merged`仍须核心live观察到MERGED |

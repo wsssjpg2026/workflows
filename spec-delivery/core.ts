@@ -51,6 +51,7 @@ export interface ProtocolV3 {
   skillBindings?: SkillBinding[];
   skillInvocations: SkillInvocation[];
   skillChildren?: SkillChildRequest[];
+  reviewDisagreements?: ReviewDisagreement[];
   skillMigrations?: { at: string; evidencePath: string;
     changes: { capability: SkillCapability; previousFingerprint: string; nextFingerprint: string }[] }[];
   dispatchRecords: DispatchRecord[];
@@ -143,9 +144,16 @@ export interface Evidence {
   head: string; base: string; path: string;
   /** The outer PR gate pins the professional result, not its review method. */
   skillFingerprint?: string; skillInvocationId?: string; rawReportSha256?: string; commentUrl?: string;
+  adjudicationId?: string;
   /** These are separate observations: a remote PR head need not equal an unpushed local head. */
   prHead?: string | null; targetBase?: string; testedHead?: string; testedTree?: string;
   integrationHead?: string | null;
+}
+export interface ReviewDisagreement {
+  id: string; ticket: string; head: string; base: string; candidateVersion: string; skillFingerprint: string;
+  regularInvocationId: string; freshInvocationId: string;
+  regularBlocking: boolean; freshBlocking: boolean; freshEvidence: Evidence; at: string;
+  adjudicationJobId?: string; outcomeBlocking?: boolean;
 }
 export interface WorkspaceRecovery {
   kind: 'wip' | 'conflict' | 'unknown_candidate';
@@ -178,6 +186,7 @@ export interface Ticket extends TicketPlan {
   recoveryRef?: string;
   pendingPushHead?: string;
   integrationHead?: string;
+  reviewDisagreementId?: string;
   failures?: FailureEvent[];
   failureBudget?: FailureBudget;
 }
@@ -280,11 +289,27 @@ function currentReviewEvidence(s: State, t: Ticket, key: 'regular' | 'fresh') {
   if (s.protocol !== currentProtocol) return true;
   const e = t.evidence[key]!, binding = s.v3?.skillBindings?.find(b => b.capability === 'prReview');
   const invocation = s.v3?.skillInvocations.find(i => i.id === e.skillInvocationId);
+  const disagreement = e.adjudicationId && s.v3?.reviewDisagreements?.find(d=>
+    d.adjudicationJobId===e.adjudicationId && d.freshInvocationId===invocation?.id &&
+    d.head===t.head && d.base===t.base && d.skillFingerprint===e.skillFingerprint && d.outcomeBlocking===false);
+  const decision = disagreement && s.v3?.decisionRecords.find(d=>d.id===e.adjudicationId &&
+    d.kind==='adjudication' && d.candidateVersion===disagreement.candidateVersion && d.scope===t.key &&
+    d.inputVersion===inputVersion(s) && d.sourceVersion===s.planSourceVersion);
+  const effectiveClear = !!(invocation?.result?.status==='pass' && !invocation.result.blocking ||
+    key==='fresh' && invocation?.result?.status==='changes_required' && invocation.result.blocking && decision);
   return !!binding && !!invocation && invocation.capability === 'prReview' &&
     invocation.bindingFingerprint === binding.fingerprint && e.skillFingerprint === binding.fingerprint &&
-    invocation.head === t.head && invocation.base === t.base && invocation.result?.status === 'pass' &&
-    !invocation.result.blocking && e.path === invocation.result.rawOutputPath &&
-    e.rawReportSha256 === invocation.result.rawOutputSha256 && !!e.commentUrl;
+    invocation.head === t.head && invocation.base === t.base && effectiveClear &&
+    e.path === invocation.result?.rawOutputPath &&
+    e.rawReportSha256 === invocation.result?.rawOutputSha256 && !!e.commentUrl;
+}
+export function activeReviewDisagreement(s:State,t:Ticket) {
+  if(!t.reviewDisagreementId)return undefined;
+  const record=s.v3?.reviewDisagreements?.find(d=>d.id===t.reviewDisagreementId);
+  ensure(record && record.ticket===t.key && record.head===t.head && record.base===t.base &&
+    record.candidateVersion===candidateVersion(s,t) && !record.adjudicationJobId,
+    '审查分歧记录不属于当前候选或已完成裁决');
+  return record;
 }
 function matchingReviews(s: State, t: Ticket) {
   return currentReviewEvidence(s, t, 'regular') && currentReviewEvidence(s, t, 'fresh') &&
@@ -378,7 +403,8 @@ function dependencyReady(s: State, t: Ticket) {
     (t.externalDependencies || []).every(key => s.facts.issueStates[key] === 'CLOSED');
 }
 function resetCandidate(t: Ticket, head: string, base: string, phase: Phase) {
-  t.head = head; t.base = base; t.evidence = {}; t.authorReview = undefined; t.epoch++; t.phase = phase; t.reason = '';
+  t.head = head; t.base = base; t.evidence = {}; t.authorReview = undefined;
+  t.reviewDisagreementId = undefined; t.epoch++; t.phase = phase; t.reason = '';
   if (phase === 'integrate') t.integrationHead = undefined;
 }
 /** Count a failed attempt exactly once, independently of its lease, replacement job and phase epoch. */
@@ -402,7 +428,7 @@ export function recordFailure(s: State, t: Ticket, failure: {
     const retrySameCandidate = failure.category === 'host' && failure.next === t.phase && !exhausted && !failure.invariant;
     if (exhausted || failure.invariant) t.phase = budget.replans ? 'blocked' : 'replan';
     else t.phase = failure.next;
-    if (!retrySameCandidate) { t.epoch++; t.evidence = {}; }
+    if (!retrySameCandidate) { t.epoch++; t.evidence = {}; t.reviewDisagreementId = undefined; }
   }
   event(s, `${t.key} 失败 ${failure.category} (${budget.totalRetries}/${s.policy.rounds}, 连续 ${budget.consecutiveNoProgress}/${s.policy.noProgress})：${failure.reason}`);
   return true;
@@ -414,7 +440,7 @@ export function finalizeRejectedReceipt(s: State, t: Ticket, j: Job) {
   if (!failure) return;
   t.phase = t.failureBudget?.replans ? 'blocked' : 'replan';
   t.reason = `回执校验失败：${failure.reason}`;
-  t.epoch++; t.evidence = {};
+  t.epoch++; t.evidence = {}; t.reviewDisagreementId = undefined;
   event(s, `${t.key} 回执无法纠正且原执行者已停止；${t.phase === 'blocked' ? '局部阻塞' : '交给 L1 重规划'}`);
 }
 function problem(s: State, t: Ticket, signature: string, next: Phase, category: FailureCategory = 'semantic', jobId?: string) {
@@ -492,6 +518,11 @@ function candidates(s: State): Candidate[] {
     }
     if (t.phase === 'review' || t.phase === 'fresh') {
       if (s.protocol === currentProtocol) {
+        const disagreement=activeReviewDisagreement(s,t);
+        if(disagreement) {
+          out.push({t,action:'adjudicate',part:'pr-review'});
+          continue;
+        }
         const review = jobsAt(s, t, 'pr-review').find(j => j.status === 'done');
         out.push({ t, action: review ? 'review-report' : 'pr-review' });
         continue;
@@ -801,7 +832,7 @@ export function submit(s: State, id: string, r: Result) {
     claim: ['claimed'], plan: ['planned'], 'plan-check': ['pass', 'changes'], implement: ['implemented', 'replan'],
     'author-review': ['reviewed'],
     'self-standards': ['reviewed'], 'self-spec': ['reviewed'], verify: ['pass', 'fail'], publish: ['published'],
-    'pr-review': ['reviewed'], 'review-lens': ['reviewed'], confirm: ['confirmed'], adjudicate: ['confirmed'], 'review-report': ['posted'],
+    'pr-review': ['reviewed'], 'review-lens': ['reviewed'], confirm: ['confirmed'], adjudicate: ['confirmed','resolved'], 'review-report': ['posted'],
     accept: ['ready', 'gap', 'conflict', 'waiting_ci', 'needs_human', 'blocked'], integrate: ['implemented', 'replan'],
     replan: ['planned'], merge: ['merged', 'waiting_merge'], close: ['closed'], cleanup: ['cleaned'],
     'spec-audit': ['complete', 'needs_closeout', 'waiting_human', 'blocked'], 'spec-close': ['closed'],
@@ -891,6 +922,24 @@ export function submit(s: State, id: string, r: Result) {
       break;
     case 'review-lens': ensure(Array.isArray(r.findings), '每一路审查必须明确返回 findings'); break;
     case 'confirm': case 'adjudicate':
+      if(j.action==='adjudicate' && s.protocol===currentProtocol) {
+        const disagreement=t && activeReviewDisagreement(s,t);
+        ensure(t && disagreement && t.phase==='fresh' && j.fresh && j.contextObservation?.mode==='new' &&
+          r.status==='resolved' && typeof data.blocking==='boolean' &&
+          typeof data.rationale==='string' && data.rationale.trim() &&
+          Array.isArray(data.skillRuleRefs) && data.skillRuleRefs.length>0 &&
+          data.skillRuleRefs.every(x=>typeof x==='string' && x.trim()) &&
+          data.disagreementId===disagreement.id &&
+          data.regularInvocationId===disagreement.regularInvocationId &&
+          data.freshInvocationId===disagreement.freshInvocationId &&
+          data.skillFingerprint===disagreement.skillFingerprint,
+          'L1 裁决必须绑定原始两轮、当前候选、技能规则并说明阻断依据');
+        disagreement.adjudicationJobId=j.id;disagreement.outcomeBlocking=data.blocking;
+        t.reviewDisagreementId=undefined;
+        if(data.blocking)problem(s,t,`L1 裁决要求修复：${String(data.rationale)}`,'implement','semantic',j.id);
+        else {t.evidence.fresh={...disagreement.freshEvidence,adjudicationId:j.id};t.phase='accept';}
+        break;
+      }
       ensure(Array.isArray(r.findings) && r.findings.length === 1, '逐项独立核实必须返回一个问题');
       ensure(r.findings[0].id === j.part, '复核必须保留原问题身份');
       r.findings[0].identity = j.finding?.identity;
@@ -910,17 +959,32 @@ export function submit(s: State, id: string, r: Result) {
           invocation.candidateVersion === candidateVersion(s, t) &&
           data.reviewInvocationId === invocation.id && r.evidencePath === invocation.result.rawOutputPath,
           '报告与本轮 prReview 调用、候选或技能版本不一致');
-        if (invocation.result.blocking) {
-          problem(s, t, `prReview 阻断：${invocation.id}`, 'implement', 'semantic', j.id);
+        const completed: Evidence = { ...evidence(), path: invocation.result.rawOutputPath,
+          skillFingerprint: invocation.bindingFingerprint, skillInvocationId: invocation.id,
+          rawReportSha256: invocation.result.rawOutputSha256, commentUrl: String(data.commentUrl) };
+        if(t.phase==='review') {
+          if(invocation.result.blocking)problem(s,t,`prReview 阻断：${invocation.id}`,'implement','semantic',j.id);
+          else {t.evidence.regular=completed;t.phase='fresh';t.epoch++;}
         } else {
-          const completed: Evidence = { ...evidence(), path: invocation.result.rawOutputPath,
-            skillFingerprint: invocation.bindingFingerprint, skillInvocationId: invocation.id,
-            rawReportSha256: invocation.result.rawOutputSha256, commentUrl: String(data.commentUrl) };
-          if (t.phase === 'review') { t.evidence.regular = completed; t.phase = 'fresh'; t.epoch++; }
-          else { ensure(t.phase === 'fresh' && currentReviewEvidence(s, t, 'regular') &&
-            t.evidence.regular!.skillFingerprint === completed.skillFingerprint,
-            'fresh 审查不能与不同候选或技能版本的 regular 组合');
-            t.evidence.fresh = completed; t.phase = 'accept'; }
+          ensure(t.phase==='fresh' && currentReviewEvidence(s,t,'regular') &&
+            t.evidence.regular!.skillFingerprint===completed.skillFingerprint &&
+            review?.fresh && review.contextObservation?.mode==='new',
+            'fresh 必须独立完成且与 regular 使用同一候选及技能版本');
+          const regular=s.v3?.skillInvocations.find(i=>i.id===t.evidence.regular!.skillInvocationId);
+          ensure(regular?.result,'regular 审查缺少技能原始结论');
+          if(regular.result.blocking!==invocation.result.blocking) {
+            const id=`review-disagreement:${invocation.id}`;
+            ensure(!s.v3?.reviewDisagreements?.some(d=>d.id===id),'审查分歧事件重复');
+            const disagreement:ReviewDisagreement={id,ticket:t.key,head:t.head,base:t.base,
+              candidateVersion:candidateVersion(s,t),skillFingerprint:invocation.bindingFingerprint,
+              regularInvocationId:regular.id,freshInvocationId:invocation.id,
+              regularBlocking:regular.result.blocking,freshBlocking:invocation.result.blocking,
+              freshEvidence:completed,at:new Date().toISOString()};
+            s.v3!.reviewDisagreements??=[];s.v3!.reviewDisagreements.push(disagreement);
+            t.reviewDisagreementId=id;
+            event(s,`${t.key} 同候选同技能版本 regular/fresh 阻断结论分歧；交独立 L1 裁决`);
+          } else if(invocation.result.blocking)problem(s,t,`prReview 阻断：${invocation.id}`,'implement','semantic',j.id);
+          else {t.evidence.fresh=completed;t.phase='accept';}
         }
         break;
       }
@@ -984,7 +1048,8 @@ export function submit(s: State, id: string, r: Result) {
       ensure(j.session && j.decisionArtifactDigest && j.decisionArtifactFiles?.length, 'L1 决策缺少原生会话或决策产物指纹');
       recordL1Decision(s, { id: j.id, kind, scope: t?.key || '$spec', inputVersion: inputVersion(s),
         sourceVersion: s.planSourceVersion,
-        candidateVersion: j.candidateVersion!, appliesToCandidateVersion: candidateVersion(s, t),
+        candidateVersion: j.candidateVersion!, appliesToCandidateVersion:
+          j.action==='adjudicate' && s.protocol===currentProtocol ? j.candidateVersion! : candidateVersion(s, t),
         artifactPath: r.evidencePath, artifactFiles: j.decisionArtifactFiles,
         artifactDigest: j.decisionArtifactDigest,
         session: j.session, at: new Date().toISOString() });

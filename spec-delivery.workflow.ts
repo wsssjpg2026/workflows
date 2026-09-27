@@ -256,6 +256,15 @@ function reconstructHandoff(s:engine.State,statePath:string,id:string,request:{d
 function decisionArtifacts(s: engine.State, j: engine.Job, r: engine.Result) {
   const t = s.tickets.find(t => t.key === j.ticket);
   const files = [r.evidencePath];
+  if (s.protocol === engine.currentProtocol && j.action === 'adjudicate' && t) {
+    const dispute = engine.activeReviewDisagreement(s,t);
+    engine.ensure(dispute, '裁决缺少当前审查分歧');
+    for (const id of [dispute.regularInvocationId,dispute.freshInvocationId]) {
+      const invocation=s.v3?.skillInvocations.find(i=>i.id===id);
+      engine.ensure(invocation?.result, '裁决缺少两轮原始技能产物');
+      files.push(invocation.result.rawOutputPath,invocation.sourceArchivePath,...invocation.result.evidencePaths);
+    }
+  }
   if (r.complete && ['plan', 'replan'].includes(j.action)) files.push(String(r.data?.planPath || ''), String(r.data?.checksPath || ''));
   if (r.complete && j.action === 'plan-check') files.push(t?.planPath || '', String(r.data?.checksPath || t?.checksPath || ''));
   return artifactFingerprint(files);
@@ -358,7 +367,7 @@ function enterWorkspaceRecovery(s: engine.State, t: engine.Ticket, statePath: st
     statusPath: path.join(directory, 'status.txt'), unmergedPath: path.join(directory, 'unmerged-index.txt'),
     stagedPatchPath: path.join(directory, 'staged.patch'), worktreePatchPath: path.join(directory, 'worktree.patch'),
     untrackedPath: path.join(directory, 'untracked.txt'), savedFilesPath: savedFiles });
-  t.recovery = recovery; t.phase = 'recovery'; t.reason = recovery.reason; t.epoch++; t.evidence = {};
+  t.recovery = recovery; t.phase = 'recovery'; t.reason = recovery.reason; t.epoch++; t.evidence = {}; t.reviewDisagreementId=undefined;
   s.specAudit = undefined; s.auditEpoch++;
   engine.event(s, `${t.key} 工作区进入 ${kind} 恢复；已保留现有工作、冲突索引与候选引用`);
   return recovery;
@@ -400,7 +409,7 @@ function recordRejectedReceipt(s: engine.State, j: engine.Job, statePath: string
     // A corrected direct submission may reuse its lease. Once a staged receipt is immutable,
     // the same previously recorded failure must still stop the unusable lease.
     if (!recorded && immutable && t.phase !== 'recovery' && t.epoch === j.epoch) {
-      t.phase = t.failureBudget?.replans ? 'blocked' : 'replan'; t.epoch++; t.evidence = {};
+      t.phase = t.failureBudget?.replans ? 'blocked' : 'replan'; t.epoch++; t.evidence = {}; t.reviewDisagreementId=undefined;
     }
   }
   recoverOnRejectedResult(s, j, statePath, error);
@@ -443,7 +452,7 @@ function recoverWorkspace(s: engine.State, statePath: string, key: string, decis
   t.recovery = undefined; t.recoveryRef = ref; t.head = decision.resolvedHead; t.base = decision.resolvedBase;
   t.handoffPath = decision.handoffPath; t.pendingPushHead = decision.resolvedHead;
   if (decision.resolvedBase !== recovery.base) t.integrationHead = decision.resolvedHead;
-  t.phase = 'replan'; t.reason = decision.reason; t.epoch++; t.evidence = {};
+  t.phase = 'replan'; t.reason = decision.reason; t.epoch++; t.evidence = {}; t.reviewDisagreementId=undefined;
   if (s.validationOwner === t.key) s.validationOwner = undefined;
   engine.event(s, `${t.key} 根据 ${decision.evidencePath} 恢复已保全候选，交给 L1 重规划`);
   return { ticket: t.key, head: t.head, base: t.base, recoveryRef: ref, phase: t.phase };
@@ -638,6 +647,10 @@ export function initialize(inputs: engine.Inputs, cwd = process.cwd()) {
 }
 export function packet(s: engine.State, j: engine.Job, statePath: string) {
   const t = s.tickets.find(t => t.key === j.ticket);
+  const disagreement=j.action==='adjudicate' && s.protocol===engine.currentProtocol && t
+    ? engine.activeReviewDisagreement(s,t) : undefined;
+  const regular=disagreement && s.v3?.skillInvocations.find(i=>i.id===disagreement.regularInvocationId);
+  const fresh=disagreement && s.v3?.skillInvocations.find(i=>i.id===disagreement.freshInvocationId);
   const child = j.childRequestId ? s.v3?.skillChildren?.find(x => x.id === j.childRequestId) : undefined;
   const resumableSkill=s.v3?.skillInvocations.find(i=>!i.result && i.jobId!==j.id &&
     s.jobs.some(old=>old.id===i.jobId&&old.status==='cancelled'&&old.ticket===j.ticket&&
@@ -706,6 +719,21 @@ export function packet(s: engine.State, j: engine.Job, statePath: string) {
       visual:t?.evidence.visual || null,standards:['AGENTS.md','CLAUDE.md'].map(name=>path.join(s.repo.root,name)).filter(fs.existsSync)} : null,
     finding: freshInitial ? null : j.finding || null,
     dispute: freshInitial ? null : j.dispute ? Object.fromEntries(Object.entries(j.dispute).map(([key, id]) => [key, resultPaths(statePath, id).result])) : null,
+    reviewDisagreement: disagreement && regular?.result && fresh?.result ? {
+      id:disagreement.id,head:disagreement.head,base:disagreement.base,
+      candidateVersion:disagreement.candidateVersion,skillFingerprint:disagreement.skillFingerprint,
+      regular:{invocationId:regular.id,blocking:disagreement.regularBlocking,
+        reportPath:regular.result.rawOutputPath,reportSha256:regular.result.rawOutputSha256,
+        sourceArchivePath:regular.sourceArchivePath,
+        evidence:regular.result.evidencePaths.map((file,index)=>({path:file,sha256:regular.result!.evidenceSha256[index]}))},
+      fresh:{invocationId:fresh.id,blocking:disagreement.freshBlocking,
+        reportPath:fresh.result.rawOutputPath,reportSha256:fresh.result.rawOutputSha256,
+        sourceArchivePath:fresh.sourceArchivePath,
+        evidence:fresh.result.evidencePaths.map((file,index)=>({path:file,sha256:fresh.result!.evidenceSha256[index]}))},
+      resultStatus:'resolved',requiredData:['disagreementId','regularInvocationId','freshInvocationId',
+        'skillFingerprint','blocking','rationale','skillRuleRefs'],
+      note:'L1 新上下文独立读取两轮原始报告、专业依据和同版本技能规则；以当前候选解释阻断差异。此决定不替代 CI 或 L2 验收。'
+    } : null,
     remainingWork: j.ticket === '$spec' ? s.tickets.map(x => ({number:x.number,phase:x.phase,dependencies:x.dependencies,reason:x.reason})) : [],
     lens: j.action === 'review-lens' ? engine.lenses[Number(j.part)] : '',
     skillBindings: s.v3?.skillBindings?.map(b => ({ capability: b.capability, name: b.name,
@@ -774,6 +802,28 @@ function validateResult(s: engine.State, j: engine.Job, r: engine.Result) {
   }
   if (s.v3?.skillBindings && ['verify','publish','pr-review','review-lens','confirm','review-report','accept','merge'].includes(j.action))
     requireCurrentAuthorReview(s,t);
+  if (s.protocol === engine.currentProtocol && j.action === 'adjudicate' && j.part === 'pr-review') {
+    const dispute=engine.activeReviewDisagreement(s,t);
+    engine.ensure(dispute && j.fresh && j.contextObservation?.mode==='new',
+      '审查分歧必须由当前候选的全新 L1 会话裁决');
+    const report=read<Record<string,unknown>>(r.evidencePath);
+    const fields=['disagreementId','regularInvocationId','freshInvocationId','skillFingerprint','blocking','rationale','skillRuleRefs'];
+    engine.ensure(fields.every(key=>JSON.stringify(report[key])===JSON.stringify(r.data?.[key])) &&
+      report.disagreementId===dispute.id && report.regularInvocationId===dispute.regularInvocationId &&
+      report.freshInvocationId===dispute.freshInvocationId && report.skillFingerprint===dispute.skillFingerprint &&
+      report.head===dispute.head && report.base===dispute.base &&
+      report.candidateVersion===dispute.candidateVersion &&
+      typeof report.blocking==='boolean' && typeof report.rationale==='string' && report.rationale.trim() &&
+      Array.isArray(report.skillRuleRefs) && report.skillRuleRefs.length>0,
+      'L1 裁决原文必须绑定当前候选、两轮报告和技能规则');
+    const first=s.v3?.skillInvocations.find(i=>i.id===dispute.regularInvocationId);
+    const bundle=first && read<{files:{relativePath:string}[]}>(first.sourceArchivePath);
+    engine.ensure(bundle && (report.skillRuleRefs as unknown[]).every(ref=>typeof ref==='string' &&
+      bundle.files.some(file=>ref===file.relativePath || ref.startsWith(file.relativePath+'#'))),
+      'L1 裁决必须引用归档技能包内的规则文件');
+    verifyReviewInvocation(s,dispute.regularInvocationId);
+    verifyReviewInvocation(s,dispute.freshInvocationId);
+  }
   if (s.protocol === engine.currentProtocol && ['accept','merge'].includes(j.action)) verifyReviewEvidenceFiles(s,t);
   if (s.protocol === engine.currentProtocol && j.action === 'review-report') {
     const invocation=s.v3?.skillInvocations.find(i=>i.id===r.data?.reviewInvocationId);
@@ -838,14 +888,36 @@ function verifyReviewEvidenceFiles(s:engine.State,t:engine.Ticket) {
       `${round} 审查缺少原始技能报告及版本记录`);
     const invocation=s.v3?.skillInvocations.find(i=>i.id===evidence.skillInvocationId);
     const job=invocation && s.jobs.find(j=>j.id===invocation.jobId);
+    const dispute=round==='fresh' && evidence.adjudicationId && s.v3?.reviewDisagreements?.find(d=>
+      d.adjudicationJobId===evidence.adjudicationId && d.freshInvocationId===invocation?.id &&
+      d.outcomeBlocking===false && d.head===t.head && d.base===t.base &&
+      d.skillFingerprint===evidence.skillFingerprint);
+    const decision=dispute && s.v3?.decisionRecords.find(d=>d.id===evidence.adjudicationId &&
+      d.kind==='adjudication' && d.scope===t.key && d.candidateVersion===dispute.candidateVersion);
+    const clear=invocation?.result?.status==='pass' && !invocation.result.blocking ||
+      invocation?.result?.status==='changes_required' && invocation.result.blocking && !!decision;
     engine.ensure(invocation && job && invocation.capability==='prReview' &&
-      invocation.bindingFingerprint===evidence.skillFingerprint && invocation.result?.status==='pass' &&
-      !invocation.result.blocking && invocation.result.rawOutputPath===evidence.path &&
+      invocation.bindingFingerprint===evidence.skillFingerprint && clear &&
+      invocation.result?.rawOutputPath===evidence.path &&
       invocation.result.rawOutputSha256===evidence.rawReportSha256 &&
       invocation.head===t.head && invocation.base===t.base,
       `${round} 审查的技能、候选或原始报告已失效`);
     skills.verifySkillResultFiles(s,job,[invocation.id]);
+    if(decision) {
+      engine.ensure(decision.inputVersion===engine.inputVersion(s) &&
+        decision.sourceVersion===s.planSourceVersion &&
+        artifactFingerprint(decision.artifactFiles).digest===decision.artifactDigest,
+        'L1 审查裁决及其输入产物已过期或被修改');
+      verifySessionArtifact(decision.session);
+    }
   }
+}
+function verifyReviewInvocation(s:engine.State,id:string) {
+  const invocation=s.v3?.skillInvocations.find(i=>i.id===id);
+  const job=invocation && s.jobs.find(j=>j.id===invocation.jobId);
+  engine.ensure(invocation && job && invocation.capability==='prReview' && invocation.result,
+    '审查调用缺少完整原始记录');
+  skills.verifySkillResultFiles(s,job,[id]);
 }
 function verify(s: engine.State, j: engine.Job, statePath: string): engine.Result {
   const t = engine.ticket(s, j.ticket);
@@ -1888,7 +1960,8 @@ export async function main(argv: string[]): Promise<unknown> {
       fs.copyFileSync(statePath, backup, fs.constants.COPYFILE_EXCL);
       // 老轮次的确认 ID 与分组方法不同，不混用部分 regular/fresh 通过结果。
       for(const t of s.tickets) if(['self','verify','publish','review','fresh','accept','merge','integrate'].includes(t.phase) || t.reason==='waiting_ci') {
-        t.phase='queued';t.epoch++;t.evidence={};t.reason='旧运行已迁移；从队首重新验证候选';
+        t.phase='queued';t.epoch++;t.evidence={};t.reviewDisagreementId=undefined;
+        t.reason='旧运行已迁移；从队首重新验证候选';
       }
       for(const j of s.jobs) if(j.result) {
         const output=resultPaths(statePath,j.id).result;
@@ -2137,7 +2210,8 @@ export async function main(argv: string[]): Promise<unknown> {
         artifactPath: path.resolve(extra), artifactFiles: artifact.files, artifactDigest: artifact.digest, session, at: new Date().toISOString() });
       // Existing ticket plans and checks were approved for the previous role routing.
       for (const t of s.tickets) if (!['done', 'human', 'blocked', 'close', 'cleanup', 'recovery'].includes(t.phase)) {
-        t.epoch++; t.evidence = {}; t.phase = t.worktree ? 'replan' : 'claim';
+        t.epoch++; t.evidence = {}; t.reviewDisagreementId=undefined;
+        t.phase = t.worktree ? 'replan' : 'claim';
         t.reason = '模型路由改变；需真实 L1 更新工单计划和独立复核';
       }
       s.validationOwner = undefined;
@@ -2241,7 +2315,8 @@ export async function main(argv: string[]): Promise<unknown> {
             d.failureEventId === t.failures?.at(-1)?.id, '失败预算解除阻塞须指出最新失败事件及有证据的新事实');
           t.failureBudget.consecutiveNoProgress = 0; t.failureBudget.lastSignature = '';
         }
-        t.handoffPath = d.handoffPath; t.phase = t.worktree ? 'replan' : 'claim'; t.epoch++; t.reason = '';
+        t.handoffPath = d.handoffPath; t.phase = t.worktree ? 'replan' : 'claim';
+        t.epoch++; t.reviewDisagreementId=undefined; t.reason = '';
         if (session) {
           const artifact = artifactFingerprint([d.evidencePath, d.handoffPath]);
           engine.recordL1Decision(s, { id: `resolve:${t.key}:${t.epoch}:${randomUUID()}`, kind: 'resolve', scope: t.key,

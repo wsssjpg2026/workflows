@@ -42,6 +42,8 @@
 
 ## 宿主适配与逐项回执
 
+DeepSeek Harness 候选适配器的隔离配置、启动、能力边界与恢复步骤见 [adapters/README.md](adapters/README.md)。
+
 ### 已绑定技能的显式调用
 
 新运行在 `init` 时固定 `implementation`、`diagnosis`、`authorReview`、`prReview`、`handoff` 五项默认绑定。默认 `authorReview` 指向仓库内版本化的 [`code-review` 包](review-skills/code-review/SKILL.md)，其双轴方法和报告格式由技能维护。状态中的 `v3.skillBindings` 记录每个 `SKILL.md` 的实际路径、原文和包内资源的 SHA-256 指纹；这不是新增用户输入。已绑定阶段获得显式调用授权，`disable-model-invocation` 不会被解释为要求用户再手动触发。原始 implement/handoff 文件只读，交接技能仍按原要求先写 OS 临时目录，再由宿主逐字归档。

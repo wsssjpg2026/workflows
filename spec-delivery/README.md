@@ -65,9 +65,17 @@ TypeScript 宿主也可使用 `spec-delivery/skills.ts` 的 `invokeBoundSkill`�
 
 可信宿主设置绝对路径 `SPEC_DELIVERY_HOST_ADAPTER`，指向可执行适配器。CLI 以 `<operation> <request.json>` 调用它；`request.json` 是已落盘的 `{token,jobId,attempt,targetHost,requestedModel,packetPath}`。操作包括 `query`、`start`、`collect`、`cancel`。每次调用的原始 stdout、stderr、退出码和时间会以只追加文件保存在 `host-events/`；账本持有摘要和路径。适配器不能直接修改 `state.json`。
 
-`query` 应按 token 查询原生任务，返回 `{token,jobId,targetHost,state,nativeId?,authoritative?}`。`state` 可为 `not_found`、`running`、`completed`、`cancelled`、`unknown`。只有宿主能权威保证 token 不存在时才返回 `not_found,authoritative:true`。`start` 应先向宿主登记 token 与 job，再返回 `running` 或 `completed` 及稳定 `nativeId`；启动后响应丢失时，下次查询必须能找到同一实例。`collect` 返回 `completed`、`nativeId` 和 actor `result`；完成事件也可在 `query` 或 `start` 中携带 `result`。`cancel` 返回原生身份和终止状态；取消请求本身不释放工作区写权，仍需 `reconcile` 的进程树停止证明。运行中的回复可附 `startedAt`，终态可附 `completedAt/cancelledAt` 与原始 `usage`。
+`query` 应按 token 查询原生任务，返回 `{token,jobId,targetHost,state,nativeId?,authoritative?}`。`state` 可为 `not_found`、`running`、`completed`、`cancelled`、`unknown`。只有宿主能权威保证 token 不存在时才返回 `not_found,authoritative:true`。`start` 应先向宿主登记 token 与 job，再返回 `running` 或 `completed` 及稳定 `nativeId`；启动后响应丢失时，下次查询必须能找到同一实例。`collect` 返回 `completed`、`nativeId` 和 actor 的结构化 `result`，或指定 `resultFile`；完成事件也可在 `query` 或 `start` 中携带结果。两者并存时只采用结构化 `result`。`finalText` 是人类摘要，不作为第二份 JSON 来源。指定文件须位于本 job 的 packet `outputDirectory` 内。`cancel` 返回原生身份和终止状态；取消请求本身不释放工作区写权。运行中的回复可附 `startedAt`，终态可附 `completedAt/cancelledAt`、`continuationSupported` 与原始 `usage`。
 
-`dispatch <state> <jobId>` 总是先查询 token，确认不存在后才启动。`collect <state> [jobId]` 按 actor 独立查询、绑定和收取，重复调用不会覆盖完成结果。原生身份与角色模型由 `SPEC_DELIVERY_HOST_OBSERVER` 再次查询核验；适配器回复中声称的模型或 caller JSON 中的 `source` 不能充当该观测。查询错误、身份不符、无法确认是否已启动或结果尚不可读时，账本记为 `uncertain`，保留实际实例和原始事件。后续按同一 token 查询；不能盲目启动另一个 actor，也不宣称跨宿主事务的 exactly-once。`dispatch-cancel <state> <jobId>` 先查询再发送取消请求。
+`dispatch <state> <jobId>` 总是先查询 token，确认不存在后才启动。`collect <state> [jobId]` 按 actor 独立查询、绑定和收取，重复调用不会覆盖完成结果。原生身份与角色模型由 `SPEC_DELIVERY_HOST_OBSERVER` 再次查询核验；适配器回复中声称的模型或 caller JSON 中的 `source` 不能充当该观测。查询错误、身份不符、无法确认是否已启动或结果尚不可读时，账本记为 `uncertain`，保留实际实例和原始事件。后续按同一 token 查询；不能盲目启动另一个 actor，也不宣称跨宿主事务的 exactly-once。
+
+### 回执修订与正式恢复
+
+`stage <state> <jobId> <result-json>` 与 `stage-raw <state> <jobId> <raw-file>` 先逐字节归档原始回执，再依次检查宿主终态、结果出现、JSON/schema 和语义。畸形 JSON、非法转义、截断或代码块包装均保留原字节、SHA-256、来源和失败事件；`result.json` 只是可再生缓存。重复收取同一内容不会重复计失败预算，已经接纳的修订不能覆盖。
+
+`recover-result <state> <decision.json>` 接受 `kind` 为 `cancel`、`confirm-stop`、`correct-binding`、`revise-receipt`、`prepare-repair` 或 `abandon` 的决定。共同字段为 `{jobId,expectedRevision,dispatchToken,attempt,expectedCandidateVersion,reason,evidencePath}`，均取自最新 `inspect` 与派发记录，并指向已存在的证据文件。`dispatch-cancel <state> <decision.json>` 是 `kind:"cancel"` 的兼容入口。取消只归档请求；`confirm-stop` 还需 `{observedState:"stopped"|"lost",processTreeStopped:true}`，并确认宿主实例与测试进程树停止后才释放租约。`correct-binding` 需 `{expectedNativeId,nativeId}`，新身份必须在当前 token 的实例日志中，并由原生会话查询再次核对真实模型；仍可能运行的旧实例还需完整进程树停止证明。
+
+格式修订用 `kind:"revise-receipt"`，增加 `{previousRevisionId,rawPath}`。托管宿主还须提供 `continuationHostEvent`，指向当前 token 的后续 `query/collect/start` 原始事件；命令核对同一原生 actor 的续接能力、终态及权威结果字节。命令在锁内检查版本和原始修订，追加链接原件的新修订，只重新验证结果，不重新执行实现、推送、评论或合并。宿主无法可靠续接时，可用 `kind:"prepare-repair"` 加 `{previousRevisionId}` 登记独立 `repair-receipt` job；其 packet 带原始字节、错误、候选与预期 head/base，禁止工作区写入。按普通 `dispatch/collect` 收取该 job 的真实宿主身份和新回执，原 job 仍须通过全部门禁。候选变化或证据不足需按正常诊断和重规划处理。
 
 **ZCode**：先读取本机 `dynamic-workflows` 技能。`zcode <state>` 为已预留的同模型 jobs 生成原生脚本、`CreateWorkflow` 参数和 `binding` 模板。实际调用后，把返回的 `runId` 加入模板并调用 `bind-batch <state> <binding.json>`。身份格式为 `{runId,jobs:[{jobId,actorName}]}`。CLI 以 `{runId}/{actorName}` 查询宿主观测。响应不确定时先查询原生运行，不能重新启动同一批。
 

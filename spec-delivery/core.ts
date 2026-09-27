@@ -44,6 +44,8 @@ export interface ProtocolV3 {
   skillMigrations?: { at: string; evidencePath: string;
     changes: { capability: SkillCapability; previousFingerprint: string; nextFingerprint: string }[] }[];
   dispatchRecords: DispatchRecord[];
+  receiptRecords?: ReceiptRecord[];
+  recoveryRecords?: RecoveryRecord[];
 }
 export function initialProtocolV3(): ProtocolV3 {
   return { executionPath: 'legacy-v02', decisionRecords: [], skillInvocations: [], skillChildren: [], dispatchRecords: [] };
@@ -76,6 +78,21 @@ export interface HostInstanceRecord {
   key: string; nativeId: string | null; state: 'requested' | 'running' | 'completed' | 'cancelled' | 'unknown';
   session?: NativeSession; firstSeenAt: string; lastSeenAt: string; events: HostEventRef[];
   startedAt?: string; completedAt?: string; cancelledAt?: string; rawUsage?: Json; bindingError?: string;
+  continuationSupported?: boolean;
+}
+export type ReceiptSource = 'stage' | 'host_structured' | 'host_file' | 'repair';
+export interface ReceiptRevision {
+  id: string; previousId?: string; source: ReceiptSource; rawPath: string; rawSha256: string;
+  sourceHostEvent?: string; sourceNativeId?: string; repairJobId?: string;
+  candidateVersion: string; at: string; status: 'raw' | 'schema_valid' | 'rejected' | 'accepted';
+  error?: string;
+}
+export interface ReceiptRecord { jobId: string; revisions: ReceiptRevision[]; currentId?: string; acceptedId?: string }
+export interface RecoveryRecord {
+  id: string; kind: 'cancel' | 'confirm-stop' | 'correct-binding' | 'revise-receipt' | 'prepare-repair' | 'abandon';
+  jobId: string; expectedRevision: number; dispatchToken: string; attempt: number;
+  evidencePath: string; reason: string; beforeNativeId?: string; afterNativeId?: string;
+  receiptRevisionId?: string; repairJobId?: string; priorBindingError?: string; at: string;
 }
 export interface DispatchRecord {
   jobId: string; attempt: number; token: string; targetHost: string; requestedModel: string;
@@ -111,7 +128,7 @@ export interface ExecutionPlan { capabilities: Capabilities; policy: Policy; tic
   inputVersion?: string; sourceVersion?: string; decisionNativeId?: string;
 }
 export type Phase = 'claim' | 'plan' | 'plan_check' | 'implement' | 'queued' | 'self' | 'verify' | 'publish' | 'review' | 'fresh' | 'accept' | 'integrate' | 'replan' | 'recovery' | 'merge' | 'close' | 'cleanup' | 'done' | 'human' | 'blocked';
-export type Action = 'claim' | 'plan' | 'plan-check' | 'implement' | 'self-standards' | 'self-spec' | 'verify' | 'publish' | 'review-lens' | 'confirm' | 'adjudicate' | 'review-report' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'spec-audit' | 'spec-close' | 'skill-child';
+export type Action = 'claim' | 'plan' | 'plan-check' | 'implement' | 'self-standards' | 'self-spec' | 'verify' | 'publish' | 'review-lens' | 'confirm' | 'adjudicate' | 'review-report' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'spec-audit' | 'spec-close' | 'skill-child' | 'repair-receipt';
 export interface Evidence {
   head: string; base: string; path: string;
   /** These are separate observations: a remote PR head need not equal an unpushed local head. */
@@ -169,6 +186,8 @@ export interface Job {
   tier: Tier; model: string; executor: 'agent' | 'main' | 'command'; fresh: boolean; contextKey: string;
   head: string; base: string; tests: number; status: 'leased' | 'running' | 'done' | 'cancelled';
   nativeId: string; result?: Result; finding?: Finding;
+  repairOfJobId?: string;
+  repairTargetRevisionId?: string;
   dispatchToken?: string;
   contextIntent?: ContextIntent; contextObservation?: ContextObservation; handoffRef?: HandoffReference;
   inputVersion?: string; candidateVersion?: string; session?: NativeSession; decisionArtifactDigest?: string; decisionArtifactFiles?: string[];
@@ -556,6 +575,12 @@ export function bind(s: State, id: string, ref: { nativeId: string; model?: stri
     verifyNativeSession(s, ref.session, ref.nativeId, j.tier);
     ensure(ref.session.jobId === j.id, '宿主观测不是当前任务的原生会话');
     ensure(j.model === s.inputs.models[j.tier], '已派发任务的模型请求与当前配置不符');
+    if (j.repairOfJobId) {
+      const original = s.jobs.find(x => x.id === j.repairOfJobId);
+      ensure(original?.session && ref.nativeId !== original.nativeId &&
+        ref.session.observationId !== original.session.observationId,
+        '独立回执修复者不能复用原业务执行者');
+    }
     if (j.parentInvocationId && j.contextIntent?.kind === 'independent') {
       const invocation = s.v3?.skillInvocations.find(i => i.id === j.parentInvocationId);
       ensure(invocation, '技能子任务缺少父调用');
@@ -684,6 +709,7 @@ export function submit(s: State, id: string, r: Result) {
     event(s, `${child.key} 技能子任务 ${r.status}；结果返回 ${parent.id}`);
     return;
   }
+  ensure(j.action !== 'repair-receipt', '独立回执修复只能通过原任务的修订链收取');
   const allowed: Record<Action, string[]> = {
     claim: ['claimed'], plan: ['planned'], 'plan-check': ['pass', 'changes'], implement: ['implemented', 'replan'],
     'self-standards': ['reviewed'], 'self-spec': ['reviewed'], verify: ['pass', 'fail'], publish: ['published'],
@@ -691,7 +717,7 @@ export function submit(s: State, id: string, r: Result) {
     accept: ['ready', 'gap', 'conflict', 'waiting_ci', 'needs_human', 'blocked'], integrate: ['implemented', 'replan'],
     replan: ['planned'], merge: ['merged', 'waiting_merge'], close: ['closed'], cleanup: ['cleaned'],
     'spec-audit': ['complete', 'needs_closeout', 'waiting_human', 'blocked'], 'spec-close': ['closed'],
-    'skill-child': ['completed', 'failed'],
+    'skill-child': ['completed', 'failed'], 'repair-receipt': [],
   };
   if (r.complete) ensure(allowed[j.action].includes(r.status), `${j.action} 不接受完成状态 ${r.status}；跳过不能算通过`);
   const t = j.ticket === '$spec' ? undefined : ticket(s, j.ticket);

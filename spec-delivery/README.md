@@ -6,7 +6,7 @@
 
 ## v0.3 过渡范围
 
-`version` 报告 `0.3.0`。新建运行写入协议 `3`，summary 继续输出独立的 `schemaVersion: 1`。协议 3 的 `v3.decisionRecords` 持久保存真实 L1 决策；技能调用与派发记录由后续工单接入。当前阶段仍使用下文的旧审查流程。此仓库的开发候选不会自动更新正式安装版。
+`version` 报告 `0.3.0`。新建运行写入协议 `3`，summary 继续输出独立的 `schemaVersion: 1`。协议 3 的 `v3.decisionRecords`、`skillInvocations`、`skillChildren` 和 `dispatchRecords` 分别持久保存 L1 决策、技能调用、技能子任务及宿主派发。当前阶段仍使用下文的旧审查流程。此仓库的开发候选不会自动更新正式安装版。
 
 ## 启动只需五项
 
@@ -50,7 +50,15 @@
 
 宿主**实际完成调用**后保存原始产物、专业证据，以及 JSON 宿主回执 `{source:"native_host",invocationId,jobId,nativeId,observationId,mode,bindingFingerprint,terminal:true,nativeEntry?}`；适配器以 `result <invocationId> <jobId>` 返回该回执；CLI 归档宿主响应后调用 `skill-finish <state> <invocationId> <outcome.json>`。源码执行回执另列出逐文件 `{relativePath,sha256}` 的 `loadedFiles`。外围 outcome 为 `{status:"pass"|"changes_required"|"incomplete"|"skipped",blocking,rawOutputPath?,evidencePaths?}`。技能无需原生输出 workflow JSON；状态/阻断判断由执行者提供，适配层只核对身份、原始文件、完整性及版本。空白或缺失产物不能形成 pass；实现 job 的外层 Result 用 `data.skillInvocationIds` 关联 implement/diagnosis 与 handoff 的已完成调用，handoff 归档内容必须与原文相同。
 
-TypeScript 宿主也可使用 `spec-delivery/skills.ts` 的 `invokeBoundSkill`：适配器提供 `capabilities` 与 `invokeNative` / `executeSource` 实际入口；函数先持久登记调用，再执行相应入口、校验宿主回执并收取结果。单次调用不自行派生子 agent；技能内部委派由后续通用子任务协议接管。
+TypeScript 宿主也可使用 `spec-delivery/skills.ts` 的 `invokeBoundSkill`：适配器提供 `capabilities` 与 `invokeNative` / `executeSource` 实际入口；函数先持久登记调用，再执行相应入口、校验宿主回执并收取结果。
+
+### 技能子任务与续接
+
+技能执行者可用 `skill-delegate <state> <invocationId> <children.json>` 登记一批专业子任务。文件为 `{children:[{key,instruction,tier,required?,independent?,skillCapability?,head?}]}`；同一父调用内 `key` 稳定且幂等，重新提交不同定义会被拒绝。`tier` 只可为 L1/L2/L3，实际模型始终取运行已确认的三档路由；请求中的其它模型字段会被拒绝。`skillCapability` 引用另一已绑定技能时，子任务记录其包和依赖的固定指纹，完成回执须引用该子任务内真实通过的 `skillInvocationIds`。实现类父任务可为已提交且干净的新候选指定 `head`；其它父任务沿用原候选。
+
+`next` 在同一 agent/测试预算下预留 `skill-child` job，仍由 `dispatch` 或 `drive` 按持久 token 查询、启动和收取真实宿主身份。父 actor 活着时继续占一个 agent 槽位。每个子任务的 packet 包含父调用 ID、请求、候选版本和上下文约束；独立子任务必须有区别于父与兄弟的原生会话，fresh 父任务使所有子任务保持 fresh 和独立。子 actor 以 `completed`、`failed` 或 `incomplete` 回执；`skill-continue <state> <invocationId>` 读取每个请求的 job、实际模型、原生身份、结果与等待状态。技能可依据这些结果再 `skill-delegate` 下一批，因此拓扑与数量由技能决定。失败或确认停止的子任务只由 `skill-retry <state> <invocationId> <keys.json>` 显式重试，文件为 `{keys:["stable-key"]}`；已完成兄弟结果不重跑。父技能的 `pass` 或 `changes_required` 仅在全部在途子任务终结且必需子任务成功后采纳。
+
+若父 actor 中断，先用宿主停止证明 `reconcile`。新预留的同角色、同候选 job 绑定原生会话后，以 `skill-resume <state> <invocationId> <resume.json>` 续接，文件为 `{jobId,evidencePath}`。命令复查当前宿主有相同版本的技能执行能力，并保留旧父身份、续接依据、已完成子结果和在途 child token。新 actor 从 packet 的 `skillResume`、原始技能归档和 `skill-continue` 的结果续接；`skill-start` 不会为同候选未完成技能重新开一套调用。此接口记录技能调用的续接关系，宿主上下文的实际恢复证明由上下文适配层提供。
 
 维护者可在所有在途 job 对账结束后运行 `migrate-skills <state> <migration.json>`，文件含 `{expectedRevision,evidencePath,replacements:{capability:"/absolute/path/SKILL.md"}}`。它显式重新固定被替换技能及依赖，也能为早期缺少绑定的 v3 运行补齐默认来源；受影响候选的自检/审查/验收证据失效，旧调用与原始产物仍可审计。运行中发现指纹漂移会拒绝调用或采纳结果，不自动迁移。
 ### 可恢复的派发接口

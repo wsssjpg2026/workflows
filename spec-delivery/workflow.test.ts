@@ -143,6 +143,7 @@ test('CI 等待保留队首并等待事件，通过后恢复验收，不派空�
   const accept=e.reserve(s)[0]; e.bind(s,accept.id,{nativeId:'accept',model:accept.model});
   s.facts.prs[201].checks=[{id:'ci',status:'pending'}];
   e.submit(s,accept.id,response(s,accept)); assert.equal(s.tickets[0].reason,'waiting_ci');
+  assert.equal(s.tickets[0].failureBudget?.totalRetries || 0, 0, 'pending CI is not a model retry');
   assert.deepEqual(e.reserve(s),[]);assert.equal(s.validationOwner,s.tickets[0].key);
   const facts=structuredClone(s.facts); facts.prs[201].checks=[{id:'ci',status:'pass'}];
   e.reconcileFacts(s,facts); assert.equal(s.status,'running'); assert.equal(s.specAudit,undefined);

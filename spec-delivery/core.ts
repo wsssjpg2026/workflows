@@ -62,6 +62,17 @@ export interface WorkspaceRecovery {
   expectedHead: string; observedHead: string | null; base: string;
   recoveryRef: string | null; snapshotPath: string; at: string;
 }
+export type FailureCategory = 'receipt_validation' | 'host' | 'model' | 'test' | 'semantic' | 'ci';
+export interface FailureEvent {
+  id: string; category: FailureCategory; reason: string; signature: string;
+  jobId?: string; at: string;
+}
+export interface FailureBudget {
+  totalRetries: number; consecutiveNoProgress: number; lastSignature: string;
+  byCategory?: Partial<Record<FailureCategory, number>>;
+  /** A dispatched L1 replan is the sole automatic escalation; it never replenishes the retry budget. */
+  replans: number;
+}
 export interface Ticket extends TicketPlan {
   key: string; phase: Phase; epoch: number; round: number; stalls: number; escalations: number;
   head: string; base: string; pr: number; branch: string; worktree: string;
@@ -75,6 +86,8 @@ export interface Ticket extends TicketPlan {
   recoveryRef?: string;
   pendingPushHead?: string;
   integrationHead?: string;
+  failures?: FailureEvent[];
+  failureBudget?: FailureBudget;
 }
 export interface LivePR { number: number; head: string; base: string; baseRef: string; state: string; draft: boolean; mergeable: string; checks: {id: string; status: string}[] }
 export interface LiveFacts { base: string; issueStates: Record<string, string>; prs: Record<string, LivePR>; at: string }
@@ -176,6 +189,8 @@ function admit(s: State) {
   if (owner?.reason === 'waiting_ci' && s.facts.prs[owner.pr]?.checks.some(c=>c.status==='pending')) return;
   if (owner && !['done', 'close', 'cleanup', 'human', 'blocked', 'recovery'].includes(owner.phase)) return;
   if (owner && s.jobs.some(j => j.ticket === owner.key && busy(j))) return;
+  if (owner?.phase === 'recovery' && s.jobs.some(j => j.ticket === owner.key &&
+    (j.testExecution || (owner.recovery?.activeJobIds.includes(j.id) && j.status === 'cancelled' && !j.stopConfirmation?.processTreeStopped)))) return;
   s.validationOwner = undefined;
   // 升级旧账本时先排空已有验证 actors，不能在它们运行时启动另一票的合并。
   const occupied = new Set(s.jobs.filter(j => busy(j) && validationPhases.includes(s.tickets.find(t => t.key === j.ticket)?.phase as Phase)).map(j => j.ticket));
@@ -248,13 +263,45 @@ function resetCandidate(t: Ticket, head: string, base: string, phase: Phase) {
   t.head = head; t.base = base; t.evidence = {}; t.epoch++; t.phase = phase; t.reason = '';
   if (phase === 'integrate') t.integrationHead = undefined;
 }
-function problem(s: State, t: Ticket, signature: string, next: Phase) {
-  t.round++; t.stalls = signature === t.lastProblem ? t.stalls + 1 : 0; t.lastProblem = signature; t.reason = signature;
+/** Count a failed attempt exactly once, independently of its lease, replacement job and phase epoch. */
+export function recordFailure(s: State, t: Ticket, failure: {
+  id: string; category: FailureCategory; reason: string; signature?: string; jobId?: string; next: Phase; invariant?: boolean; preservePhase?: boolean;
+}) {
+  t.failures ??= [];
+  if (t.failures.some(e => e.id === failure.id)) return false;
   ensure(s.policy, '缺少策略');
-  if (t.round >= s.policy.rounds || t.stalls >= s.policy.noProgress) {
-    t.phase = t.escalations ? 'blocked' : 'replan'; t.reason = signature;
-  } else t.phase = next;
+  const signature = `${failure.category}:${(failure.signature || failure.reason).trim().replace(/\s+/g, ' ')}`;
+  const budget = t.failureBudget ??= { totalRetries: 0, consecutiveNoProgress: 0, lastSignature: '', replans: t.escalations };
+  budget.consecutiveNoProgress = signature === budget.lastSignature ? budget.consecutiveNoProgress + 1 : 1;
+  budget.totalRetries++; budget.lastSignature = signature;
+  budget.byCategory ??= {}; budget.byCategory[failure.category] = (budget.byCategory[failure.category] || 0) + 1;
+  t.failures.push({ id: failure.id, category: failure.category, reason: failure.reason, signature,
+    jobId: failure.jobId, at: new Date().toISOString() });
+  t.round = budget.totalRetries; t.stalls = budget.consecutiveNoProgress; t.lastProblem = signature;
+  if (!failure.preservePhase && t.phase !== 'recovery') t.reason = failure.reason;
+  const exhausted = budget.totalRetries >= s.policy.rounds || budget.consecutiveNoProgress >= s.policy.noProgress;
+  if (!failure.preservePhase && t.phase !== 'recovery') {
+    const retrySameCandidate = failure.category === 'host' && failure.next === t.phase && !exhausted && !failure.invariant;
+    if (exhausted || failure.invariant) t.phase = budget.replans ? 'blocked' : 'replan';
+    else t.phase = failure.next;
+    if (!retrySameCandidate) { t.epoch++; t.evidence = {}; }
+  }
+  event(s, `${t.key} 失败 ${failure.category} (${budget.totalRetries}/${s.policy.rounds}, 连续 ${budget.consecutiveNoProgress}/${s.policy.noProgress})：${failure.reason}`);
+  return true;
+}
+/** A correctable receipt keeps its lease; once that lease is stopped, its failure must not be retried unchanged. */
+export function finalizeRejectedReceipt(s: State, t: Ticket, j: Job) {
+  if (t.phase === 'recovery' || t.epoch !== j.epoch) return;
+  const failure = t.failures?.findLast(f => f.jobId === j.id && f.category === 'receipt_validation');
+  if (!failure) return;
+  t.phase = t.failureBudget?.replans ? 'blocked' : 'replan';
+  t.reason = `回执校验失败：${failure.reason}`;
   t.epoch++; t.evidence = {};
+  event(s, `${t.key} 回执无法纠正且原执行者已停止；${t.phase === 'blocked' ? '局部阻塞' : '交给 L1 重规划'}`);
+}
+function problem(s: State, t: Ticket, signature: string, next: Phase, category: FailureCategory = 'semantic', jobId?: string) {
+  const id = jobId ? `${jobId}:${category}` : `${t.key}:${t.epoch}:${category}:${createHash('sha256').update(signature).digest('hex').slice(0, 16)}`;
+  recordFailure(s, t, { id, category, reason: signature, jobId, next });
 }
 export function ciAllowed(pr: LivePR, r?: Result) {
   const checks = pr.checks;
@@ -314,6 +361,8 @@ function candidates(s: State): Candidate[] {
   for (const t of s.tickets) {
     advanceGroups(s, t);
     if (['done', 'human', 'blocked', 'recovery'].includes(t.phase)) continue;
+    // An invalid receipt can change phase while its original writer is still active.
+    if (s.jobs.some(j => j.ticket === t.key && busy(j) && j.epoch !== t.epoch)) continue;
     if (validationPhases.includes(t.phase) && s.validationOwner !== t.key) continue;
     if (t.phase === 'claim' && !dependencyReady(s, t)) continue;
     if (t.phase === 'self') { out.push({ t, action: 'self-standards' }, { t, action: 'self-spec' }); continue; }
@@ -379,6 +428,10 @@ export function reserve(s: State): Job[] {
       contextKey: `${s.id}:${key}:${continuity}${fresh ? `:fresh-${epoch}` : ''}`, head: c.t?.head || '', base: c.t?.base || s.facts.base,
       tests: hasTests(c.action), status: 'leased', nativeId: '', finding: c.finding, dispute: c.dispute,
       inputVersion: inputVersion(s), candidateVersion: candidateVersion(s, c.t), timing: { leasedAt: new Date().toISOString() } };
+    if (c.action === 'replan' && c.t) {
+      const budget = c.t.failureBudget ??= { totalRetries: 0, consecutiveNoProgress: 0, lastSignature: '', replans: 0 };
+      budget.replans++;
+    }
     s.jobs.push(j); created.push(j);
   }
   if (created.length) event(s, `已预留 ${created.length} 个任务，含所有显式审查 actors`);
@@ -436,7 +489,8 @@ export function submit(s: State, id: string, r: Result) {
   j.result = r; j.status = 'done';
   j.timing ??= { leasedAt: '' }; j.timing.completedAt = new Date().toISOString();
   if (!r.complete) {
-    if (t) { t.phase = 'blocked'; t.reason = `${j.action}: ${r.status}`; }
+    if (t) recordFailure(s, t, { id: `${j.id}:model`, category: 'model', reason: `${j.action}: ${r.status}`,
+      jobId: j.id, next: 'replan', invariant: true });
     else if (!paused) s.status = 'blocked';
     event(s, `${j.action} 未完整执行，不能视为通过`); return;
   }
@@ -462,12 +516,12 @@ export function submit(s: State, id: string, r: Result) {
     case 'plan-check':
       ensure(t, '缺少工单');
       if (r.status === 'pass') { if (data.checksPath) t.checksPath = String(data.checksPath); t.phase = 'implement'; }
-      else problem(s, t, String(data.reason || '计划尚未满足验收'), 'plan'); break;
+      else problem(s, t, String(data.reason || '计划尚未满足验收'), 'plan', 'semantic', j.id); break;
     case 'implement': case 'integrate':
       ensure(t, '缺少工单');
       if (r.status === 'replan') {
         ensure(r.handoffPath && typeof data.reason === 'string' && data.reason.trim(), '重规划必须交接真实候选和原因');
-        problem(s, t, data.reason, 'replan');
+        problem(s, t, data.reason, 'replan', 'semantic', j.id);
         t.head = r.head!; t.base = r.base!; t.pendingPushHead = r.head!;
         if (j.action === 'integrate') t.integrationHead = r.head!;
         break;
@@ -490,7 +544,7 @@ export function submit(s: State, id: string, r: Result) {
           integrationHead: t.integrationHead || null };
         t.phase = 'publish';
       }
-      else problem(s, t, String(data.failureSignature || r.status), 'implement'); break;
+      else problem(s, t, String(data.failureSignature || r.status), 'implement', 'test', j.id); break;
     case 'publish':
       ensure(t && freshEvidence(t, 'tests') && freshEvidence(t, 'self'), '发布前需要同候选的自检与测试');
       ensure(!t.visual || freshEvidence(t, 'visual'), '适用视觉检查缺失');
@@ -510,7 +564,7 @@ export function submit(s: State, id: string, r: Result) {
       const cs = jobsAt(s, t, 'confirm').flatMap(x =>
         (jobsAt(s, t, 'adjudicate').find(d => d.part === x.part)?.result || x.result)?.findings || []);
       const blockers = cs.filter(f => f.confidence! >= 50);
-      if (blockers.length) problem(s, t, blockers.map(f => f.description).sort().join('|'), 'implement');
+      if (blockers.length) problem(s, t, blockers.map(f => f.description).sort().join('|'), 'implement', 'semantic', j.id);
       else if (t.phase === 'review') { t.evidence.regular = evidence(); t.phase = 'fresh'; t.epoch++; }
       else { ensure(t.phase === 'fresh', '非审查阶段'); t.evidence.fresh = evidence(); t.phase = 'accept'; }
       break;
@@ -520,18 +574,19 @@ export function submit(s: State, id: string, r: Result) {
       if (r.status === 'ready') {
         ensure(Array.isArray(data.satisfiedCriteria) && t.criteria.every(c => (data.satisfiedCriteria as Json[]).includes(c)), 'issue 验收条件未全部满足');
         t.evidence.accept = evidence();
-        if (live?.mergeable === 'CONFLICTING') problem(s, t, '目标分支存在冲突', 'integrate');
+        if (live?.mergeable === 'CONFLICTING') problem(s, t, '目标分支存在冲突', 'integrate', 'semantic', j.id);
         else if (!live || !ciAllowed(live, r)) { t.phase = 'blocked'; t.reason = 'waiting_ci'; }
         else t.phase = 'merge';
       } else if (r.status === 'gap') {
-        ensure(data.planPath, '验收缺口必须附 L2 补充计划'); t.planPath = String(data.planPath); problem(s, t, String(data.reason || '验收缺口'), 'replan');
-      } else if (r.status === 'conflict') { problem(s, t, '需要集成目标分支', 'integrate'); }
+        ensure(data.planPath, '验收缺口必须附 L2 补充计划'); t.planPath = String(data.planPath); problem(s, t, String(data.reason || '验收缺口'), 'replan', 'semantic', j.id);
+      } else if (r.status === 'conflict') { problem(s, t, '需要集成目标分支', 'integrate', 'semantic', j.id); }
       else if (r.status === 'waiting_ci') { t.phase = 'blocked'; t.reason = 'waiting_ci'; }
       else { t.phase = 'blocked'; t.reason = String(data.reason || r.status); }
       break;
     case 'replan':
       ensure(t && data.planPath && data.checksPath, '独立 L1 重规划需要计划与验证清单');
-      t.planPath = String(data.planPath); t.checksPath = String(data.checksPath); t.escalations++; t.stalls = 0; t.round = 0; t.baseInvalidations = 0;
+      t.planPath = String(data.planPath); t.checksPath = String(data.checksPath); t.escalations++;
+      t.baseInvalidations = 0;
       t.phase = 'plan_check'; t.epoch++; break;
     case 'merge':
       if (r.status === 'waiting_merge') { ensure(t, '缺少工单'); t.phase = 'blocked'; t.reason = 'waiting_merge'; break; }
@@ -612,7 +667,8 @@ export function reconcileFacts(s: State, facts: LiveFacts) {
     }
     if (t.phase === 'blocked' && t.reason === 'waiting_ci' && p && ciAllowed(p)) { t.phase = 'accept'; t.epoch++; }
     if (t.phase === 'blocked' && t.reason === 'waiting_ci' && p?.checks.some(c=>c.status==='failed')) {
-      problem(s,t,`CI 执行失败：${p.checks.filter(c=>c.status==='failed').map(c=>c.id).sort().join(',')}`,'implement');
+      const failed = p.checks.filter(c=>c.status==='failed').map(c=>c.id).sort().join(',');
+      recordFailure(s, t, { id: `ci:${t.key}:${p.head}:${failed}`, category: 'ci', reason: `CI 执行失败：${failed}`, next: 'implement' });
     }
     if (t.phase === 'merge' && p?.mergeable === 'CONFLICTING') resetCandidate(t, t.head, facts.base, 'integrate');
   }

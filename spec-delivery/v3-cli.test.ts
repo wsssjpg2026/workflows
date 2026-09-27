@@ -240,7 +240,9 @@ test('每票独立计划复核及过期工件门禁通过公开 CLI 生效', () 
     assert.equal(x.call('bind', statePath, checking.id, binding).status, 0);
     const same = x.call('stage', statePath, checking.id, JSON.stringify({ complete: true, status: 'pass', evidencePath: x.planEvidence }));
     assert.notEqual(same.status, 0); assert.match(same.stderr, /独立 L1 原生会话/);
-    assert.equal(JSON.parse(fs.readFileSync(statePath, 'utf8')).tickets[0].phase, 'plan_check');
+    const rejectedState = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    assert.equal(rejectedState.tickets[0].phase, 'replan');
+    assert.equal(rejectedState.tickets[0].failures.at(-1).category, 'receipt_validation');
     // A fresh run with separate sessions reaches implementation, then a changed check file invalidates the approval.
   } finally { fs.rmSync(x.temp, { recursive: true, force: true }); }
   const y = fixture();

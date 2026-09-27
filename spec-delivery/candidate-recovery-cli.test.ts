@@ -41,7 +41,7 @@ if(!a.includes('graphql')){console.error('unexpected gh '+a.join(' '));process.e
 const base=fs.readFileSync(${JSON.stringify(targetFile)},'utf8').trim();
 const pr=fs.readFileSync(${JSON.stringify(prFile)},'utf8').trim();
 const query=a.find(x=>x.startsWith('query='))||'';
-const repository={target:{target:{oid:base}},i100:{number:100,state:'OPEN'},i101:{number:101,state:'OPEN'}};
+const repository={target:{target:{oid:base}},i100:{number:100,state:'OPEN'},i101:{number:101,state:'OPEN'},i102:{number:102,state:'OPEN'}};
 if(query.includes('p201:'))repository.p201={number:201,url:'https://github.com/example/test/pull/201',state:'OPEN',headRefOid:pr,baseRefOid:base,baseRefName:'main',headRefName:'task',isDraft:false,mergeable:'MERGEABLE',mergeCommit:null};
 console.log(JSON.stringify({data:{repository}}));
 `);
@@ -172,12 +172,109 @@ test('commit H→M requesting replan hands M to L1, preserves unpushed candidate
     const stale = x.call('submit', x.statePath, planning.id, resultFile);
     assert.notEqual(stale.status, 0); assert.match(stale.stderr, /过期候选 SHA/);
     assert.equal(x.readState().tickets[0].phase, 'replan');
+    const failedOnce = x.readState().tickets[0].failureBudget?.totalRetries;
+    assert.equal(failedOnce, 2);
+    assert.equal(x.readState().tickets[0].failures?.at(-1)?.category, 'receipt_validation');
+    assert.notEqual(x.call('submit', x.statePath, planning.id, resultFile).status, 0);
+    assert.equal(x.readState().tickets[0].failureBudget?.totalRetries, failedOnce);
     fs.writeFileSync(resultFile, JSON.stringify({ model: planning.model, complete: true, status: 'planned',
       head: m, base: x.base, evidencePath: x.evidencePath,
       data: { planPath: x.planPath, checksPath: x.checksPath } }));
     const current = x.call('submit', x.statePath, planning.id, resultFile);
     assert.equal(current.status, 0, current.stderr);
     assert.equal(x.readState().tickets[0].phase, 'plan_check');
+  } finally { fs.rmSync(x.root, { recursive: true, force: true }); }
+});
+
+test('cancel and replacement attempts share one bounded host budget across job IDs', () => {
+  const x = fixture('implement');
+  try {
+    stop(x);
+    let saved = x.readState();
+    assert.equal(saved.tickets[0].failureBudget?.totalRetries, 1);
+    let next = JSON.parse(x.call('next', x.statePath).stdout);
+    const replacement = next.jobs.find((j: engine.Job) => j.ticket === '101' && j.action === 'implement');
+    assert.ok(replacement); assert.notEqual(replacement.id, x.job.id);
+    const bindPath = path.join(x.run, 'replacement-binding.json');
+    fs.writeFileSync(bindPath, JSON.stringify({ nativeId: `host-${replacement.id}`, model: replacement.model }));
+    x.observe(`host-${replacement.id}`, replacement.id, replacement.model);
+    assert.equal(x.call('bind', x.statePath, replacement.id, bindPath).status, 0);
+    const secondEvidence = path.join(x.run, 'second-host-observation.md'); fs.writeFileSync(secondEvidence, 'second observed stop\n');
+    const statusPath = path.join(x.run, 'second-stopped.json');
+    fs.writeFileSync(statusPath, JSON.stringify([{ jobId: replacement.id, nativeId: `host-${replacement.id}`,
+      state: 'stopped', processTreeStopped: true, evidencePath: secondEvidence }]));
+    assert.equal(x.call('reconcile', x.statePath, statusPath).status, 0);
+    saved = x.readState();
+    assert.equal(saved.tickets[0].failureBudget?.totalRetries, 2);
+    assert.equal(saved.tickets[0].failureBudget?.consecutiveNoProgress, 2);
+    assert.equal(saved.tickets[0].phase, 'replan');
+    next = JSON.parse(x.call('next', x.statePath).stdout);
+    const replan = next.jobs.find((j: engine.Job) => j.ticket === '101' && j.action === 'replan');
+    assert.ok(replan);
+    fs.writeFileSync(bindPath, JSON.stringify({ nativeId: `host-${replan.id}`, model: replan.model }));
+    x.observe(`host-${replan.id}`, replan.id, replan.model);
+    assert.equal(x.call('bind', x.statePath, replan.id, bindPath).status, 0);
+    assert.equal(x.call('stage', x.statePath, replan.id, JSON.stringify({ complete: true, status: 'planned',
+      head: x.base, base: x.base, evidencePath: x.evidencePath,
+      data: { planPath: x.planPath, checksPath: x.checksPath } })).status, 0);
+    assert.equal(x.readState().tickets[0].failureBudget?.totalRetries, 2, 'successful replan does not replenish total retries');
+    next = JSON.parse(x.call('next', x.statePath).stdout);
+    const check = next.jobs.find((j: engine.Job) => j.ticket === '101' && j.action === 'plan-check');
+    assert.ok(check);
+    fs.writeFileSync(bindPath, JSON.stringify({ nativeId: `host-${check.id}`, model: check.model }));
+    x.observe(`host-${check.id}`, check.id, check.model);
+    assert.equal(x.call('bind', x.statePath, check.id, bindPath).status, 0);
+    assert.equal(x.call('stage', x.statePath, check.id, JSON.stringify({ complete: true, status: 'changes',
+      head: x.base, base: x.base, evidencePath: x.evidencePath,
+      data: { reason: 'still no passing plan' } })).status, 0);
+    saved = x.readState();
+    assert.equal(saved.tickets[0].phase, 'blocked');
+    assert.equal(saved.tickets[0].failureBudget?.totalRetries, 3);
+    const metrics = x.call('metrics', x.statePath); assert.equal(metrics.status, 0, metrics.stderr);
+    const reported = JSON.parse(metrics.stdout).tickets.find((t: {issue:number}) => t.issue === 101);
+    assert.deepEqual(reported.failureBudget.byCategory, { host: 2, semantic: 1 });
+    next = JSON.parse(x.call('next', x.statePath).stdout);
+    assert.equal(next.jobs.filter((j: engine.Job) => j.ticket === '101').length, 0);
+  } finally { fs.rmSync(x.root, { recursive: true, force: true }); }
+});
+
+test('a rejected correctable receipt cannot retry the same invariant action after its writer is stopped', () => {
+  const x = fixture('implement');
+  try {
+    const resultPath = path.join(x.run, 'bad-candidate.json');
+    fs.writeFileSync(resultPath, JSON.stringify({ model: x.job.model, ...receipt(x, '0'.repeat(40), x.base) }));
+    const rejected = x.call('submit', x.statePath, x.job.id, resultPath);
+    assert.notEqual(rejected.status, 0); assert.match(rejected.stderr, /本地候选 SHA/);
+    assert.notEqual(x.call('submit', x.statePath, x.job.id, resultPath).status, 0);
+    assert.equal(x.readState().tickets[0].failureBudget?.totalRetries, 1);
+    assert.equal(x.readState().tickets[0].phase, 'implement', 'a corrected result may still use this lease');
+    stop(x);
+    const saved = x.readState();
+    assert.equal(saved.tickets[0].failureBudget?.totalRetries, 1, 'stopping the rejected attempt does not double count it');
+    assert.equal(saved.tickets[0].phase, 'replan');
+    const next = JSON.parse(x.call('next', x.statePath).stdout);
+    assert.equal(next.jobs.filter((j: engine.Job) => j.ticket === '101' && j.action === 'implement').length, 0);
+    assert.equal(next.jobs.filter((j: engine.Job) => j.ticket === '101' && j.action === 'replan').length, 1);
+  } finally { fs.rmSync(x.root, { recursive: true, force: true }); }
+});
+
+test('a real failing verification command records a test failure without consuming a model retry for pending CI', () => {
+  const x = fixture('implement');
+  try {
+    const state = x.readState(); state.jobs = []; state.tickets[0].phase = 'verify'; state.tickets[0].checksPath = x.checksPath;
+    state.validationOwner = '101'; fs.writeFileSync(x.statePath, JSON.stringify(state));
+    fs.writeFileSync(x.checksPath, JSON.stringify({ scopeReason: 'actual command failure',
+      commands: [{ name: 'fail', argv: [process.execPath, '-e', 'process.exit(7)'], timeoutSeconds: 5 }] }));
+    // The fixture starts after an L1 approval; keep that seeded approval tied to this manifest.
+    state.v3!.decisionRecords.find(d => d.kind === 'plan-check')!.artifactDigest = artifactDigest([x.planPath, x.checksPath]);
+    fs.writeFileSync(x.statePath, JSON.stringify(state));
+    const next = JSON.parse(x.call('next', x.statePath).stdout);
+    const verify = next.jobs.find((j: engine.Job) => j.action === 'verify'); assert.ok(verify);
+    const executed = x.call('execute', x.statePath, verify.id); assert.equal(executed.status, 0, executed.stderr);
+    const saved = x.readState();
+    assert.equal(saved.tickets[0].phase, 'implement');
+    assert.equal(saved.tickets[0].failures?.[0].category, 'test');
+    assert.equal(saved.tickets[0].failureBudget?.totalRetries, 1);
   } finally { fs.rmSync(x.root, { recursive: true, force: true }); }
 });
 
@@ -326,5 +423,84 @@ test('unreported local commit is classified as unknown candidate and anchored be
     const resumed = recover(x, m, x.base);
     assert.equal(resumed.status, 0, resumed.stderr);
     assert.equal(x.readState().tickets[0].phase, 'replan');
+  } finally { fs.rmSync(x.root, { recursive: true, force: true }); }
+});
+
+test('failure events are idempotent, unknown writers retain the queue, and a stopped writer yields to an independent ticket', () => {
+  const x = fixture('implement');
+  try {
+    const secondWorktree = path.join(x.root, '.agents', 'worktrees', 'second');
+    git(x.root, 'worktree', 'add', '-b', 'second', secondWorktree, x.base);
+    const state = x.readState();
+    const second = engine.buildTicket({ number: 102, kind: 'software', dependencies: [], criteria: ['done'], visual: false }, x.base);
+    second.phase = 'queued'; second.head = x.base; second.branch = 'second'; second.worktree = secondWorktree;
+    state.tickets.push(second); state.facts.issueStates['102'] = 'OPEN'; state.validationOwner = '101';
+    fs.writeFileSync(x.statePath, JSON.stringify(state));
+    fs.writeFileSync(path.join(x.worktree, 'source.txt'), 'unfinished but preserved\n');
+    const first = x.call('stage', x.statePath, x.job.id, JSON.stringify(receipt(x, x.base, x.base)));
+    assert.notEqual(first.status, 0); assert.match(first.stderr, /未提交变化/);
+    let saved = x.readState();
+    assert.equal(saved.tickets[0].phase, 'recovery');
+    assert.deepEqual(saved.tickets[0].failures?.map(f => f.category), ['receipt_validation']);
+    assert.equal(saved.tickets[0].failureBudget?.totalRetries, 1);
+    const repeated = x.call('collect', x.statePath); assert.equal(repeated.status, 0, repeated.stderr);
+    assert.equal(x.readState().tickets[0].failureBudget?.totalRetries, 1);
+    let next = JSON.parse(x.call('next', x.statePath).stdout);
+    assert.equal(x.readState().validationOwner, '101');
+    assert.equal(next.jobs.filter((j: engine.Job) => j.ticket === '102').length, 0);
+    const unknown = path.join(x.run, 'unknown-tree.json');
+    fs.writeFileSync(unknown, JSON.stringify([{ jobId: x.job.id, nativeId: `host-${x.job.id}`,
+      state: 'lost', evidencePath: x.evidencePath }]));
+    assert.match(x.call('reconcile', x.statePath, unknown).stderr, /整个进程树/);
+    assert.equal(x.readState().validationOwner, '101');
+    stop(x);
+    saved = x.readState();
+    assert.equal(saved.tickets[0].phase, 'recovery');
+    assert.equal(saved.tickets[0].failureBudget?.totalRetries, 1, 'stopping an already failed attempt does not count twice');
+    assert.deepEqual(saved.tickets[0].failures?.map(f => f.category), ['receipt_validation']);
+    next = JSON.parse(x.call('next', x.statePath).stdout);
+    assert.equal(x.readState().validationOwner, '102');
+    assert.equal(next.jobs.filter((j: engine.Job) => j.ticket === '102' && j.action.startsWith('self-')).length, 2);
+    assert.equal(next.jobs.filter((j: engine.Job) => j.ticket === '101').length, 0);
+    git(x.worktree, 'add', 'source.txt'); git(x.worktree, 'commit', '-m', 'preserve recovered candidate');
+    const recoveredHead = git(x.worktree, 'rev-parse', 'HEAD');
+    const restored = recover(x, recoveredHead, x.base); assert.equal(restored.status, 0, restored.stderr);
+    next = JSON.parse(x.call('next', x.statePath).stdout);
+    const replan = next.jobs.find((j: engine.Job) => j.ticket === '101' && j.action === 'replan');
+    assert.ok(replan); assert.equal(replan.head, recoveredHead);
+    assert.equal(x.readState().tickets[0].failureBudget?.replans, 1);
+    const bindPath = path.join(x.run, 'failed-replan-binding.json');
+    fs.writeFileSync(bindPath, JSON.stringify({ nativeId: `host-${replan.id}`, model: replan.model }));
+    x.observe(`host-${replan.id}`, replan.id, replan.model);
+    assert.equal(x.call('bind', x.statePath, replan.id, bindPath).status, 0);
+    const modelFailure = x.call('stage', x.statePath, replan.id, JSON.stringify({ complete: false, status: 'model_error',
+      evidencePath: x.evidencePath }));
+    assert.equal(modelFailure.status, 0, modelFailure.stderr);
+    saved = x.readState();
+    assert.equal(saved.tickets[0].phase, 'blocked');
+    assert.equal(saved.tickets[0].failureBudget?.totalRetries, 2);
+    assert.deepEqual(saved.tickets[0].failures?.map(f => f.category), ['receipt_validation', 'model']);
+    assert.equal(x.call('collect', x.statePath).status, 0);
+    assert.equal(x.readState().tickets[0].failureBudget?.totalRetries, 2);
+    next = JSON.parse(x.call('next', x.statePath).stdout);
+    assert.equal(next.jobs.filter((j: engine.Job) => j.ticket === '101').length, 0);
+    const resolution = path.join(x.run, 'resolve-budget.json');
+    const resolveNativeId = 'native-l1-resolve-budget';
+    const resolveVersions = { decisionNativeId: resolveNativeId, inputVersion: engine.inputVersion(saved),
+      candidateVersion: engine.candidateVersion(saved, saved.tickets[0]) };
+    x.observe(resolveNativeId, `$resolve:101:${saved.tickets[0].epoch}`, saved.inputs.models.L1);
+    fs.writeFileSync(resolution, JSON.stringify([{ ticket: '101', evidencePath: x.evidencePath,
+      handoffPath: x.handoffPath, ...resolveVersions }]));
+    assert.match(x.call('resolve', x.statePath, resolution).stderr, /失败预算解除阻塞/);
+    saved = x.readState();
+    fs.writeFileSync(resolution, JSON.stringify([{ ticket: '101', evidencePath: x.evidencePath, handoffPath: x.handoffPath,
+      ...resolveVersions, failureEventId: saved.tickets[0].failures!.at(-1)!.id,
+      newFacts: 'committed recovery head and new model evidence' }]));
+    saved.status = 'paused'; fs.writeFileSync(x.statePath, JSON.stringify(saved));
+    assert.equal(x.call('resolve', x.statePath, resolution).status, 0);
+    assert.equal(x.readState().status, 'paused');
+    assert.equal(JSON.parse(x.call('next', x.statePath).stdout).status, 'paused');
+    saved = x.readState(); saved.status = 'retired'; fs.writeFileSync(x.statePath, JSON.stringify(saved));
+    assert.notEqual(x.call('resolve', x.statePath, resolution).status, 0);
   } finally { fs.rmSync(x.root, { recursive: true, force: true }); }
 });

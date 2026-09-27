@@ -65,8 +65,31 @@ else { console.error('unexpected gh '+a.join(' ')); process.exit(2); }
   const observer = path.join(bin, 'native-observer');
   fs.writeFileSync(observer, `#!/usr/bin/env node\nconst fs=require('fs');const all=JSON.parse(fs.readFileSync(${JSON.stringify(sessions)},'utf8'));const [op,id,job]=process.argv.slice(2);const found=all[id];if(op!=='observe'||!found||found.jobId!==job)process.exit(2);console.log(JSON.stringify(found));\n`);
   fs.chmodSync(observer, 0o755);
-  const env = { ...process.env, HOME: temp, PATH: bin + path.delimiter + process.env.PATH, SPEC_DELIVERY_HOST_OBSERVER: observer };
-  const call = (...args: string[]) => spawnSync(process.execPath, [entry, ...args], { cwd: root, env, encoding: 'utf8' });
+  const migrationObserver=path.join(bin,'migration-observer');
+  fs.writeFileSync(migrationObserver,`#!/usr/bin/env node
+const fs=require('fs');const request=JSON.parse(fs.readFileSync(0,'utf8'));
+if(process.argv[2]!=='quiescence'||request.jobs.length||request.dispatches.length)process.exit(2);
+console.log(JSON.stringify({source:'native_host',schemaVersion:1,challenge:request.challenge,runId:request.runId,
+  inventorySha256:request.inventorySha256,ledgerSha256:request.ledgerSha256,observedAt:new Date().toISOString(),
+  actors:[],dispatches:[],instances:[],processes:[],
+  processTree:{state:'stopped',unknownChildren:0,observationId:'empty-run-process-query'},
+  externalActions:{state:'settled',unknown:0,observationId:'empty-run-action-query'}}));
+`);fs.chmodSync(migrationObserver,0o755);
+  const env = { ...process.env, HOME: temp, PATH: bin + path.delimiter + process.env.PATH,
+    SPEC_DELIVERY_HOST_OBSERVER: observer,SPEC_DELIVERY_MIGRATION_OBSERVER:migrationObserver };
+  const directCall = (...args: string[]) => spawnSync(process.execPath, [entry, ...args], { cwd: root, env, encoding: 'utf8' });
+  const call = (...args: string[]) => {
+    // These existing manual actor fixtures exercise historical completion semantics.
+    // New unified leases are tested separately through directCall and managed dispatch.
+    if(args[0]==='bind'&&fs.existsSync(args[1])) {
+      const state=JSON.parse(fs.readFileSync(args[1],'utf8')) as core.State;
+      const job=state.jobs.find(j=>j.id===args[2]);
+      if(job&&!state.v3?.dispatchRecords.find(d=>d.jobId===job.id)?.managed) {
+        job.legacyManualLease=true;fs.writeFileSync(args[1],JSON.stringify(state));
+      }
+    }
+    return directCall(...args);
+  };
   const inputPath = path.join(temp, 'input.json'); fs.writeFileSync(inputPath, JSON.stringify(inputs));
   const planEvidence = path.join(temp, 'plan-evidence.md'); fs.writeFileSync(planEvidence, 'L1 plan evidence\n');
   const planPath = path.join(temp, 'plan.json');
@@ -76,7 +99,7 @@ else { console.error('unexpected gh '+a.join(' ')); process.exit(2); }
     tickets: [{ number: 101, kind: 'software', dependencies: [], criteria: ['delivered'], visual: false }],
     specCriteria: ['delivered'], evidencePath: planEvidence,
   }));
-  return { temp, root, head, call, inputPath, planPath, planEvidence, ghLog, issueSource, observe, sessions, env };
+  return { temp, root, head, call, directCall, inputPath, planPath, planEvidence, ghLog, issueSource, observe, sessions, env };
 }
 function planned(x: ReturnType<typeof fixture>) {
   const started = x.call('init', x.inputPath); assert.equal(started.status, 0, started.stderr);
@@ -91,6 +114,35 @@ function planned(x: ReturnType<typeof fixture>) {
   assert.ok(planning);
   return { statePath, planning };
 }
+test('统一新租约拒绝手动 bind/stage/submit 绕过持久派发与宿主终态',()=>{
+  const x=fixture();try {
+    const {statePath,planning}=planned(x),nativeId='manual-unrelated-actor';
+    x.observe(nativeId,planning.id,'large');
+    const binding=path.join(x.temp,'manual-binding.json');
+    fs.writeFileSync(binding,JSON.stringify({nativeId}));
+    const rejectedBind=x.directCall('bind',statePath,planning.id,binding);
+    assert.notEqual(rejectedBind.status,0);assert.match(rejectedBind.stderr,/持久 token/);
+    const state=JSON.parse(fs.readFileSync(statePath,'utf8')) as core.State;
+    const job=state.jobs.find(j=>j.id===planning.id)!;
+    const original=JSON.parse(fs.readFileSync(x.sessions,'utf8'))[nativeId];
+    const raw=JSON.stringify(original),evidencePath=path.join(x.temp,'manual-observation.json');
+    fs.writeFileSync(evidencePath,raw+'\n');
+    job.nativeId=nativeId;job.status='running';job.session={...original,evidencePath,evidenceDigest:sha(raw)};
+    const dispatch=state.v3!.dispatchRecords.find(d=>d.jobId===job.id)!;
+    dispatch.status='running';dispatch.nativeId=nativeId;
+    dispatch.instances.push({key:`native:${nativeId}`,nativeId,state:'running',
+      firstSeenAt:new Date().toISOString(),lastSeenAt:new Date().toISOString(),events:[]});
+    fs.writeFileSync(statePath,JSON.stringify(state));
+    const receipt={complete:true,status:'planned',evidencePath:x.planEvidence,
+      data:{planPath:x.planPath,checksPath:x.planPath}};
+    const staged=x.directCall('stage',statePath,job.id,JSON.stringify(receipt));
+    assert.notEqual(staged.status,0);assert.match(staged.stderr,/宿主派发和终态查询/);
+    const resultFile=path.join(x.temp,'manual-result.json');fs.writeFileSync(resultFile,JSON.stringify(receipt));
+    const submitted=x.directCall('submit',statePath,job.id,resultFile);
+    assert.notEqual(submitted.status,0);assert.match(submitted.stderr,/宿主派发和终态查询/);
+    assert.notEqual(JSON.parse(fs.readFileSync(statePath,'utf8')).jobs.find((j:core.Job)=>j.id===job.id).status,'done');
+  }finally{fs.rmSync(x.temp,{recursive:true,force:true});}
+});
 function controlledHost(x: ReturnType<typeof fixture>) {
   const store = path.join(x.temp, 'host.json');
   fs.writeFileSync(store, JSON.stringify({ mode: 'normal', attempts: 0, starts: 0, actors: {} }));
@@ -240,7 +292,7 @@ test('v3 公开 CLI 从五项输入初始化、规划、认领并登记一次 ag
     const initial = JSON.parse(fs.readFileSync(statePath, 'utf8'));
     assert.equal(initial.protocol, 3);
     assert.equal(initial.mainSession.source, 'unknown');
-    assert.equal(initial.v3.executionPath, 'legacy-v02');
+    assert.equal(initial.v3.executionPath, 'unified-v03');
     assert.deepEqual(initial.v3.decisionRecords, []);
     assert.deepEqual(initial.v3.skillInvocations, []);
     assert.deepEqual(initial.v3.dispatchRecords, []);
@@ -545,7 +597,11 @@ test('旧协议保持只读，暂停迁移有原账本备份且不会自动恢�
     const denied = x.call('next', statePath); assert.notEqual(denied.status, 0);
     assert.match(denied.stderr, /upgrade.*协议 3/);
     const proof = path.join(x.temp, 'migration.json');
-    fs.writeFileSync(proof, JSON.stringify({ evidencePath: x.planEvidence }));
+    const inventory=JSON.parse(x.call('migration-context',statePath).stdout);
+    fs.writeFileSync(proof, JSON.stringify({schemaVersion:1,expectedRevision:inventory.revision,
+      inventorySha256:inventory.inventorySha256,ledgerSha256:inventory.ledgerSha256,evidencePath:x.planEvidence,
+      observedAt:new Date().toISOString(),statusIntent:'preserve',
+      processTreeStopped:true,externalActionsSettled:true}));
     const migrated = x.call('upgrade', statePath, proof); assert.equal(migrated.status, 0, migrated.stderr);
     const result = JSON.parse(migrated.stdout);
     assert.equal(fs.readFileSync(result.backupPath, 'utf8'), oldBytes);
@@ -638,14 +694,14 @@ test('启动响应丢失、绑定前后和结果落盘后恢复；重复 collect
   } finally { fs.rmSync(x.temp, { recursive: true, force: true }); }
 });
 
-test('托管 actor 的预存 ready 文件须等待宿主确认终态才可收取', () => {
+test('托管 actor 的提前 stage 被拒，宿主确认终态后才可收取', () => {
   const x = fixture();
   try {
     const {statePath,planning}=planned(x),host=controlledHost(x);
     const checks=path.join(x.temp,'early-checks.md');fs.writeFileSync(checks,'checked\n');
     const result={complete:true,status:'planned',evidencePath:x.planEvidence,data:{planPath:x.planPath,checksPath:checks}};
-    const staged=x.call('stage',statePath,planning.id,JSON.stringify(result));assert.equal(staged.status,0,staged.stderr);
-    assert.deepEqual(JSON.parse(staged.stdout).submitted,[]);
+    const staged=x.directCall('stage',statePath,planning.id,JSON.stringify(result));
+    assert.notEqual(staged.status,0);assert.match(staged.stderr,/宿主派发和终态查询/);
     const started=x.call('dispatch',statePath,planning.id);assert.equal(started.status,0,started.stderr);
     assert.equal(JSON.parse(started.stdout).status,'running');
     const pending=x.call('collect',statePath,planning.id);assert.equal(pending.status,0,pending.stderr);
@@ -1308,6 +1364,20 @@ test('diagnosing-bugs 路径在完成候选后补调一个 authorReview，跳过
     const skipped=h.call('skill-finish',statePath,review.invocationId,h.file('skipped-review.json',
       {status:'skipped',blocking:false}));
     assert.equal(skipped.status,'skipped');
+    // Keep this test on the semantic author-review gate after a separately covered
+    // managed-host terminal path; the controlled fixture supplies that terminal event.
+    const terminal=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const terminalJob=terminal.jobs.find((j:{id:string})=>j.id===reviewer.id);
+    const terminalDispatch=terminal.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===reviewer.id);
+    const terminalEvent=path.join(x.temp,'diagnosis-review-terminal.json');
+    fs.writeFileSync(terminalEvent,JSON.stringify({token:terminalDispatch.token,jobId:reviewer.id,
+      nativeId:terminalJob.nativeId,state:'completed'}));
+    const ref={kind:'query',evidencePath:terminalEvent,digest:sha(fs.readFileSync(terminalEvent)),
+      at:new Date().toISOString()};
+    terminalDispatch.status='completed';terminalDispatch.events.push(ref);
+    const instance=terminalDispatch.instances.find((i:{nativeId:string})=>i.nativeId===terminalJob.nativeId);
+    instance.state='completed';instance.events.push(ref);
+    fs.writeFileSync(statePath,JSON.stringify(terminal));
     const rejected=x.call('submit',statePath,reviewer.id,h.file('skipped-outer-result.json',
       {model:'small',complete:true,status:'reviewed',head,base:x.head,
         evidencePath:x.planEvidence,data:{skillInvocationIds:[review.invocationId]}}));
@@ -1612,7 +1682,7 @@ test('离线 metrics 保留两种 provider 原文和未知费用，重复观测�
   } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
 });
 
-test('纠错前后的两个原生实例与取消用量都出现在同一离线对账中', () => {
+test('纠错前后的两个原生实例和补录用量同账；补录不能伪造取消终态', () => {
   const x=fixture();
   try {
     const {statePath,planning}=planned(x),host=controlledHost(x);
@@ -1630,13 +1700,18 @@ test('纠错前后的两个原生实例与取消用量都出现在同一离线�
     fs.writeFileSync(usageFile,JSON.stringify([{jobId:planning.id,nativeId:oldNative,
       dispatchToken:dispatch.token,evidencePath:oldEvent,state:'cancelled',
       usage:{prompt_tokens:75,completion_tokens:20,total_tokens:95,prompt_cache_hit_tokens:30}}]));
+    const forged=x.call('record-host',statePath,usageFile);assert.notEqual(forged.status,0);
+    assert.match(forged.stderr,/补录用量不能改写终态/);
+    fs.writeFileSync(usageFile,JSON.stringify([{jobId:planning.id,nativeId:oldNative,
+      dispatchToken:dispatch.token,evidencePath:oldEvent,
+      usage:{prompt_tokens:75,completion_tokens:20,total_tokens:95,prompt_cache_hit_tokens:30}}]));
     assert.equal(x.call('record-host',statePath,usageFile).status,0);
     const metrics=x.call('metrics',statePath);assert.equal(metrics.status,0,metrics.stderr);
     const m=JSON.parse(metrics.stdout).reconciliation;
     assert.equal(m.scope.observedNativeInstanceCount,2);
     const old=m.instances.find((i:{nativeId:string})=>i.nativeId===oldNative);
     const current=m.instances.find((i:{nativeId:string})=>i.nativeId==='corrected-actor');
-    assert.equal(old.status,'cancelled');assert.deepEqual(old.boundJobIds,[]);
+    assert.notEqual(old.status,'cancelled');assert.deepEqual(old.boundJobIds,[]);
     assert.ok(old.unexplainedReasons.includes('no_final_job_binding'));
     assert.equal(old.selectedUsage[0].normalized.cachedReadTokens.value,30);
     assert.deepEqual(current.boundJobIds,[planning.id]);

@@ -85,7 +85,7 @@ TypeScript 宿主也可使用 `spec-delivery/skills.ts` 的 `invokeBoundSkill`�
 
 每个 actor 将原始 Result JSON 写入该 packet 的输出目录，生成脚本在该 actor 的 `ask` 完成后立即 `report` 文件名和 token。可信桥接从 `GetWorkflowRun` 取得终态与对应报告，适配器再把结果文件交给核心；核心先观测原生模型和上下文，逐项绑定与收取。脚本中的 `report` 不能代替宿主终态或证据门禁。
 
-**Codex CLI**：使用 [Codex 适配器](adapters/CODEX.md) 的 `probe`、逐模型 `probe-models` 与三个包装入口，将已验证的 `exec -m` 路由接入持久 `dispatch/collect`、原生 rollout 身份观测及技能源码执行。主会话模型可不同于 L1；缺少路由或原生身份时停止，不以 persona、请求字符串或默认模型补证。其它支持指定模型的宿主可对已返回的 job 调用真实 agent 工具，以 `bind <state> <jobId> <binding.json>` 记录 `{nativeId}`。任务真正完成后，由宿主把语义 Result 交给 `stage <state> <jobId> <result-json>`；这是 JSON 内容参数，应使用参数数组传递。旧的 `submit <state> <jobId> <result.json>` 仍可用，但需要完整 Result 身份。
+**Codex CLI**：使用 [Codex 适配器](adapters/CODEX.md) 的 `probe`、逐模型 `probe-models` 与三个包装入口，将已验证的 `exec -m` 路由接入持久 `dispatch/collect`、原生 rollout 身份观测及技能源码执行。主会话模型可不同于 L1；缺少路由或原生身份时停止，不以 persona、请求字符串或默认模型补证。其它支持指定模型的宿主也须实现持久 token 的 `query/start/collect/cancel` 契约。新 `unified-v03` 租约由可信宿主查询绑定；`bind` 只能重复核对已托管的同一原生身份。`stage`/`stage-raw`/`submit` 要求该 token 的已归档宿主终态。旧手动租约可结清原结果，不能作为新运行的派发方式。
 
 协议 3 的模型任务要求宿主设置绝对路径环境变量 `SPEC_DELIVERY_HOST_OBSERVER`，指向可信的原生会话查询适配器。CLI 以 `observe <nativeId> <jobId>` 调用它；适配器从宿主 API/原生事件返回 `{source:"native_host",observationId,jobId,nativeId,provider,model,observedAt}`。CLI 将原始响应追加归档到运行目录并验证 provider/model 与请求角色一致。`binding.json` 中自填 `model`、`source` 或证据路径没有证明力。路由 ID 可为 `provider/model`，例如配置 `deepseek-official/deepseek/deepseek-v4.1-flash` 对应观测 `provider=deepseek-official`、`model=deepseek/deepseek-v4.1-flash`。适配器的可信性和工具权限取决于宿主；无隔离能力时协议依赖宿主遵守角色边界，不宣称提示词形成强隔离。
 
@@ -177,11 +177,13 @@ fresh 首轮 packet 只传原始 spec/issue 链接及缓存原件索引、候选
 
 确定性命令先保存结果再提交状态。同一 job 的命令进程已退出且结果存在时，`execute/drive` 使用原结果恢复；不会重跑已完成验证。认领使用预期基线 SHA 创建 branch/worktree，并用稳定评论标记对账。若命令退出但没有结果，`drive` 返回 `recoveryRequired`；L1 先确认其子进程和不确定远端动作，再用 `reconcile` 对账授权命令恢复。锁等待有界；锁的恢复者自身异常退出时，L1 核对 `.lock.recovery` 的持有者后恢复，不能删仍在使用的锁。
 
-旧版运行（无 `protocol` 或协议 `2`）可以直接 `inspect/metrics/summary`，也可用 `bind/stage/collect/submit` 登记原租约已经完成的结果；新派发由版本门禁拒绝。继续派发前先对账并排空在途任务，再显式执行 `upgrade <state> <evidence.json>`，内容为 `{evidencePath}`。命令先把原账本逐字节备份到返回的 `backupPath`，再迁移到协议 `3`；保留原结果与已完成工单，未完成验证从队列重新获取证据，不混用旧版部分审查。`paused` 和 `waiting_human` 状态保持原样，退役运行不能升级或复活。查看历史运行无需迁移；未知协议会明确报错。
+旧版运行（无 `protocol` 或协议 `2`）可以直接 `inspect/metrics/summary`，也可用 `bind/stage/collect/submit` 登记原租约已经完成的结果；新派发由版本门禁拒绝。协议 `3` 的旧 `legacy-v02` marker 或不完整技能绑定也只能读取、对账和收取旧租约，不能回退到固定审查调度。新运行使用 `unified-v03`、五项固定版本的能力绑定和逐 job 持久 token；`bind-batch` 仅可结清旧协议租约。T17 的 `zcode` 为已有 token 生成逐 job 原生脚本，不创建批次旁路。
+
+迁移步骤、可信 `SPEC_DELIVERY_MIGRATION_OBSERVER` 的逐项查询契约与可复现的旧账本演示见 [MIGRATION.md](MIGRATION.md)。先用 `migration-context <state>` 离线取得当前 revision、原字节指纹与 actor/token/子任务/进程清单；逐项查询宿主并结清在途或不确定动作。`upgrade <state> <decision.json>` 在锁内要求宿主再次查询全部身份与进程，原字节备份和 SHA-256 成功后才归档观测并改账本。完成 job、原始模型会话与结果保持原样；未完成旧候选的部分作者/PR 审查证据全部失效，回到 `claim` 或 `replan`，重新取得批准计划与绑定技能结果。协议 `3` 过渡账本用同样的停稳决定调用 `migrate-skills`，并逐字节备份。`paused`、`waiting_human`、`complete` 状态保持原样；退役运行只能读取。`summary` schemaVersion `1` 与离线零副作用不变。
 
 `reconfigure <state> <models.json>` 在无在途任务时调整路由，文件为 `{models,capabilities,evidencePath,decisionNativeId,sourceVersion}`；真实 L1 重新确认资源和模型，旧工单计划与复核失效并进入重规划。主会话模型可以不同于新 L1；未取得当前主会话观测时记录为 `unknown`。`retire <state> <reason.json>` 需要 `{reason,evidencePath}`，要求已停止所有任务；保留证据和未交付资源，常规调度无法复活它。
 
-`resolve <state> <decisions.json>` 接收 L1 取得新事实后的 `[{ticket,evidencePath,handoffPath,decisionNativeId,inputVersion,candidateVersion}]`，版本由只读 `decision-context <state>` 取得。CLI 查询真实 L1 会话，只解除无在途任务的局部阻断，回到认领或重规划。用户要求继续时使用 `resume <state>`；它不自动消除工单阻断或人工条件。
+`resolve <state> <decisions.json>` 接收 L1 取得新事实后的 `[{ticket,evidencePath,handoffPath,decisionNativeId,inputVersion,candidateVersion}]`，版本由只读 `decision-context <state>` 取得。CLI 查询真实 L1 会话，只解除无在途任务的局部阻断，回到认领或重规划。`resolve` 和事实对账不会解除 `paused`/`waiting_human`。用户明确继续时使用 `resume <state> <decision.json>`，决定绑定当前 revision、原状态、输入版本、真实 L1 会话及授权依据；`waiting_human` 还需人工条件原文依据和已完成的人工工单。继续决定单独归档，不跳过工单阻断。
 
 ## 完成、指标与验证
 

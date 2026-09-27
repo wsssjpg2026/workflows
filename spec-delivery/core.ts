@@ -1,5 +1,6 @@
 /** 可移植的调度内核。语义判断由 L1/2/3 提供；转换、预算和证据版本由代码约束。 */
 import { createHash } from 'node:crypto';
+import {historicalReviewLenses,historicalBlocking,validateHistoricalConfirmation} from './legacy-review.ts';
 export type Tier = 'L1' | 'L2' | 'L3';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export interface Inputs { spec: number | string; targetBranch: string; models: Record<Tier, string> }
@@ -44,9 +45,9 @@ export interface SkillChildRequest {
   skillCapability?: SkillCapability; dependencyFingerprint?: string;
   jobIds: string[]; pending: boolean; requestedAt: string;
 }
-/** v3 持久账本；旧固定审查调度仍由后续迁移票替换。 */
+/** v3 持久账本；旧 marker 只为历史读取和显式迁移保留。 */
 export interface ProtocolV3 {
-  executionPath: 'legacy-v02';
+  executionPath: 'legacy-v02' | 'unified-v03';
   decisionRecords: L1DecisionRecord[];
   skillBindings?: SkillBinding[];
   skillInvocations: SkillInvocation[];
@@ -60,7 +61,7 @@ export interface ProtocolV3 {
   recoveryRecords?: RecoveryRecord[];
 }
 export function initialProtocolV3(): ProtocolV3 {
-  return { executionPath: 'legacy-v02', decisionRecords: [], skillInvocations: [], skillChildren: [], dispatchRecords: [] };
+  return { executionPath: 'unified-v03', decisionRecords: [], skillInvocations: [], skillChildren: [], dispatchRecords: [] };
 }
 export interface Policy { agents: number; issues: number; tests: number; noProgress: number; rounds: number }
 export interface Capabilities { framework: string; mainModel?: string; modelRouting: 'per_agent' | 'per_run'; models: string[] }
@@ -224,12 +225,15 @@ export interface Job {
   repairOfJobId?: string;
   repairTargetRevisionId?: string;
   dispatchToken?: string;
+  /** Only historical manual leases may retain the pre-dispatch completion path. Never set on a new unified reservation. */
+  legacyManualLease?: boolean;
   contextIntent?: ContextIntent; contextObservation?: ContextObservation; handoffRef?: HandoffReference;
   inputVersion?: string; candidateVersion?: string; session?: NativeSession; decisionArtifactDigest?: string; decisionArtifactFiles?: string[];
   timing?: { leasedAt: string; boundAt?: string; startedAt?: string; resultAt?: string; completedAt?: string; cancelledAt?: string };
   usage?: { inputTokens?: number; outputTokens?: number; cost?: number; currency?: string; modelMs?: number };
   dispute?: { previous: string; current: string };
   testExecution?: { pid: number; granted: boolean; startedAt: string; worktree?: string; evidenceDirectory?: string };
+  testProcessHistory?: {pid:number;kind:'completed'|'reconciled';evidencePath:string;evidenceSha256:string;at:string}[];
   commandRecovery?: { nativeId: string; evidencePath: string; at: string };
   stopConfirmation?: { state: 'stopped' | 'lost'; evidencePath: string; processTreeStopped: boolean; at: string };
   parentInvocationId?: string; childRequestId?: string;
@@ -252,10 +256,26 @@ export interface State {
     endedAt?: string; evidencePath: string; evidenceDigest: string;
     closedEvidencePath?: string; closedEvidenceDigest?: string; reason: string }[];
   retired?: { at: string; evidencePath: string; reason: string };
+  migrations?: { at: string; fromProtocol: number | null; toProtocol: 3;
+    expectedRevision: number; backupPath: string; backupSha256: string;
+    decisionPath: string; decisionSha256: string; quiescencePath: string; quiescenceSha256: string;
+    hostObservationPath: string; hostObservationSha256: string;
+    previousStatus: State['status']; invalidatedTickets: string[] }[];
+  continuations?: {at:string; fromStatus:State['status']; kind:'user_resume'|'human_condition_resolved'|'blocked_resume';
+    decisionPath:string; decisionSha256:string; evidencePath:string; evidenceSha256:string;
+    humanEvidencePath?:string; humanEvidenceSha256?:string; session:NativeSession}[];
   events: { revision: number; message: string; at?: string }[];
 }
-/** Protocol 2 compatibility; protocol 3 delegates review topology to its bound skill. */
-export const lenses = ['规范', '明显缺陷', 'Git 历史', '历史 PR 评论', '代码注释'];
+/** Historical protocol 2 review labels; protocol 3 delegates topology to its bound skill. */
+export const lenses = historicalReviewLenses;
+const requiredSkillCapabilities: SkillCapability[] = ['implementation','diagnosis','authorReview','prReview','handoff'];
+export function unifiedSkillsReady(s: State) {
+  const bindings=s.v3?.skillBindings;
+  return s.protocol===currentProtocol && s.v3?.executionPath==='unified-v03' &&
+    Array.isArray(bindings) && bindings.length===requiredSkillCapabilities.length &&
+    requiredSkillCapabilities.every(capability=>bindings.filter(b=>b?.capability===capability &&
+      !!b.fingerprint && !!b.sourcePath && Array.isArray(b.files) && b.files.length>0).length===1);
+}
 export function ensure(condition: unknown, message: string): asserts condition { if (!condition) throw new Error(message); }
 export function event(s: State, message: string) { s.revision++; s.events.push({ revision: s.revision, message, at: new Date().toISOString() }); }
 export function inputVersion(s: State) {
@@ -336,7 +356,7 @@ function matchingReviews(s: State, t: Ticket) {
 export function ticket(s: State, key: string) { const t = s.tickets.find(t => t.key === key); ensure(t, `未知工单 ${key}`); return t; }
 const busy = (j: Job) => j.status === 'leased' || j.status === 'running';
 const tierFor = (a: Action): Tier => ['claim', 'plan', 'plan-check', 'replan', 'adjudicate', 'spec-audit', 'spec-close', 'verify', 'cleanup'].includes(a) ? 'L1' : ['implement', 'author-review', 'self-standards', 'self-spec', 'publish'].includes(a) ? 'L3' : 'L2';
-const boundAuthorReview = (s: State) => s.protocol === currentProtocol && !!s.v3?.skillBindings;
+const boundAuthorReview = (s: State) => unifiedSkillsReady(s);
 // agent 的测试按实际执行申请，不能在整段读代码/推理时间占住测试批次。
 const hasTests = (a: Action) => a === 'verify' ? 1 : 0;
 const validationPhases: Phase[] = ['queued', 'integrate', 'self', 'verify', 'publish', 'review', 'fresh', 'accept', 'merge'];
@@ -529,7 +549,7 @@ function disputes(s: State, t: Ticket, current: Job[]) {
     const previous = s.jobs.findLast(p => p.ticket === t.key && p.epoch !== t.epoch && p.status === 'done' &&
       p.result?.complete && p.result.status === 'confirmed' && p.result.findings?.length === 1 && Number.isFinite(p.result.findings[0].confidence) &&
       ['confirm', 'adjudicate'].includes(p.action) && p.head === j.head && p.base === j.base && p.part === j.part);
-    return previous && (previous.result!.findings![0].confidence! >= 50) !== (j.result!.findings![0].confidence! >= 50)
+    return previous && historicalBlocking(previous.result!.findings![0]) !== historicalBlocking(j.result!.findings![0])
       ? [{ t, action: 'adjudicate' as Action, part: j.part, finding: j.finding, dispute: { previous: previous.id, current: j.id } }] : [];
   });
 }
@@ -591,6 +611,8 @@ function candidates(s: State): Candidate[] {
 }
 export function reserve(s: State): Job[] {
   ensure(s.status === 'running' && s.policy, '只有运行中的已规划 workflow 可以派发');
+  if(s.protocol===currentProtocol) ensure(unifiedSkillsReady(s),
+    '统一执行路径缺少完整技能绑定；先显式 migrate-skills，不能回退固定审查调度');
   if (s.protocol === currentProtocol && s.planEvidence)
     ensure(currentDecision(s, 'execution-plan', '$spec', globalDecisionVersion(s)), 'L1 执行图或资源决策缺失或已过期');
   const created: Job[] = [];
@@ -977,9 +999,9 @@ export function submit(s: State, id: string, r: Result) {
       ensure(r.findings[0].id === j.part, '复核必须保留原问题身份');
       r.findings[0].identity = j.finding?.identity;
       r.findings[0].sources = j.finding?.sources;
-      ensure(Number.isFinite(r.findings[0].confidence) && r.findings[0].confidence! >= 0 && r.findings[0].confidence! <= 100, '缺少 0–100 置信评分');
+      validateHistoricalConfirmation(r.findings[0]);
       if (j.action === 'adjudicate') ensure(r.findings[0].assessment?.rationale, '裁决必须解释同候选判定分歧，不能用重复抽样代替证据');
-      ensure(r.findings[0].confidence! < 50 || r.findings[0].confirmed === true, '>=50 的问题必须被独立证据确认'); break;
+      break;
     case 'review-report': {
       ensure(t && data.commentUrl, '审查必须留下完成评论');
       if (s.protocol === currentProtocol) {
@@ -1023,7 +1045,7 @@ export function submit(s: State, id: string, r: Result) {
       }
       const cs = jobsAt(s, t, 'confirm').flatMap(x =>
         (jobsAt(s, t, 'adjudicate').find(d => d.part === x.part)?.result || x.result)?.findings || []);
-      const blockers = cs.filter(f => f.confidence! >= 50);
+      const blockers = cs.filter(historicalBlocking);
       if (blockers.length) problem(s, t, blockers.map(f => f.description).sort().join('|'), 'implement', 'semantic', j.id);
       else if (t.phase === 'review') { t.evidence.regular = evidence(); t.phase = 'fresh'; t.epoch++; }
       else { ensure(t.phase === 'fresh', '非审查阶段'); t.evidence.fresh = evidence(); t.phase = 'accept'; }
@@ -1184,7 +1206,7 @@ export function reconcileFacts(s: State, facts: LiveFacts) {
   }
   if (s.specAudit?.status === 'complete' && facts.issueStates[String(s.spec)] === 'CLOSED') {
     for (const t of s.tickets) if (t.closeout && t.worktree && !t.cleaned && t.phase === 'done') {
-      t.phase = 'cleanup'; if (s.status !== 'paused') s.status = 'running';
+      t.phase = 'cleanup'; if (!['paused','waiting_human','retired'].includes(s.status)) s.status = 'running';
     }
   }
   if (s.status === 'running' && !s.jobs.some(busy) && s.specAudit?.status === 'complete' && facts.issueStates[String(s.spec)] === 'CLOSED' && s.tickets.every(t => t.phase === 'done')) s.status = 'complete';

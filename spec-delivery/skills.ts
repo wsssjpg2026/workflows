@@ -491,6 +491,7 @@ export async function invokeBoundSkill(s: State, job: Job, capability: SkillCapa
 
 export function migrateSkillBindings(s: State, replacements: Partial<Record<SkillCapability, string>>, evidencePath: string) {
   ensure(s.protocol === currentProtocol && s.v3, '只有协议 3 运行能迁移技能绑定');
+  const legacyConvergence=s.v3.executionPath==='legacy-v02';
   ensure(Object.keys(replacements).every(key => capabilities.includes(key as SkillCapability)), '技能迁移包含未知能力名称');
   ensure(fs.statSync(evidencePath).isFile() && fs.readFileSync(evidencePath, 'utf8').trim(), '技能迁移需要非空依据');
   ensure(!s.jobs.some(j => j.status === 'leased' || j.status === 'running'), '技能迁移前先停止或收取全部在途任务');
@@ -504,8 +505,9 @@ export function migrateSkillBindings(s: State, replacements: Partial<Record<Skil
     if (resolved.fingerprint !== prior?.fingerprint) changed.push(capability);
     return resolved;
   });
-  ensure(changed.length > 0, '技能来源和依赖未变化，无需迁移');
+  ensure(changed.length > 0 || legacyConvergence, '技能来源和依赖未变化，无需迁移');
   s.v3.skillBindings = next;
+  s.v3.executionPath='unified-v03';
   s.v3.skillMigrations ??= [];
   s.v3.skillMigrations.push({ at: new Date().toISOString(), evidencePath: path.resolve(evidencePath),
     changes: changed.map(capability => ({ capability,
@@ -513,6 +515,14 @@ export function migrateSkillBindings(s: State, replacements: Partial<Record<Skil
       nextFingerprint: next.find(b => b.capability === capability)!.fingerprint })) });
   for (const t of s.tickets) {
     if (['done', 'human', 'close', 'cleanup', 'recovery'].includes(t.phase)) continue;
+    if (legacyConvergence) {
+      if (!['claim','plan','plan_check'].includes(t.phase)) {
+        t.phase=t.worktree?'replan':'claim';t.epoch++;t.evidence={};t.authorReview=undefined;
+        t.reviewDisagreementId=undefined;
+        t.reason='过渡协议的部分审查无效；重新批准计划并执行统一技能';
+      }
+      continue;
+    }
     if (changed.includes('implementation') || changed.includes('diagnosis') || changed.includes('handoff')) {
       if (!t.worktree || ['claim', 'plan', 'plan_check'].includes(t.phase)) continue;
       t.phase = 'replan'; t.epoch++; t.evidence = {}; t.authorReview=undefined;

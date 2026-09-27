@@ -468,9 +468,9 @@ function supportedLedger(s: engine.State) {
   engine.ensure(s.protocol === undefined || s.protocol === 2 || s.protocol === engine.currentProtocol,
     `不支持的运行协议：${String(s.protocol)}`);
   if (s.protocol === engine.currentProtocol) {
-    engine.ensure(s.v3?.executionPath === 'legacy-v02' && Array.isArray(s.v3.decisionRecords) &&
+    engine.ensure(['legacy-v02','unified-v03'].includes(s.v3?.executionPath || '') && Array.isArray(s.v3?.decisionRecords) &&
       Array.isArray(s.v3.skillInvocations) && Array.isArray(s.v3.dispatchRecords),
-      '运行协议 3 缺少过渡执行路径或记录边界');
+      '运行协议 3 缺少执行路径或记录边界');
   }
 }
 function allowCompletion(s: engine.State) {
@@ -482,6 +482,190 @@ function requireProtocol(s: engine.State) {
   engine.ensure(s.status !== 'retired', '运行已退役；只允许 inspect/metrics/summary，保留账本和资源');
   engine.ensure(s.protocol === engine.currentProtocol,
     '旧版运行须先核对并停止在途任务，再执行 upgrade 迁移到协议 3；inspect/metrics/summary 可直接读取');
+}
+function requireUnified(s: engine.State) {
+  requireProtocol(s);
+  engine.ensure(engine.unifiedSkillsReady(s),
+    '统一执行路径缺少完整技能绑定；先 inspect 并显式 migrate-skills，不能回退固定审查调度');
+}
+function unifiedDispatchRequired(s:engine.State,j:engine.Job) {
+  return s.protocol===engine.currentProtocol&&s.v3?.executionPath==='unified-v03'&&
+    j.executor==='agent'&&!j.legacyManualLease;
+}
+function verifiedDispatchCompletion(s:engine.State,j:engine.Job) {
+  const d=s.v3?.dispatchRecords.find(x=>x.jobId===j.id);
+  engine.ensure(d?.managed&&!!j.dispatchToken&&d.token===j.dispatchToken&&
+    d.status==='completed'&&d.nativeId===j.nativeId&&
+    d.events.some(e=>['query','collect','start'].includes(e.kind)&&fs.existsSync(e.evidencePath)&&
+      sha(fs.readFileSync(e.evidencePath))===e.digest)&&
+    d.instances.some(i=>i.nativeId===j.nativeId&&i.state==='completed'&&
+      i.events.some(e=>fs.existsSync(e.evidencePath)&&sha(fs.readFileSync(e.evidencePath))===e.digest)),
+    '统一运行的任务须经持久 token 的可信宿主派发和终态查询，不能手动提交结果');
+  return d;
+}
+function migrationInventory(s: engine.State) {
+  return {revision:s.revision,status:s.status,
+    jobs:s.jobs.map(j=>({id:j.id,status:j.status,nativeId:j.nativeId,
+      testPid:j.testExecution?.pid||null,testProcessHistory:j.testProcessHistory||[],
+      stopConfirmed:!!j.stopConfirmation?.processTreeStopped})),
+    dispatches:(s.v3?.dispatchRecords||[]).map(d=>({token:d.token,jobId:d.jobId,status:d.status,
+      operationPid:d.operationPid||null,instances:d.instances.map(i=>({key:i.key,nativeId:i.nativeId,state:i.state}))})),
+    detached:(s.v3?.detachedInstances||[]).map(i=>({key:i.key,nativeId:i.nativeId,state:i.state})),
+    children:(s.v3?.skillChildren||[]).map(c=>({id:c.id,pending:c.pending,jobIds:c.jobIds})),
+    openWaits:(s.waitIntervals||[]).filter(w=>!w.endedAt).map(w=>({id:w.id,kind:w.kind}))};
+}
+function migrationContext(s: engine.State,statePath:string) {
+  const inventory=migrationInventory(s);
+  return {...inventory,inventorySha256:sha(JSON.stringify(inventory)),
+    ledgerSha256:sha(fs.readFileSync(statePath))};
+}
+interface MigrationDecision {
+  schemaVersion: 1; expectedRevision: number; inventorySha256: string; ledgerSha256:string;
+  evidencePath: string; observedAt: string; statusIntent: 'preserve';
+  processTreeStopped: true; externalActionsSettled: true;
+}
+interface MigrationHostObservation {
+  source:'native_host'; schemaVersion:1; challenge:string; runId:string; inventorySha256:string;
+  ledgerSha256:string; observedAt:string;
+  actors:{jobId:string;nativeId:string;state:'completed'|'cancelled'|'running'|'unknown';observationId:string}[];
+  dispatches:{token:string;jobId:string;targetHost:string;state:'not_found'|'completed'|'cancelled'|'running'|'unknown';
+    nativeId?:string;authoritative?:boolean;observationId:string}[];
+  instances:{key:string;nativeId:string;state:'completed'|'cancelled'|'running'|'unknown';observationId:string}[];
+  processes:{jobId:string;kind:'command'|'test'|'dispatch';pid:number;state:'stopped'|'running'|'unknown';
+    descendantsStopped:boolean;observationId:string}[];
+  processTree:{state:'stopped'|'running'|'unknown';unknownChildren:number;observationId:string};
+  externalActions:{state:'settled'|'pending'|'unknown';unknown:number;observationId:string};
+}
+function migrationHostQuiescence(s:engine.State,statePath:string,context:ReturnType<typeof migrationContext>) {
+  const observer=process.env.SPEC_DELIVERY_MIGRATION_OBSERVER;
+  engine.ensure(observer&&path.isAbsolute(observer)&&fs.statSync(observer).isFile(),
+    '迁移缺少可信宿主逐项查询适配器 SPEC_DELIVERY_MIGRATION_OBSERVER');
+  const challenge=randomUUID(),started=Date.now();
+  const result=spawnSync(observer,['quiescence',statePath],{cwd:path.dirname(statePath),
+    input:JSON.stringify({schemaVersion:1,challenge,runId:s.id,...context}),encoding:'utf8',
+    maxBuffer:32*1024*1024,timeout:30_000,stdio:['pipe','pipe','pipe']});
+  engine.ensure(result.status===0,`迁移宿主查询失败：${result.error?.message||result.stderr||result.status}`);
+  const output=result.stdout.trim();
+  let observed:MigrationHostObservation;
+  try {observed=JSON.parse(output);}catch{throw Error('迁移宿主查询未返回结构化 JSON');}
+  const at=Date.parse(observed?.observedAt);
+  engine.ensure(observed?.source==='native_host'&&observed.schemaVersion===1&&observed.challenge===challenge&&
+    observed.runId===s.id&&observed.inventorySha256===context.inventorySha256&&
+    observed.ledgerSha256===context.ledgerSha256&&Number.isFinite(at)&&
+    at>=started-60_000&&at<=Date.now()+60_000,
+    '迁移宿主观测不是针对当前运行、清单和账本的即时查询');
+  const proof=(value:{observationId?:string})=>typeof value?.observationId==='string'&&!!value.observationId.trim();
+  const exact=<E extends {observationId:string},A extends {observationId:string}>(
+    expected:E[],actual:A[],key:(x:E|A)=>string,valid:(x:E,y:A)=>boolean,kind:string)=>{
+    engine.ensure(Array.isArray(actual)&&actual.length===expected.length&&
+      new Set(actual.map(key)).size===actual.length&&actual.every(proof)&&
+      new Set(actual.map(x=>x.observationId)).size===actual.length,
+      `迁移宿主 ${kind} 查询缺失、重复或没有原始观测 ID`);
+    for(const item of expected) {
+      const match=actual.find(x=>key(x)===key(item));
+      engine.ensure(match&&valid(item,match),`迁移宿主 ${kind} ${key(item)} 未证明终态`);
+    }
+  };
+  const actors=s.jobs.filter(j=>j.executor==='agent'&&!!j.nativeId).map(j=>({jobId:j.id,nativeId:j.nativeId,
+    state:j.status==='done'?'completed':'cancelled',observationId:''}));
+  exact(actors,observed.actors,x=>x.jobId,(a,b)=>b.nativeId===a.nativeId&&b.state===a.state,'actor');
+  const dispatches=(s.v3?.dispatchRecords||[]).map(d=>({token:d.token,jobId:d.jobId,targetHost:d.targetHost,
+    state:d.status==='prepared'?'not_found':d.status,nativeId:d.nativeId,observationId:''}));
+  exact(dispatches,observed.dispatches,x=>x.token,(a,b)=>b.jobId===a.jobId&&b.targetHost===a.targetHost&&
+    b.state===a.state&&(a.state==='not_found'?b.authoritative===true:b.nativeId===a.nativeId), 'dispatch token');
+  const instances=[...(s.v3?.dispatchRecords||[]).flatMap(d=>d.instances),...(s.v3?.detachedInstances||[])]
+    .filter(i=>!!i.nativeId).map(i=>({key:i.key,nativeId:i.nativeId!,state:i.state,observationId:''}));
+  exact(instances,observed.instances,x=>x.key,(a,b)=>b.nativeId===a.nativeId&&b.state===a.state,
+    '原生实例');
+  const processes=s.jobs.flatMap(j=>{
+    const rows:{jobId:string;kind:'command'|'test'|'dispatch';pid:number;state:'stopped';descendantsStopped:true;observationId:string}[]=[];
+    const commandPid=Number(j.nativeId.match(/^command:(\d+):/)?.[1]);
+    if(commandPid)rows.push({jobId:j.id,kind:'command',pid:commandPid,state:'stopped',descendantsStopped:true,observationId:''});
+    if(j.testExecution?.pid)rows.push({jobId:j.id,kind:'test',pid:j.testExecution.pid,state:'stopped',descendantsStopped:true,observationId:''});
+    for(const history of j.testProcessHistory||[])rows.push({jobId:j.id,kind:'test',pid:history.pid,
+      state:'stopped',descendantsStopped:true,observationId:''});
+    return rows;
+  });
+  for(const d of s.v3?.dispatchRecords||[])if(d.operationPid)processes.push({jobId:d.jobId,kind:'dispatch',
+    pid:d.operationPid,state:'stopped',descendantsStopped:true,observationId:''});
+  exact(processes,observed.processes,x=>`${x.jobId}:${x.kind}:${x.pid}`,(a,b)=>b.state==='stopped'&&
+    b.descendantsStopped===true,'进程树 PID');
+  engine.ensure(observed.processTree?.state==='stopped'&&observed.processTree.unknownChildren===0&&
+    proof(observed.processTree),'迁移宿主未证明运行目录内全部子进程停止');
+  engine.ensure(observed.externalActions?.state==='settled'&&observed.externalActions.unknown===0&&
+    proof(observed.externalActions),'迁移宿主未证明外部动作和未知派发已结清');
+  return {raw:output+'\n',challenge};
+}
+function verifyMigrationQuiescence(s: engine.State, statePath:string, decision: MigrationDecision) {
+  const context=migrationContext(s,statePath);
+  engine.ensure(decision?.schemaVersion===1 && decision.expectedRevision===s.revision &&
+    decision.inventorySha256===context.inventorySha256 &&
+    decision.ledgerSha256===context.ledgerSha256,
+    '迁移清单或 revision 已过期；重新读取 migration-context 并查询宿主');
+  engine.ensure(decision.statusIntent==='preserve' && decision.processTreeStopped===true &&
+    decision.externalActionsSettled===true && Number.isFinite(Date.parse(decision.observedAt)) &&
+    Math.abs(Date.now()-Date.parse(decision.observedAt))<=10*60_000,
+    '迁移需要十分钟内的进程树停止、外部动作已结清与保持原状态的显式证明');
+  safeFile(decision.evidencePath);
+  engine.ensure(fs.readFileSync(decision.evidencePath,'utf8').trim(), '迁移对账依据不能为空');
+  engine.ensure(!s.jobs.some(j=>active(j)), '迁移前先收取或停止全部在途任务');
+  engine.ensure(!s.jobs.some(j=>j.testExecution), '迁移前测试进程树必须正式对账');
+  engine.ensure(s.jobs.every(j=>(j.testProcessHistory||[]).every(h=>h.pid>0&&
+    fs.existsSync(h.evidencePath)&&sha(fs.readFileSync(h.evidencePath))===h.evidenceSha256)),
+    '历史测试进程 PID 的原始终态或停止证据缺失');
+  engine.ensure(!s.jobs.some(j=>j.status==='done'&&!j.result ||
+    j.status==='cancelled'&&!!j.nativeId&&!j.stopConfirmation?.processTreeStopped),
+    '迁移前已结束任务须有原始结果，已取消 actor 须确认整个进程树停止');
+  engine.ensure(!(s.v3?.skillChildren||[]).some(c=>c.pending || c.jobIds.some(id=>
+    s.jobs.some(j=>j.id===id && active(j)))), '迁移前技能子任务必须逐项收取或停止');
+  for(const d of s.v3?.dispatchRecords||[]) {
+    engine.ensure(!d.operationPid && !['starting','running','uncertain'].includes(d.status),
+      `派发 token ${d.token} 尚有在途或不确定动作；先按 token 查询并对账`);
+    engine.ensure(d.status==='prepared' || ['completed','cancelled'].includes(d.status),
+      `派发 token ${d.token} 未取得终态`);
+    engine.ensure(d.events.every(e=>fs.existsSync(e.evidencePath) &&
+      sha(fs.readFileSync(e.evidencePath))===e.digest),'派发 token 原始宿主事件缺失或已改变');
+    if(d.status==='completed')engine.ensure(d.instances.some(i=>i.nativeId&&i.state==='completed'),
+      `派发 token ${d.token} 缺少已完成的原生实例`);
+    for(const i of d.instances) {
+      if(i.key===`token:${d.token}` && i.state==='requested' && !i.nativeId)continue;
+      engine.ensure(['completed','cancelled'].includes(i.state),
+        `派发 token ${d.token} 存在未终止的原生实例`);
+      engine.ensure(i.events.length>0 && i.events.every(e=>fs.existsSync(e.evidencePath) &&
+        sha(fs.readFileSync(e.evidencePath))===e.digest), '原生实例终态证据缺失或已改变');
+    }
+  }
+  for(const i of s.v3?.detachedInstances||[]) {
+    engine.ensure(['completed','cancelled'].includes(i.state) && i.events.length>0 &&
+      i.events.every(e=>fs.existsSync(e.evidencePath)&&sha(fs.readFileSync(e.evidencePath))===e.digest),
+      '存在未绑定、未知或缺少原始证据的宿主实例');
+  }
+  engine.ensure(!(s.waitIntervals||[]).some(w=>w.kind==='recovery'&&!w.endedAt),
+    '恢复等待区间尚未结清，不能迁移');
+  return migrationHostQuiescence(s,statePath,context);
+}
+function backupMigration(statePath:string,s:engine.State,decisionPath:string,decision:MigrationDecision,
+  host:{raw:string;challenge:string}) {
+  const bytes=fs.readFileSync(statePath),backup=path.join(path.dirname(statePath),'migrations',
+    `pre-v3-${randomUUID()}.json`);
+  fs.mkdirSync(path.dirname(backup),{recursive:true});
+  fs.copyFileSync(statePath,backup,fs.constants.COPYFILE_EXCL);
+  const digest=sha(bytes);
+  engine.ensure(sha(fs.readFileSync(backup))===digest,'迁移备份字节校验失败；原账本未改变');
+  const hostDigest=sha(host.raw),hostPath=path.join(path.dirname(statePath),'host-observations',
+    `migration-${sha(s.id+host.challenge).slice(0,20)}-${hostDigest.slice(0,20)}.json`);
+  fs.mkdirSync(path.dirname(hostPath),{recursive:true});
+  fs.writeFileSync(hostPath,host.raw,{flag:'wx',mode:0o444});
+  engine.ensure(sha(fs.readFileSync(hostPath))===hostDigest,'迁移宿主观测归档字节校验失败');
+  const record:NonNullable<engine.State['migrations']>[number]={at:new Date().toISOString(),
+    fromProtocol:s.protocol??null,toProtocol:3,expectedRevision:s.revision,
+    backupPath:backup,backupSha256:digest,decisionPath:path.resolve(decisionPath),
+    decisionSha256:sha(fs.readFileSync(decisionPath)),quiescencePath:path.resolve(decision.evidencePath),
+    quiescenceSha256:sha(fs.readFileSync(decision.evidencePath)),previousStatus:s.status,
+    hostObservationPath:hostPath,hostObservationSha256:hostDigest,
+    invalidatedTickets:[]};
+  s.migrations??=[];s.migrations.push(record);
+  return record;
 }
 function lock(file: string) {
   const dir = file + '.lock';
@@ -625,10 +809,12 @@ export function initialize(inputs: engine.Inputs, cwd = process.cwd()) {
     engine.ensure(prior.status!=='retired','该运行已明确退役，不能由 init 自动复活；保留账本和资源');
     engine.ensure(JSON.stringify(prior.inputs.models) === JSON.stringify(inputs.models), '已有运行使用其他模型；先核对/停止旧任务后再重新配置，避免重复派发');
     return { statePath: file, resumed: true, protocol: prior.protocol ?? 1,
-      migrationRequired: prior.protocol !== engine.currentProtocol,
-      next: prior.protocol === engine.currentProtocol
+      migrationRequired: prior.protocol !== engine.currentProtocol || !engine.unifiedSkillsReady(prior),
+      next: engine.unifiedSkillsReady(prior)
         ? 'inspect 后实时 reconcile；不得重新认领已有任务'
-        : '旧运行只读；继续派发前先对账、停止在途任务并显式 upgrade' };
+        : prior.protocol === engine.currentProtocol
+          ? '过渡运行只读；停稳后显式 migrate-skills 固定完整技能绑定'
+          : '旧运行只读；继续派发前先对账、停止在途任务并显式 upgrade' };
   }
   const parent = gh.issue(repo, spec), children = gh.subIssues(repo, spec);
   engine.ensure(parent.state === 'OPEN', '目标 spec 已关闭'); engine.ensure(children.length, '目标 spec 尚无可读取的既有 sub-issues');
@@ -717,7 +903,7 @@ export function packet(s: engine.State, j: engine.Job, statePath: string, source
     sourceUrl: `https://${s.repo.host}/${s.repo.slug}/issues/${t?.number || s.spec}`,
     reviewContext: t && (j.action==='author-review' || child?.skillCapability==='authorReview')
       ? { ...authorReviewSources(s,t,j.head,j.base), fixedPoint:j.base,
-          instruction:'按绑定的 code-review 技能分别委派 Standards 与 Spec 轴，保留两路原始结果；需要的 issue/spec 与规范来源由本 packet 提供。' }
+          instruction:'按当前固定的 authorReview 技能包及其依赖执行；原始 issue/spec、候选和规范来源由本 packet 提供。' }
       : null,
     objectiveEvidence: objective, prior: relevant.slice(-20), historyIndexPath: freshInitial || j.fresh && j.action !== 'review-report' ? '' : priorPath,
     sourceArchive: sourceArchive || null,
@@ -1410,7 +1596,7 @@ function dispatchRound(statePath: string, jobId: string, launch: boolean) {
   const release = lock(statePath);
   let request: engine.DispatchRecord;
   try {
-    const s = read<engine.State>(statePath); requireProtocol(s);
+    const s = read<engine.State>(statePath); if(launch)requireUnified(s);else requireProtocol(s);
     const j = s.jobs.find(x => x.id === jobId), d = s.v3!.dispatchRecords.find(x => x.jobId === jobId);
     engine.ensure(j && d && j.executor === 'agent', '任务尚未预留派发意图');
     if (j.status === 'done') return { jobId, status: 'completed', nativeId: j.nativeId };
@@ -1538,6 +1724,9 @@ export function consumeStaged(statePath: string, ids?: string[]) {
     let s = read<engine.State>(statePath); allowCompletion(s);
     const jobs = s.jobs.filter(j => active(j) && j.nativeId && j.executor === 'agent' && engine.contextReady(j) &&
       s.tickets.find(t => t.key === j.ticket)?.phase !== 'recovery' && (!ids || ids.includes(j.id)) &&
+      (!unifiedDispatchRequired(s,j) || (()=>{
+        try {verifiedDispatchCompletion(s,j);return true;}catch{return false;}
+      })()) &&
       (!s.v3?.dispatchRecords.find(d => d.jobId === j.id)?.managed ||
         s.v3.dispatchRecords.find(d => d.jobId === j.id)?.status === 'completed') &&
       fs.existsSync(resultPaths(statePath, j.id).ready) &&
@@ -1741,6 +1930,8 @@ function stageRawResult(statePath: string, id: string, bytes: Buffer, source: en
   try {
     const s = read<engine.State>(statePath), j = s.jobs.find(j => j.id === id); allowCompletion(s);
     engine.ensure(j && j.executor === 'agent' && (active(j) || j.status === 'done'), '只能接收已登记的 agent 任务结果');
+    if(unifiedDispatchRequired(s,j)&&!options.recovery&&!(source==='repair'&&options.repairJobId))
+      verifiedDispatchCompletion(s,j);
     if(engine.contextReady(j))verifyHandoffRef(j);
     if (options.recovery) {
       const target=recoveryTarget(s,options.recovery);
@@ -1855,6 +2046,9 @@ function confirmStopped(s:engine.State,statePath:string,j:engine.Job,proof:{
   }
   j.status='cancelled';
   j.stopConfirmation={state:proof.state,evidencePath:proof.evidencePath,processTreeStopped:true,at:new Date().toISOString()};
+  if(j.testExecution?.pid){j.testProcessHistory??=[];j.testProcessHistory.push({pid:j.testExecution.pid,
+    kind:'reconciled',evidencePath:proof.evidencePath,
+    evidenceSha256:sha(fs.readFileSync(proof.evidencePath)),at:new Date().toISOString()});}
   j.timing??={leasedAt:''};j.timing.cancelledAt=new Date().toISOString();delete j.testExecution;
   if(j.action==='skill-child')engine.event(s,`${j.id} 技能子任务已由宿主确认停止；父调用等待显式 skill-retry`);
   else if(s.v3?.skillInvocations.some(i=>i.jobId===j.id&&!i.result))
@@ -1956,6 +2150,8 @@ export function bindBatch(statePath: string, binding: {runId:string; model?:stri
   const release = lock(statePath);
   try {
     const s = read<engine.State>(statePath); allowCompletion(s);
+    engine.ensure(s.protocol!==engine.currentProtocol,
+      '协议 3 禁止旧批次模板绑定；使用持久 token 的逐 job 派发及回执协议');
     engine.ensure(binding.runId && binding.jobs.length && new Set(binding.jobs.map(j=>j.jobId)).size === binding.jobs.length, '需要真实 runId 与不重复的任务清单');
     for (const item of binding.jobs) {
       engine.ensure(item.actorName, '需要原生 actor 的稳定名称');
@@ -2003,7 +2199,7 @@ function runTest(statePath:string,id:string,request:{argv:string[];timeoutSecond
     j.testExecution={pid:process.pid,granted:j.tests===0,startedAt:new Date().toISOString(),worktree,evidenceDirectory:out};j.tests=1;
     engine.event(s,`${j.ticket} 获得测试配额`);save(statePath,s);
   } finally {release();}
-  let a:number|undefined,b:number|undefined;
+  let a:number|undefined,b:number|undefined,testGroupPid:number|undefined;
   try {
     if(audit) {
       try {git(audit.repo.root,'cat-file','-e',`${base}^{commit}`);}
@@ -2016,7 +2212,9 @@ function runTest(statePath:string,id:string,request:{argv:string[];timeoutSecond
     const beforeFingerprint=worktreeFingerprint(worktree,statusBefore);
     const workingTreeFingerprint=statusBefore ? beforeFingerprint : null;
     fs.mkdirSync(out,{recursive:true});a=fs.openSync(path.join(out,'stdout.log'),'w');b=fs.openSync(path.join(out,'stderr.log'),'w');
-    const r=spawnSync(request.argv[0],request.argv.slice(1),{cwd:worktree,env:{...process.env,...request.env},timeout:request.timeoutSeconds*1000,stdio:['ignore',a,b],shell:false});
+    const r=spawnSync(request.argv[0],request.argv.slice(1),{cwd:worktree,env:{...process.env,...request.env},
+      timeout:request.timeoutSeconds*1000,stdio:['ignore',a,b],shell:false,detached:true});
+    testGroupPid=r.pid;
     const statusAfter=gitRaw(worktree,'status','--porcelain=v1','--untracked-files=all');
     const afterFingerprint=worktreeFingerprint(worktree,statusAfter);
     const candidateStable=git(worktree,'rev-parse','HEAD')===head && afterFingerprint===beforeFingerprint;
@@ -2036,7 +2234,12 @@ function runTest(statePath:string,id:string,request:{argv:string[];timeoutSecond
     } catch { /* 回执/测试租约中已记录目录，不能因清理问题覆盖首次测试结果。 */ }
     release=lock(statePath);
     try {const s=read<engine.State>(statePath),j=s.jobs.find(j=>j.id===id)!;
-      if(j.testExecution?.pid===process.pid){if(j.testExecution.granted)j.tests=0;delete j.testExecution;engine.event(s,`${j.ticket} 测试进程结束`);save(statePath,s);}
+      if(j.testExecution?.pid===process.pid){
+        if(testGroupPid){j.testProcessHistory??=[];j.testProcessHistory.push({pid:testGroupPid,
+          kind:'completed',evidencePath:path.join(out,'receipt.json'),
+          evidenceSha256:fs.existsSync(path.join(out,'receipt.json'))?
+            sha(fs.readFileSync(path.join(out,'receipt.json'))):'',at:new Date().toISOString()});}
+        if(j.testExecution.granted)j.tests=0;delete j.testExecution;engine.event(s,`${j.ticket} 测试进程结束`);save(statePath,s);}
     } finally {release();}
   }
 }
@@ -2044,15 +2247,15 @@ export async function main(argv: string[]): Promise<unknown> {
   const [op, file, extra, fourth] = argv;
   if(op==='version')return {workflow:'spec-delivery',version:workflowVersion};
   if (!op || op === 'help') return { workflow: 'spec-delivery', input: ['spec', 'targetBranch', 'models.L1', 'models.L2', 'models.L3'],
-    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan-context <state>', 'decision-context <state>', 'plan <state> <plan.json>', 'observe-main <state> <native-id>', 'drive <state>', 'next <state>', 'dispatch <state> <jobId>', 'dispatch-cancel <state> <decision.json>', 'recover-result <state> <decision.json>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'context-handoff <state> <jobId> <verification.json>', 'context-reconstruct <state> <jobId> <reconstruction.json>', 'skill-start <state> <jobId> <host-capabilities.json>', 'skill-delegate <state> <invocationId> <children.json>', 'skill-continue <state> <invocationId>', 'skill-retry <state> <invocationId> <keys.json>', 'skill-resume <state> <invocationId> <resume.json>', 'skill-finish <state> <invocationId> <outcome.json>', 'migrate-skills <state> <migration.json>', 'stage <state> <jobId> <result-json>', 'stage-raw <state> <jobId> <raw-file>', 'collect <state> [jobId]', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'publish-pr <state> <jobId> <request.json>', 'merge-pr <state> <jobId> <request.json>', 'test <state> <jobId> <request.json>', 'ci-attest <state> <accept-jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'recover-workspace <state> <ticket> <decision.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'record-wait <state> <observation.json>', 'metrics <state>', 'metrics-compare <before-state> <after-state>', 'resume <state>', 'zcode <state>'] };
+    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'migration-context <state>', 'plan-context <state>', 'decision-context <state>', 'plan <state> <plan.json>', 'observe-main <state> <native-id>', 'drive <state>', 'next <state>', 'dispatch <state> <jobId>', 'dispatch-cancel <state> <decision.json>', 'recover-result <state> <decision.json>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json> (historical only)', 'context-handoff <state> <jobId> <verification.json>', 'context-reconstruct <state> <jobId> <reconstruction.json>', 'skill-start <state> <jobId> <host-capabilities.json>', 'skill-delegate <state> <invocationId> <children.json>', 'skill-continue <state> <invocationId>', 'skill-retry <state> <invocationId> <keys.json>', 'skill-resume <state> <invocationId> <resume.json>', 'skill-finish <state> <invocationId> <outcome.json>', 'migrate-skills <state> <migration.json>', 'stage <state> <jobId> <result-json>', 'stage-raw <state> <jobId> <raw-file>', 'collect <state> [jobId]', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'publish-pr <state> <jobId> <request.json>', 'merge-pr <state> <jobId> <request.json>', 'test <state> <jobId> <request.json>', 'ci-attest <state> <accept-jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'recover-workspace <state> <ticket> <decision.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'record-wait <state> <observation.json>', 'metrics <state>', 'metrics-compare <before-state> <after-state>', 'resume <state> <decision.json>', 'zcode <state>'] };
   engine.ensure(file, '缺少输入文件/状态路径');
   // summary 在 lock() 之前返回：只验证可读协议，不创建/等待/恢复/删除状态锁，也不进入写路径。
   if (op === 'summary') return summarizeLedger(path.resolve(file));
   if (op === 'init') return initialize(read<engine.Inputs>(file));
   // 历史读取不触发锁恢复、GitHub 观测或状态写入。
-  if (op === 'inspect' || op === 'metrics') {
+  if (op === 'inspect' || op === 'metrics' || op === 'migration-context') {
     const state = read<engine.State>(path.resolve(file)); supportedLedger(state);
-    return op === 'inspect' ? { ...state, rolesPath } : metrics(state);
+    return op === 'inspect' ? { ...state, rolesPath } : op === 'migration-context' ? migrationContext(state,path.resolve(file)) : metrics(state);
   }
   if (op === 'metrics-compare') {
     engine.ensure(extra,'需要前后两个状态文件');
@@ -2108,7 +2311,7 @@ export async function main(argv: string[]): Promise<unknown> {
   }
   if (op === 'bind-batch') { engine.ensure(extra, '需要宿主批次绑定文件'); return bindBatch(path.resolve(file),read(extra)); }
   if (op === 'drive') {
-    requireProtocol(read<engine.State>(path.resolve(file)));
+    requireUnified(read<engine.State>(path.resolve(file)));
     const statePath=path.resolve(file);
     const collected = await main(['collect', statePath]);
     const completed:string[] = [], dispatched: unknown[] = [];
@@ -2167,16 +2370,24 @@ export async function main(argv: string[]): Promise<unknown> {
         ciConfigured:request.reason==='no_ci'?false:undefined};
     }
     if (op === 'upgrade') {
-      engine.ensure(extra && !s.jobs.some(active), '升级前先对账并确认所有在途任务已停止或完整提交');
-      const proof=read<{evidencePath:string}>(extra);safeFile(proof.evidencePath);
-      if(s.protocol===engine.currentProtocol)return {statePath,status:s.status,upgraded:false};
-      const backup = path.join(path.dirname(statePath), 'migrations', `pre-v3-${randomUUID()}.json`);
-      fs.mkdirSync(path.dirname(backup), {recursive:true});
-      fs.copyFileSync(statePath, backup, fs.constants.COPYFILE_EXCL);
-      // 老轮次的确认 ID 与分组方法不同，不混用部分 regular/fresh 通过结果。
-      for(const t of s.tickets) if(['self','verify','publish','review','fresh','accept','merge','integrate'].includes(t.phase) || t.reason==='waiting_ci') {
-        t.phase='queued';t.epoch++;t.evidence={};t.reviewDisagreementId=undefined;
-        t.reason='旧运行已迁移；从队首重新验证候选';
+      engine.ensure(extra, '升级需显式迁移决定文件');
+      if(s.protocol===engine.currentProtocol) {
+        engine.ensure(engine.unifiedSkillsReady(s), '过渡协议 3 需停稳后显式 migrate-skills，不能直接继续派发');
+        return {statePath,status:s.status,upgraded:false};
+      }
+      const proof=read<MigrationDecision>(extra);
+      const host=verifyMigrationQuiescence(s,statePath,proof);
+      const migration=backupMigration(statePath,s,extra,proof,host);
+      // 旧计划、作者和 PR 审查方法均不能拼成新技能的完整通过。
+      for(const t of s.tickets) if(!['done','human','close','cleanup'].includes(t.phase)) {
+        const affected=['self','verify','publish','review','fresh','accept','merge','integrate','queued'].includes(t.phase) ||
+          t.reason==='waiting_ci';
+        t.evidence={};t.authorReview=undefined;t.reviewDisagreementId=undefined;
+        if(affected) {
+          t.phase=t.worktree?'replan':'claim';t.epoch++;
+          t.reason='旧协议部分候选与审查证据已失效；重新批准计划、执行绑定技能并审查';
+          migration.invalidatedTickets.push(t.key);
+        }
       }
       for(const j of s.jobs) if(j.result) {
         const output=resultPaths(statePath,j.id).result;
@@ -2185,10 +2396,11 @@ export async function main(argv: string[]): Promise<unknown> {
       if(s.status!=='complete'){s.specAudit=undefined;s.auditEpoch++;}
       s.validationOwner=undefined;s.protocol=engine.currentProtocol;s.v3=engine.initialProtocolV3();
       s.v3.skillBindings=skills.defaultSkillBindings();
-      engine.event(s,`迁移为运行协议 3；原账本备份：${backup}；保留全部原结果和已完成工单。对账依据：${proof.evidencePath}`);
-      save(statePath,s);return {statePath,status:s.status,upgraded:true,backupPath:backup};
+      engine.event(s,`迁移为统一运行协议 3；原账本备份 SHA-256 ${migration.backupSha256}：${migration.backupPath}；保留全部原结果和已完成工单。对账依据：${proof.evidencePath}`);
+      save(statePath,s);return {statePath,status:s.status,upgraded:true,backupPath:migration.backupPath,
+        backupSha256:migration.backupSha256,invalidatedTickets:migration.invalidatedTickets};
     }
-    if(!['bind','submit','reconcile','retire'].includes(op))requireProtocol(s);
+    if(!['bind','submit','reconcile','retire','record-host','record-wait','migrate-skills'].includes(op))requireUnified(s);
     if (op === 'context-handoff') {
       engine.ensure(extra&&fourth,'需要后继 jobId 与 L1 核验请求');
       const ref=forwardOriginalHandoff(s,statePath,extra,read(fourth));save(statePath,s);
@@ -2300,11 +2512,22 @@ export async function main(argv: string[]): Promise<unknown> {
     }
     if (op === 'migrate-skills') {
       engine.ensure(extra, '需要显式技能迁移文件');
-      const request=read<{expectedRevision:number;evidencePath:string;replacements:Partial<Record<engine.SkillCapability,string>>}>(extra);
+      const request=read<MigrationDecision & {replacements:Partial<Record<engine.SkillCapability,string>>}>(extra);
       engine.ensure(request.expectedRevision===s.revision, '技能迁移决定已过期；重新 inspect 当前账本');
-      const changed=skills.migrateSkillBindings(s,request.replacements || {},path.resolve(request.evidencePath));
+      const convergence=s.v3?.executionPath==='legacy-v02' || !engine.unifiedSkillsReady(s);
+      const host=convergence?verifyMigrationQuiescence(s,statePath,request):undefined;
+      const trial=structuredClone(s);
+      const changed=skills.migrateSkillBindings(trial,request.replacements || {},path.resolve(request.evidencePath));
+      if(convergence) {
+        const migration=backupMigration(statePath,s,extra,request,host!);
+        migration.invalidatedTickets=trial.tickets.filter((t,i)=>t.phase!==s.tickets[i]?.phase ||
+          t.epoch!==s.tickets[i]?.epoch).map(t=>t.key);
+        trial.migrations=s.migrations;
+      }
+      s=trial;
       save(statePath,s);
-      return {statePath,changed,revision:s.revision,status:s.status};
+      return {statePath,changed,revision:s.revision,status:s.status,
+        backupPath:convergence?s.migrations?.at(-1)?.backupPath:undefined};
     }
     if (op === 'recover-workspace') {
       engine.ensure(extra && fourth, '需要工单 key 与恢复决定文件');
@@ -2405,6 +2628,12 @@ export async function main(argv: string[]): Promise<unknown> {
       const ref = read<{ nativeId: string; model?: string }>(fourth);
       const j = s.jobs.find(j => j.id === extra); engine.ensure(j, '未知任务');
       const dispatch = s.v3?.dispatchRecords.find(d=>d.jobId===extra);
+      if(unifiedDispatchRequired(s,j))
+        engine.ensure(dispatch?.managed&&!!j.dispatchToken&&dispatch.token===j.dispatchToken&&
+          ['running','completed'].includes(dispatch.status)&&dispatch.nativeId===ref.nativeId&&
+          dispatch.instances.some(i=>i.nativeId===ref.nativeId&&
+            ['running','completed'].includes(i.state)&&i.events.length>0),
+          '统一运行的 actor 须由可信宿主按持久 token 查询并绑定，不能用手填原生身份');
       if(dispatch?.managed) engine.ensure(!dispatch.instances.some(i=>i.nativeId && i.nativeId!==ref.nativeId),
         '持久 token 的原生实例身份不符；需要先对账，不能用手填绑定覆盖');
       if (j.nativeId) engine.ensure(j.nativeId === ref.nativeId, '同一租约不能重复绑定另一任务');
@@ -2494,12 +2723,26 @@ export async function main(argv: string[]): Promise<unknown> {
           if(stamp)engine.ensure(Number.isFinite(Date.parse(stamp)),'宿主时间无效');
         if(d) {
           const at=new Date().toISOString(); let found=d.instances.find(x=>x.nativeId===r.nativeId);
+          if(d.managed) {
+            engine.ensure(found,'托管派发的用量记录不能创建未经宿主发现的原生实例');
+            if(r.state&&r.state!==found.state) {
+              const ref=d.events.find(e=>e.evidencePath===r.evidencePath&&
+                fs.existsSync(e.evidencePath)&&sha(fs.readFileSync(e.evidencePath))===e.digest);
+              let reply:Partial<HostReply>|undefined;
+              try {reply=JSON.parse(JSON.parse(fs.readFileSync(r.evidencePath,'utf8')).stdout);}catch{}
+              engine.ensure(ref&&reply?.token===d.token&&reply.jobId===d.jobId&&
+                reply.targetHost===d.targetHost&&reply.nativeId===r.nativeId&&reply.state===r.state,
+                '托管实例状态只能由原始宿主派发事件改变，补录用量不能改写终态');
+            }
+          }
           if(!found){found={key:`native:${r.nativeId}`,nativeId:r.nativeId,state:r.state||'unknown',firstSeenAt:at,lastSeenAt:at,events:[]};d.instances.push(found);}
           instance=found;
           instance.lastSeenAt=at; if(r.state)instance.state=r.state;
           const digest=sha(fs.readFileSync(r.evidencePath));const ref:engine.HostEventRef={kind:'query',evidencePath:r.evidencePath,digest,at};
-          if(!instance.events.some(x=>x.evidencePath===ref.evidencePath&&x.digest===ref.digest))instance.events.push(ref);
-          if(!d.events.some(x=>x.evidencePath===ref.evidencePath&&x.digest===ref.digest))d.events.push(ref);
+          if(!d.managed) {
+            if(!instance.events.some(x=>x.evidencePath===ref.evidencePath&&x.digest===ref.digest))instance.events.push(ref);
+            if(!d.events.some(x=>x.evidencePath===ref.evidencePath&&x.digest===ref.digest))d.events.push(ref);
+          }
         } else if(s.v3) {
           s.v3.detachedInstances??=[];
           const targetHost=r.targetHost||s.capabilities?.framework||'unknown';
@@ -2565,6 +2808,7 @@ export async function main(argv: string[]): Promise<unknown> {
         if (trialJob.status !== 'done') {
           engine.ensure(!trialJob.testExecution,'测试进程未完成');
           if (trial.protocol === engine.currentProtocol && trialJob.executor === 'agent') {
+          if(unifiedDispatchRequired(trial,trialJob))verifiedDispatchCompletion(trial,trialJob);
           engine.ensure(trialJob.session, '缺少原生会话观测'); verifySessionArtifact(trialJob.session);
           verifyHandoffRef(trialJob);
             if (trialJob.tier === 'L1') {
@@ -2632,15 +2876,45 @@ export async function main(argv: string[]): Promise<unknown> {
             session, at: new Date().toISOString() });
         }
       }
-      if (s.status !== 'paused') s.status = 'running'; engine.event(s, 'L1 用已取得的新事实解除局部阻塞；重新规划而非跳过验证');
+      if (s.status === 'blocked' || s.status === 'running') s.status = 'running';
+      engine.event(s, 'L1 用已取得的新事实解除局部阻塞；重新规划而非跳过验证');
       s.specAudit = undefined; s.auditEpoch++;
     } else if (op === 'resume') {
-      engine.ensure(!s.jobs.some(active), '恢复前先对账或停止已有任务'); engine.reconcileFacts(s, observe(s));
-      engine.ensure(s.status !== 'complete', '本 workflow 已完成'); s.status = 'running'; s.specAudit = undefined; s.auditEpoch++;
-      s.mainSession = { source: 'unknown', at: new Date().toISOString() };
-      const mainId = extra || process.env.SPEC_DELIVERY_MAIN_NATIVE_ID;
-      if (mainId) try { s.mainSession = nativeSession(statePath, mainId, '$main'); } catch { /* 当前主会话不可观测。 */ }
-      engine.event(s, 'L1 根据用户继续指令恢复执行；未自动清除工单阻塞');
+      engine.ensure(extra,'恢复暂停或人工条件需要单独的版本化继续决定');
+      const decision=read<{schemaVersion:1;expectedRevision:number;expectedStatus:engine.State['status'];
+        kind:'user_resume'|'human_condition_resolved'|'blocked_resume';inputVersion:string;
+        decisionNativeId:string;evidencePath:string;humanEvidencePath?:string;reason:string}>(extra);
+      engine.ensure(decision.schemaVersion===1 && decision.expectedRevision===s.revision &&
+        decision.expectedStatus===s.status && decision.inputVersion===engine.inputVersion(s),
+        '恢复决定的状态、revision 或输入版本已过期');
+      engine.ensure(s.status==='paused'||s.status==='waiting_human'||s.status==='blocked',
+        '只有暂停、人工等待或已阻断的运行可显式恢复');
+      engine.ensure(decision.kind===(s.status==='paused'?'user_resume':s.status==='waiting_human'?
+        'human_condition_resolved':'blocked_resume') && !!decision.reason?.trim(),
+        '恢复决定必须对应用户暂停或当前人工条件，并说明继续原因');
+      engine.ensure(!s.jobs.some(active) && !s.jobs.some(j=>j.testExecution),
+        '恢复前先对账或停止已有任务及测试进程');
+      safeFile(decision.evidencePath);
+      engine.ensure(fs.readFileSync(decision.evidencePath,'utf8').trim(),'继续授权依据不能为空');
+      if(s.status==='waiting_human') {
+        safeFile(decision.humanEvidencePath || '');
+        engine.ensure(fs.readFileSync(decision.humanEvidencePath!,'utf8').trim(),
+          '人工条件解除需要非空原始依据');
+      }
+      engine.ensure(decision.decisionNativeId,'恢复决定需要真实 L1 原生会话');
+      const session=nativeSession(statePath,decision.decisionNativeId,'$resume');
+      engine.verifyNativeSession(s,session,decision.decisionNativeId,'L1');verifySessionArtifact(session);
+      engine.reconcileFacts(s,observe(s));
+      if(decision.expectedStatus==='waiting_human')
+        engine.ensure(s.tickets.filter(t=>t.kind==='human').every(t=>t.phase==='done'),
+          '仍有未完成的人工工单；不能解除 waiting_human');
+      s.continuations??=[];s.continuations.push({at:new Date().toISOString(),fromStatus:decision.expectedStatus,
+        kind:decision.kind,decisionPath:path.resolve(extra),decisionSha256:sha(fs.readFileSync(extra)),
+        evidencePath:path.resolve(decision.evidencePath),evidenceSha256:sha(fs.readFileSync(decision.evidencePath)),
+        ...(decision.humanEvidencePath?{humanEvidencePath:path.resolve(decision.humanEvidencePath),
+          humanEvidenceSha256:sha(fs.readFileSync(decision.humanEvidencePath))}:{}),session});
+      s.status='running';s.specAudit=undefined;s.auditEpoch++;s.mainSession=session;
+      engine.event(s, 'L1 按单独的继续决定恢复运行；局部阻塞仍需逐项处理');
     } else throw new Error(`未知命令 ${op}`);
     save(statePath, s); return { statePath, status: s.status, revision: s.revision };
   } finally { release(); }

@@ -7,6 +7,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import * as e from './core.ts';
+import {defaultSkillBindings} from './skills.ts';
 import { packet, stageResult } from '../spec-delivery.workflow.ts';
 const entry=fileURLToPath(new URL('../spec-delivery.workflow.ts',import.meta.url));
 const git=(cwd:string,...args:string[])=>execFileSync('git',args,{cwd,encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
@@ -20,7 +21,8 @@ function setup() {
   }
   fs.appendFileSync(path.join(root,'.git','info','exclude'),'\n/.agents/\n/bin/\n/evidence.md\n/plan.json\n');
   const run=path.join(root,'.agents','workflow-runs','test');fs.mkdirSync(run,{recursive:true});const statePath=path.join(run,'state.json');
-  const s:e.State={schema:1,protocol:3,v3:e.initialProtocolV3(),id:'cli-fixture',revision:0,inputs:{spec:100,targetBranch:'main',models:{L1:'large',L2:'middle',L3:'small'}},spec:100,repo:{root,slug:'example/test',host:'github.com',defaultBranch:'main'},status:'running',policy:{agents:8,issues:3,tests:1,noProgress:3,rounds:4},tickets:[],jobs:[],specCriteria:['done'],planEvidence:'',auditEpoch:1,events:[],facts:{base:head,issueStates:{100:'OPEN',101:'OPEN'},prs:{},at:''}};
+  const v3=e.initialProtocolV3();v3.skillBindings=defaultSkillBindings(path.join(root,'.agents','skills'));
+  const s:e.State={schema:1,protocol:3,v3,id:'cli-fixture',revision:0,inputs:{spec:100,targetBranch:'main',models:{L1:'large',L2:'middle',L3:'small'}},spec:100,repo:{root,slug:'example/test',host:'github.com',defaultBranch:'main'},status:'running',policy:{agents:8,issues:3,tests:1,noProgress:3,rounds:4},tickets:[],jobs:[],specCriteria:['done'],planEvidence:'',auditEpoch:1,events:[],facts:{base:head,issueStates:{100:'OPEN',101:'OPEN'},prs:{},at:''}};
   const t=e.buildTicket({number:101,kind:'software',dependencies:[],criteria:['done'],visual:false},head);t.phase='plan';t.head=head;t.branch='task';t.worktree=wt;s.tickets.push(t);
   const j=e.reserve(s)[0];fs.writeFileSync(statePath,JSON.stringify(s));
   fs.mkdirSync(path.join(root,'bin'));const log=path.join(run,'gh.log');
@@ -34,11 +36,25 @@ function setup() {
   const observer=path.join(root,'bin','observer');
   fs.writeFileSync(observer,`#!/usr/bin/env node\nconst fs=require('fs');const all=JSON.parse(fs.readFileSync(${JSON.stringify(sessions)},'utf8'));const [op,id,job]=process.argv.slice(2);const session=all[id];if(op!=='observe'||!session||session.jobId!==job)process.exit(2);console.log(JSON.stringify(session));\n`);
   fs.chmodSync(observer,0o755);
+  const migrationHost=path.join(run,'migration-host.json');fs.writeFileSync(migrationHost,JSON.stringify({actors:{}}));
+  const migrationObserver=path.join(root,'bin','migration-observer');
+  fs.writeFileSync(migrationObserver,`#!/usr/bin/env node
+const fs=require('fs'),q=JSON.parse(fs.readFileSync(0,'utf8'));
+const live=JSON.parse(fs.readFileSync(${JSON.stringify(migrationHost)},'utf8'));
+const actors=q.jobs.filter(j=>j.nativeId&&!j.nativeId.startsWith('command:')).map(j=>({jobId:j.id,
+  nativeId:j.nativeId,state:live.actors[j.id]||'unknown',observationId:'native-query-'+j.id}));
+console.log(JSON.stringify({source:'native_host',schemaVersion:1,challenge:q.challenge,runId:q.runId,
+  inventorySha256:q.inventorySha256,ledgerSha256:q.ledgerSha256,observedAt:new Date().toISOString(),
+  actors,dispatches:[],instances:[],processes:[],
+  processTree:{state:'stopped',unknownChildren:0,observationId:'process-inventory'},
+  externalActions:{state:'settled',unknown:0,observationId:'external-inventory'}}));
+`);fs.chmodSync(migrationObserver,0o755);
   fs.writeFileSync(path.join(root,'bin','gh'),`#!/usr/bin/env node\nconst fs=require('fs');fs.appendFileSync(${JSON.stringify(log)},'call\\n');console.log(JSON.stringify({data:{repository:{target:{target:{oid:'${head}'}},i100:{number:100,state:'OPEN'},i101:{number:101,state:'OPEN'}}}}));\n`);fs.chmodSync(path.join(root,'bin','gh'),0o755);
   fs.writeFileSync(path.join(root,'evidence.md'),'actual evidence');fs.writeFileSync(path.join(root,'plan.json'),'{}');
-  const env={...process.env,HOME:root,PATH:path.join(root,'bin')+path.delimiter+process.env.PATH,SPEC_DELIVERY_HOST_OBSERVER:observer};
+  const env={...process.env,HOME:root,PATH:path.join(root,'bin')+path.delimiter+process.env.PATH,
+    SPEC_DELIVERY_HOST_OBSERVER:observer,SPEC_DELIVERY_MIGRATION_OBSERVER:migrationObserver};
   const call=(...args:string[])=>spawnSync(process.execPath,[entry,...args],{cwd:root,env,encoding:'utf8'});
-  return {root,run,head,s,t,j,statePath,log,call,observe};
+  return {root,run,head,s,t,j,statePath,log,call,observe,migrationHost};
 }
 function deliveryRemote(x:ReturnType<typeof setup>, initial:{state:'OPEN'|'MERGED';checks?:unknown[]}) {
   const remote=path.join(x.run,'delivery-remote.json');
@@ -85,10 +101,13 @@ else throw Error('unexpected gh request '+a.join(' '));
   return {remote,read:()=>JSON.parse(fs.readFileSync(remote,'utf8')),
     update:(patch:Record<string,unknown>)=>fs.writeFileSync(remote,JSON.stringify({...JSON.parse(fs.readFileSync(remote,'utf8')),...patch}))};
 }
-test('真实 CLI 批次绑定收取已有结果，只查询一次易变事实并可重复调用',()=>{
+test('旧批次仅可收取历史租约；统一运行拒绝批次绑定',()=>{
   const x=setup();try {
-    stageResult(x.statePath,x.j.id,{complete:true,status:'planned',evidencePath:'evidence.md',data:{planPath:'plan.json',checksPath:'plan.json'}});
     const binding=path.join(x.run,'binding.json');fs.writeFileSync(binding,JSON.stringify({runId:'actual-native-run',model:'large',jobs:[{jobId:x.j.id,actorName:'planner'}]}));
+    const denied=x.call('bind-batch',x.statePath,binding);assert.notEqual(denied.status,0);
+    assert.match(denied.stderr,/禁止旧批次模板绑定/);
+    x.s.protocol=2;delete x.s.v3;fs.writeFileSync(x.statePath,JSON.stringify(x.s));
+    stageResult(x.statePath,x.j.id,{complete:true,status:'planned',evidencePath:'evidence.md',data:{planPath:'plan.json',checksPath:'plan.json'}});
     x.observe('actual-native-run/planner',x.j.id,'large');
     const result=x.call('bind-batch',x.statePath,binding);assert.equal(result.status,0,result.stderr);assert.equal(JSON.parse(result.stdout).submitted.length,1);
     assert.equal(fs.readFileSync(x.log,'utf8').trim().split('\n').length,1);
@@ -128,10 +147,17 @@ test('旧运行必须对账迁移，保留旧结果并重新排队未完成审�
     delete x.s.protocol;delete x.s.v3;x.j.status='done';x.j.result={model:x.j.model,complete:true,status:'planned',evidencePath:path.join(x.root,'evidence.md')};
     x.t.phase='fresh';x.t.evidence.regular={head:x.head,base:x.head,path:'old-review'};fs.writeFileSync(x.statePath,JSON.stringify(x.s));
     assert.notEqual(x.call('next',x.statePath).status,0);
-    const proof=path.join(x.run,'proof.json');fs.writeFileSync(proof,JSON.stringify({evidencePath:path.join(x.root,'evidence.md'),reason:'run replaced'}));
+    const context=x.call('migration-context',x.statePath);assert.equal(context.status,0,context.stderr);
+    const inventory=JSON.parse(context.stdout);
+    const proof=path.join(x.run,'proof.json');fs.writeFileSync(proof,JSON.stringify({schemaVersion:1,
+      expectedRevision:inventory.revision,inventorySha256:inventory.inventorySha256,ledgerSha256:inventory.ledgerSha256,
+      evidencePath:path.join(x.root,'evidence.md'),observedAt:new Date().toISOString(),
+      statusIntent:'preserve',processTreeStopped:true,externalActionsSettled:true}));
     const upgrade=x.call('upgrade',x.statePath,proof);assert.equal(upgrade.status,0,upgrade.stderr);
-    const saved=JSON.parse(fs.readFileSync(x.statePath,'utf8'));assert.equal(saved.protocol,3);assert.equal(saved.v3.executionPath,'legacy-v02');assert.equal(saved.tickets[0].phase,'queued');assert.deepEqual(saved.tickets[0].evidence,{});assert.equal(saved.jobs[0].result.status,'planned');
-    assert.equal(x.call('retire',x.statePath,proof).status,0);
+    const saved=JSON.parse(fs.readFileSync(x.statePath,'utf8'));assert.equal(saved.protocol,3);assert.equal(saved.v3.executionPath,'unified-v03');assert.equal(saved.tickets[0].phase,'replan');assert.deepEqual(saved.tickets[0].evidence,{});assert.equal(saved.jobs[0].result.status,'planned');
+    const retire=path.join(x.run,'retire.json');fs.writeFileSync(retire,JSON.stringify({
+      reason:'explicitly retire migrated fixture',evidencePath:path.join(x.root,'evidence.md')}));
+    assert.equal(x.call('retire',x.statePath,retire).status,0);
     for(const operation of ['next','resume','resolve'])assert.notEqual(x.call(operation,x.statePath,proof).status,0);
     assert.equal(x.call('inspect',x.statePath).status,0);
   } finally {fs.rmSync(x.root,{recursive:true,force:true});}
@@ -184,9 +210,14 @@ else console.log(JSON.stringify({number:100,html_url:'https://github.com/example
 test('旧协议的已完成 agent 可以先登记原结果再升级，无需伪造停止',()=>{
   const x=setup();try {
     delete x.s.protocol;delete x.s.v3;e.bind(x.s,x.j.id,{nativeId:'old-run/planner',model:x.j.model});fs.writeFileSync(x.statePath,JSON.stringify(x.s));
+    fs.writeFileSync(x.migrationHost,JSON.stringify({actors:{[x.j.id]:'completed'}}));
     const result=path.join(x.run,'legacy-result.json');fs.writeFileSync(result,JSON.stringify({model:x.j.model,complete:true,status:'planned',evidencePath:path.join(x.root,'evidence.md'),head:x.j.head,base:x.j.base,data:{planPath:path.join(x.root,'plan.json'),checksPath:path.join(x.root,'plan.json')}}));
     const submitted=x.call('submit',x.statePath,x.j.id,result);assert.equal(submitted.status,0,submitted.stderr);
-    const proof=path.join(x.run,'proof.json');fs.writeFileSync(proof,JSON.stringify({evidencePath:path.join(x.root,'evidence.md')}));
+    const inventory=JSON.parse(x.call('migration-context',x.statePath).stdout);
+    const proof=path.join(x.run,'proof.json');fs.writeFileSync(proof,JSON.stringify({schemaVersion:1,
+      expectedRevision:inventory.revision,inventorySha256:inventory.inventorySha256,ledgerSha256:inventory.ledgerSha256,
+      evidencePath:path.join(x.root,'evidence.md'),observedAt:new Date().toISOString(),
+      statusIntent:'preserve',processTreeStopped:true,externalActionsSettled:true}));
     const upgraded=x.call('upgrade',x.statePath,proof);assert.equal(upgraded.status,0,upgraded.stderr);
     const saved=JSON.parse(fs.readFileSync(x.statePath,'utf8'));assert.equal(saved.jobs[0].status,'done');assert.equal(saved.tickets[0].phase,'plan_check');
   } finally {fs.rmSync(x.root,{recursive:true,force:true});}

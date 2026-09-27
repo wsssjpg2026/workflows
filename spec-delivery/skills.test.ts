@@ -304,9 +304,16 @@ function contextFixture(mode:'resumed'|'new') {
     evidencePath:x.j.session!.evidencePath,findings:[]};
   const successor:core.Job={...structuredClone(x.j),id:'job-2',epoch:x.t.epoch,status:'leased',nativeId:'',
     session:undefined,contextObservation:undefined,result:undefined,part:'0',
+    legacyManualLease:true,
     contextIntent:core.contextIntentFor(x.s,x.t.key,'review-lens','0',false),
     contextKey:'review-continuation',candidateVersion:core.candidateVersion(x.s,x.t)};
   assert.equal(successor.contextIntent!.kind,'continue');x.s.jobs.push(successor);
+  successor.dispatchToken=`fixture-${sha(successor.id)}`;
+  x.s.v3!.dispatchRecords.push({jobId:successor.id,attempt:1,token:successor.dispatchToken,
+    targetHost:'fixture',requestedModel:successor.model,packetPath:'',requestPath:'',requestDigest:'',
+    status:'prepared',createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),
+    events:[],instances:[{key:`token:${successor.dispatchToken}`,nativeId:null,state:'requested',
+      firstSeenAt:new Date().toISOString(),lastSeenAt:new Date().toISOString(),events:[]}]});
   const sessionsPath=path.join(x.root,'context-sessions.json');
   const nativeId=mode==='resumed'?'host/resumed':'host/new';
   const sessions:Record<string,unknown>={

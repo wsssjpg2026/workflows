@@ -35,7 +35,8 @@ export function metrics(s: State) {
   }, {} as Record<string, number>);
   return { run: s.id, status: s.status, jobs: s.jobs.length, byAction: count('action'), byTier: count('tier'), byStatus: count('status'),
     observation: s.telemetry || null, validationOwner: s.validationOwner || null,
-    tickets: s.tickets.map(t => ({ issue: t.number, phase: t.phase, invalidations: t.baseInvalidations || 0, queueSkips: t.queueSkips || 0 })),
+    tickets: s.tickets.map(t => ({ issue: t.number, phase: t.phase, invalidations: t.baseInvalidations || 0, queueSkips: t.queueSkips || 0,
+      failureBudget: t.failureBudget || null, lastFailure: t.failures?.at(-1) || null })),
     tasks: s.jobs.map(j => ({ id: j.id, model: j.model, nativeId: j.nativeId, timing: j.timing || null, usage: j.usage || null })),
     note: 'null 表示未获取；绑定时间不是模型开始时间。ghInvocations 是 CLI 调用次数，不是 HTTP 分页请求数。' };
 }

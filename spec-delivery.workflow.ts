@@ -156,6 +156,19 @@ function recoverOnRejectedResult(s: engine.State, j: engine.Job, statePath: stri
   if (observed.unmerged || observed.status || observed.error || observed.branch !== t.branch || observed.head !== t.head)
     enterWorkspaceRecovery(s, t, statePath, `回执无法采用：${error.message}`, j.id, observed);
 }
+function recordRejectedReceipt(s: engine.State, j: engine.Job, statePath: string, error: Error, immutable = false) {
+  const t = s.tickets.find(t => t.key === j.ticket);
+  if (t && active(j) && t.epoch === j.epoch && s.status !== 'retired') {
+    const recorded = engine.recordFailure(s, t, { id: `${j.id}:receipt_validation`, category: 'receipt_validation',
+      reason: error.message, jobId: j.id, next: t.phase, invariant: immutable, preservePhase: !immutable });
+    // A corrected direct submission may reuse its lease. Once a staged receipt is immutable,
+    // the same previously recorded failure must still stop the unusable lease.
+    if (!recorded && immutable && t.phase !== 'recovery' && t.epoch === j.epoch) {
+      t.phase = t.failureBudget?.replans ? 'blocked' : 'replan'; t.epoch++; t.evidence = {};
+    }
+  }
+  recoverOnRejectedResult(s, j, statePath, error);
+}
 function recoverWorkspace(s: engine.State, statePath: string, key: string, decision: {
   expectedRevision: number; expectedRecoveryHead: string | null; resolvedHead: string; resolvedBase: string;
   evidencePath: string; handoffPath: string; reason: string; sourceEvidencePath?: string;
@@ -666,7 +679,7 @@ export function consumeStaged(statePath: string, ids?: string[]) {
         job.timing ??= {leasedAt:''}; job.timing.resultAt=read<{at:string}>(resultPaths(statePath,j.id).ready).at;
         validateResult(trial, job, r); engine.submit(trial, job.id, r); s = trial; submitted.push(j.id);
       } catch (error) {
-        recoverOnRejectedResult(s, j, statePath, error as Error);
+        recordRejectedReceipt(s, j, statePath, error as Error, true);
         rejected.push({jobId:j.id,error:(error as Error).message});
       }
     }
@@ -686,6 +699,13 @@ export function stageResult(statePath: string, id: string, value: unknown) {
       write(files.result, r);
       write(files.ready, {jobId:id,at:new Date().toISOString(),resultPath:files.result});
     }
+  } catch (error) {
+    const s = read<engine.State>(statePath), j = s.jobs.find(j => j.id === id);
+    if (j && active(j)) {
+      recordRejectedReceipt(s, j, statePath, error as Error);
+      save(statePath, s);
+    }
+    throw error;
   } finally { release(); }
   return { jobId:id, resultPath:resultPaths(statePath,id).result, ...consumeStaged(statePath,[id]) };
 }
@@ -892,8 +912,8 @@ export async function main(argv: string[]): Promise<unknown> {
         if (trialJob.status !== 'done') {engine.ensure(!trialJob.testExecution,'测试进程未完成');trial.facts = observe(trial,[trialJob]); validateResult(trial, trialJob, r); }
         engine.submit(trial, extra, r);
       } catch (error) {
-        recoverOnRejectedResult(s, j, statePath, error as Error);
-        if (s.tickets.some(t => t.phase === 'recovery' && t.recovery?.sourceJobId === j.id)) save(statePath, s);
+        recordRejectedReceipt(s, j, statePath, error as Error);
+        save(statePath, s);
         throw error;
       }
       s = trial; archiveResult(statePath,s.jobs.find(x=>x.id===extra)!);
@@ -921,7 +941,14 @@ export async function main(argv: string[]): Promise<unknown> {
           j.stopConfirmation = {state:observation.state,evidencePath:observation.evidencePath,processTreeStopped:observation.processTreeStopped===true,at:new Date().toISOString()};
           j.timing??={leasedAt:''};j.timing.cancelledAt=new Date().toISOString();delete j.testExecution;
           if (j.ticket === '$spec') s.specAudit = undefined;
-          else engine.ticket(s, j.ticket).reason = '任务已终止；新执行者从持久证据恢复本阶段，不跳过中间验证';
+          else {
+            const t = engine.ticket(s, j.ticket);
+            if (t.failures?.some(f => f.jobId === j.id)) engine.finalizeRejectedReceipt(s, t, j);
+            else if (j.nativeId)
+              engine.recordFailure(s, t, { id: `${j.id}:host`, category: 'host', jobId: j.id,
+                reason: `宿主执行 ${observation.state}；${observation.evidencePath}`, signature: `${j.action}:${observation.state}`,
+                next: t.phase, preservePhase: t.phase === 'recovery' });
+          }
         }
         // completed 必须读取并提交原结果，不重做外部动作；running 保留原租约。
       }
@@ -931,11 +958,17 @@ export async function main(argv: string[]): Promise<unknown> {
       engine.event(s, '实时核对宿主、GitHub 和候选；没有将 journal 回放当作新验证');
     } else if (op === 'resolve') {
       engine.ensure(extra, '需要 L1 根据已取得事实生成的解除阻塞决定');
-      const decisions = read<{ticket:string; evidencePath:string; handoffPath:string}[]>(extra);
+      const decisions = read<{ticket:string; evidencePath:string; handoffPath:string; newFacts?:string; failureEventId?:string}[]>(extra);
       s.facts = observe(s);
       for (const d of decisions) {
         const t = engine.ticket(s, d.ticket); safeFile(d.evidencePath); safeFile(d.handoffPath);
         engine.ensure(t.phase === 'blocked' && !s.jobs.some(j => j.ticket === t.key && active(j)), '只解除没有在途任务的阻塞工单');
+        engine.ensure(!s.jobs.some(j => j.ticket === t.key && j.testExecution), '测试进程树未对账，不能解除阻塞');
+        if (t.failureBudget?.totalRetries) {
+          engine.ensure(typeof d.newFacts === 'string' && d.newFacts.trim() &&
+            d.failureEventId === t.failures?.at(-1)?.id, '失败预算解除阻塞须指出最新失败事件及有证据的新事实');
+          t.failureBudget.consecutiveNoProgress = 0; t.failureBudget.lastSignature = '';
+        }
         t.handoffPath = d.handoffPath; t.phase = t.worktree ? 'replan' : 'claim'; t.epoch++; t.reason = '';
       }
       if (s.status !== 'paused') s.status = 'running'; engine.event(s, 'L1 用已取得的新事实解除局部阻塞；重新规划而非跳过验证');

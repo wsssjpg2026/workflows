@@ -85,7 +85,7 @@ TypeScript 宿主也可使用 `spec-delivery/skills.ts` 的 `invokeBoundSkill`�
 
 每个 actor 将原始 Result JSON 写入该 packet 的输出目录，生成脚本在该 actor 的 `ask` 完成后立即 `report` 文件名和 token。可信桥接从 `GetWorkflowRun` 取得终态与对应报告，适配器再把结果文件交给核心；核心先观测原生模型和上下文，逐项绑定与收取。脚本中的 `report` 不能代替宿主终态或证据门禁。
 
-**其它支持指定模型的宿主（包括 Codex）**：对已返回的 job 调用真实 agent 工具，以 `bind <state> <jobId> <binding.json>` 记录 `{nativeId}`。任务真正完成后，由宿主把语义 Result 交给 `stage <state> <jobId> <result-json>`；这是 JSON 内容参数，应使用参数数组传递。旧的 `submit <state> <jobId> <result.json>` 仍可用，但需要完整 Result 身份。当前宿主无法选择指定模型或查询任务时明确阻断。
+**Codex CLI**：使用 [Codex 适配器](adapters/CODEX.md) 的 `probe`、逐模型 `probe-models` 与三个包装入口，将已验证的 `exec -m` 路由接入持久 `dispatch/collect`、原生 rollout 身份观测及技能源码执行。主会话模型可不同于 L1；缺少路由或原生身份时停止，不以 persona、请求字符串或默认模型补证。其它支持指定模型的宿主可对已返回的 job 调用真实 agent 工具，以 `bind <state> <jobId> <binding.json>` 记录 `{nativeId}`。任务真正完成后，由宿主把语义 Result 交给 `stage <state> <jobId> <result-json>`；这是 JSON 内容参数，应使用参数数组传递。旧的 `submit <state> <jobId> <result.json>` 仍可用，但需要完整 Result 身份。
 
 协议 3 的模型任务要求宿主设置绝对路径环境变量 `SPEC_DELIVERY_HOST_OBSERVER`，指向可信的原生会话查询适配器。CLI 以 `observe <nativeId> <jobId>` 调用它；适配器从宿主 API/原生事件返回 `{source:"native_host",observationId,jobId,nativeId,provider,model,observedAt}`。CLI 将原始响应追加归档到运行目录并验证 provider/model 与请求角色一致。`binding.json` 中自填 `model`、`source` 或证据路径没有证明力。路由 ID 可为 `provider/model`，例如配置 `deepseek-official/deepseek/deepseek-v4.1-flash` 对应观测 `provider=deepseek-official`、`model=deepseek/deepseek-v4.1-flash`。适配器的可信性和工具权限取决于宿主；无隔离能力时协议依赖宿主遵守角色边界，不宣称提示词形成强隔离。
 

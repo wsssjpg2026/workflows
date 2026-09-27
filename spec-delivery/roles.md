@@ -35,11 +35,11 @@
 
 ## 上下文与交接
 
-同模型且宿主支持保留上下文时，按稳定 `contextKey` 继续原执行者。跨模型、跨ZCode run或上下文不可恢复时，通过交接文档恢复，不声称保留了同一物理会话。
+`contextKey` 仅提示宿主路由；是否续接以可信宿主观测中的 contextId、`mode` 与祖先证明为准。作者实现/修复及 regular 各自保留职责内的历史；独立动作必须新建上下文。无法证明续接时启动新会话，在交接核验前不执行该 job 的其它技能或提交结果。
 
-由交出工作的 agent 显式加载并调用宿主可用的 `handoff` 技能，先按技能要求写入 OS 临时目录，记录候选、目标、已完成/未完成、关键判断及理由、失败尝试、未提交变化、待确定外部动作、证据路径和下一步；再将原文副本归档到本次运行的持久目录，以归档路径填写 `handoffPath`。L1核验并转发；接任者读取原始spec、代码、规范和证据后核对当前状态。技能不可用须明确报告，不能声称已经调用。
+由交出工作的 agent 显式加载并调用宿主可用的 `handoff` 技能，先按原技能要求写入 OS 临时目录并列出 suggested skills，引用已有 spec、计划、提交和证据，不复制无关历史或凭据；再由外围逐字归档。L1 用 `context-handoff` 核验原技能调用、来源、当前候选及原文 SHA 后转发引用；接任者从 `contextReferencePath` 读取原文并核对当前状态。技能不可用须明确报告，不能声称已经调用。
 
-实现侧保持计划→实现→修复的判断连续性；regular审查侧保存自己的问题与复核历史。两侧分别交接。原agent已不可恢复时，由L1基于持久化证据重建并标明未知项。
+实现侧保持计划→实现→修复的判断连续性；regular审查侧保存自己的问题与复核历史。两侧分别交接。原 agent 经宿主证实不可恢复时，由 L1 基于持久化证据重建并标明未知项，使用 `context-reconstruct` 留下独立记录，不冒称原 actor 已调用 handoff。
 
 fresh job的全部参与者使用新上下文，初始材料包含原始需求、完整diff、仓库规范和原始测试证据，排除旧review结论和作者的辩解摘要。先独立审查，再核对历史问题去重；fresh不是“不读来源”。恢复旧任务不是fresh。
 
@@ -212,7 +212,7 @@ CI按下列规则处理，无需逐次请求用户批准：
 | `review-lens` | `reviewed` | 顶层`findings`必填；遵循packet指定的单个lens |
 | `confirm` | `confirmed` | 顶层`findings`恰好一项，保留被派发的问题ID，给出`confidence`和复核证据；≥50须`confirmed:true` |
 | `adjudicate` | `confirmed` | L1 裁决同一候选判定分歧；字段同 confirm，另须完整 assessment，rationale 解释差异 |
-| `review-report` | `posted` | `data.commentUrl`与顶层`handoffPath`必填；由核心根据全部确认结果决定进入修复或下一阶段 |
+| `review-report` | `posted` | `data.commentUrl`必填；若提供顶层`handoffPath`，它必须来自原 actor 已完成的 handoff 技能调用。后继新会话在不能续接时再经 L1 核验交接或重建；由核心根据全部确认结果决定进入修复或下一阶段 |
 | `accept` | `ready` | `data.satisfiedCriteria`逐字包含packet全部criteria；附适用CI事实及下述豁免结构 |
 | `accept` | `gap`、`conflict`、`waiting_ci`、`needs_human`、`blocked` | `gap`必须`data.planPath`，并附`reason`；其它状态附具体原因和证据；补充计划先过L1 `plan-check` |
 | `merge` | `merged`、`waiting_merge` | 真实远端合并证据或等待原因；`merged`仍须核心live观察到MERGED |

@@ -46,6 +46,8 @@ export function metrics(s: State) {
       failureBudget: t.failureBudget || null, lastFailure: t.failures?.at(-1) || null })),
     tasks: s.jobs.map(j => ({ id: j.id, executor: j.executor, requestedModel: j.executor === 'agent' ? j.model : null,
       observedProvider: j.session?.provider || null, observedModel: j.session?.model || null, nativeId: j.nativeId,
+      contextIntent:j.contextIntent || null,observedContext:j.contextObservation || null,
+      handoffKind:j.handoffRef?.kind || null,
       timing: j.timing || null, usage: j.usage || null })),
     dispatches: (s.v3?.dispatchRecords || []).map(d => ({jobId:d.jobId,attempt:d.attempt,token:d.token,targetHost:d.targetHost,
       requestedModel:d.requestedModel,status:d.status,uncertainty:d.uncertainty || null,events:d.events.length,

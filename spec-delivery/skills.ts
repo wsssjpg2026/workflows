@@ -93,7 +93,7 @@ function archiveSource(statePath: string, id: string, bundle: SkillSourceBundle)
 export function prepareSkillCall(s: State, job: Job, capability: SkillCapability, host: SkillHostCapabilities,
   statePath: string): PreparedSkillCall {
   ensure(s.status === 'running', '运行暂停或阻断时不能启动新的技能调用');
-  ensure(job.executor === 'agent' && job.status === 'running' && job.nativeId && job.session,
+  ensure(job.executor === 'agent' && (job.status === 'running' || capability === 'handoff' && job.status === 'done') && job.nativeId && job.session,
     '技能必须由已绑定真实宿主会话的 agent job 显式调用');
   ensure(job.session.jobId === job.id && job.session.nativeId === job.nativeId, '技能调用执行者与 job 不符');
   verifyNativeSession(s, job.session, job.nativeId, job.tier);
@@ -113,7 +113,8 @@ export function prepareSkillCall(s: State, job: Job, capability: SkillCapability
   if (!registration) ensure(host.sourceExecution?.allowed && host.sourceExecution.acceptsOriginalFiles,
     `宿主没有已注册且指纹匹配的 ${binding.name} 原生显式调用，且不允许加载原技能及依赖源码执行`);
   const currentCandidate = candidateVersion(s, job.ticket === '$spec' ? undefined : s.tickets.find(t => t.key === job.ticket));
-  ensure(job.candidateVersion === currentCandidate, '候选版本改变，不能调用旧 job 的技能');
+  if (!(capability === 'handoff' && job.status === 'done'))
+    ensure(job.candidateVersion === currentCandidate, '候选版本改变，不能调用旧 job 的技能');
   const id = `${job.id}:skill:${capability}:${randomUUID()}`;
   const source = sourceBundle(binding);
   ensure(source.files.every(file => digest(Buffer.from(file.dataBase64, 'base64')) === file.sha256),
@@ -155,7 +156,8 @@ export function finishSkillCall(s: State, invocationId: string, outcome: SkillOu
     return invocation.result;
   }
   const job = s.jobs.find(j => j.id === invocation.jobId);
-  ensure(job && job.status === 'running' && job.session && JSON.stringify(job.session) === JSON.stringify(invocation.session),
+  ensure(job && (job.status === 'running' || invocation.capability === 'handoff' && job.status === 'done') &&
+    job.session && JSON.stringify(job.session) === JSON.stringify(invocation.session),
     '技能结果不属于当前真实执行者');
   if (invocation.hostCapabilityPath)
     ensure(digest(fs.readFileSync(nonblank(invocation.hostCapabilityPath))) === invocation.hostCapabilitySha256,
@@ -163,8 +165,9 @@ export function finishSkillCall(s: State, invocationId: string, outcome: SkillOu
   verifySkillBinding(bindingFor(s, invocation.capability));
   ensure(bindingFor(s, invocation.capability).fingerprint === invocation.bindingFingerprint,
     '技能调用的版本已迁移，旧结果不能用于当前门禁');
-  ensure(candidateVersion(s, job.ticket === '$spec' ? undefined : s.tickets.find(t => t.key === job.ticket)) === invocation.candidateVersion,
-    '技能结果候选已过期');
+  if (!(invocation.capability === 'handoff' && job.status === 'done'))
+    ensure(candidateVersion(s, job.ticket === '$spec' ? undefined : s.tickets.find(t => t.key === job.ticket)) === invocation.candidateVersion,
+      '技能结果候选已过期');
   ensure(['pass', 'changes_required', 'incomplete', 'skipped'].includes(outcome.status) && typeof outcome.blocking === 'boolean',
     '技能外围回执缺少明确状态或阻断结论');
   ensure(outcome.status !== 'pass' || outcome.blocking === false, 'pass 不能同时声明阻断');

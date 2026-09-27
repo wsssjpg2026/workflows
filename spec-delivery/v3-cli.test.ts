@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { normalizeResult, resultPaths } from './host.ts';
+import { rawSourcesForJob } from './raw-sources.ts';
 import * as core from './core.ts';
 
 const entry = fileURLToPath(new URL('../spec-delivery.workflow.ts', import.meta.url));
@@ -14,7 +15,7 @@ const sha = (value:string) => createHash('sha256').update(value).digest('hex');
 const git = (cwd: string, ...argv: string[]) => execFileSync('git', argv, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const inputs = { spec: 100, targetBranch: 'main', models: { L1: 'large', L2: 'middle', L3: 'small' } };
 
-function fixture() {
+function fixture(withStandard = false) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-v3-cli-'));
   for (const name of ['implement', 'diagnosing-bugs', 'code-review', 'code-review-from-claude', 'handoff']) {
     const directory = path.join(temp, '.agents', 'skills', name); fs.mkdirSync(directory, { recursive: true });
@@ -23,7 +24,9 @@ function fixture() {
   const root = path.join(temp, 'repo'), bare = path.join(temp, 'origin.git');
   fs.mkdirSync(root); git(temp, 'init', '--bare', bare); git(root, 'init', '-b', 'main');
   git(root, 'config', 'user.email', 'test@example.invalid'); git(root, 'config', 'user.name', 'Workflow Test');
-  fs.writeFileSync(path.join(root, 'source.txt'), 'base\n'); git(root, 'add', 'source.txt'); git(root, 'commit', '-m', 'base');
+  fs.writeFileSync(path.join(root, 'source.txt'), 'base\n');
+  if(withStandard)fs.writeFileSync(path.join(root,'AGENTS.md'),'# Fixture standard\nReview the changed source.\n');
+  git(root, 'add', '.'); git(root, 'commit', '-m', 'base');
   const head = git(root, 'rev-parse', 'HEAD');
   git(root, 'remote', 'add', 'origin', bare); git(root, 'remote', 'set-url', '--push', 'origin', 'https://github.com/example/test.git');
   git(root, 'push', bare, 'main');
@@ -1286,11 +1289,29 @@ else if(op==='result') {
       replacements:{prReview:replacement}}));
     const migrated=x.call('migrate-skills',statePath,migrationRequest);
     assert.equal(migrated.status,0,migrated.stderr);
+    let regularSourceArchive='';
     for(const phase of ['review','fresh']) {
       const next=invoke('next',statePath);
       const j=next.jobs.find((job:{action:string})=>job.action==='pr-review');assert.ok(j);
       assert.equal(j.fresh,phase==='fresh');
       if(phase==='fresh')assert.equal(j.contextIntent.kind,'independent');
+      const reviewPacket=JSON.parse(fs.readFileSync(j.packetPath,'utf8'));
+      assert.ok(reviewPacket.sourceArchive?.manifestPath);
+      assert.equal(reviewPacket.sourceArchive.cacheHit,true,'两轮复用作者阶段已固定的原始来源');
+      if(phase==='review')regularSourceArchive=reviewPacket.sourceArchive.manifestPath;
+      if(phase==='fresh') {
+        assert.equal(reviewPacket.sourceArchive.manifestPath,regularSourceArchive);
+        assert.equal(reviewPacket.rawSources.archivePath,reviewPacket.sourceArchive.manifestPath);
+        assert.equal(reviewPacket.historyIndexPath,'');
+        assert.deepEqual(reviewPacket.prior,[]);
+        assert.equal(reviewPacket.handoffRef,null);
+        assert.ok(reviewPacket.sourceArchive.files.every((file:{kind:string})=>
+          ['spec','issue','diff','standard','history'].includes(file.kind)));
+        const raw=reviewPacket.sourceArchive.files.map((file:{archivePath:string})=>
+          fs.readFileSync(file.archivePath,'utf8')).join('\n');
+        assert.ok(!raw.includes('review holistic report'));
+        assert.ok(!JSON.stringify(reviewPacket).includes('Standards: pass'));
+      }
       x.observe(`pr-${phase}`,j.id,'middle');
       fs.writeFileSync(binding,JSON.stringify({nativeId:`pr-${phase}`}));
       invoke('bind',statePath,j.id,binding);
@@ -1576,5 +1597,95 @@ test('技能子任务的实际 usage、外部等待和未知时间边界分开�
     assert.equal(instance.selectedUsage[0].normalized.inputTokens.value,22);
     assert.equal(instance.selectedUsage[0].normalized.reasoningTokens.value,3);
     assert.equal(instance.timing.launchMs,null,'宿主没有真实启动边界时不能用绑定时间代替');
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('公开 CLI 复用固定候选原始来源，来源与候选变化失效且损坏缓存明确失败', () => {
+  const x=fixture(true);
+  try {
+    const {statePath}=approvedImplementation(x);
+    const actualGit=execFileSync('which',['git'],{encoding:'utf8'}).trim();
+    const reads=path.join(x.temp,'source-git-reads.log');
+    const wrapper=path.join(x.temp,'bin','git');
+    fs.writeFileSync(wrapper,`#!/usr/bin/env node
+const fs=require('fs'),{spawnSync}=require('child_process'),args=process.argv.slice(2);
+if(args[0]==='diff'||args[0]==='log'||args[0]==='ls-tree'||args[0]==='show')
+  fs.appendFileSync(${JSON.stringify(reads)},JSON.stringify(args)+'\\n');
+const child=spawnSync(${JSON.stringify(actualGit)},args,{stdio:'inherit'});
+process.exit(child.status===null?1:child.status);
+`);
+    fs.chmodSync(wrapper,0o755);
+    const sourceReads=()=>fs.existsSync(reads)?fs.readFileSync(reads,'utf8').trim().split('\n').filter(Boolean)
+      .map(line=>JSON.parse(line) as string[]):[];
+    const issue=()=>{const r=x.call('next',statePath);assert.equal(r.status,0,r.stderr);
+      const job=JSON.parse(r.stdout).jobs.find((j:{action:string})=>j.action==='implement');assert.ok(job);
+      return {job,packet:JSON.parse(fs.readFileSync(job.packetPath,'utf8'))};};
+    const first=issue();
+    assert.equal(first.packet.sourceArchive.cacheHit,false);
+    assert.deepEqual(first.packet.sourceArchive.files.map((f:{kind:string})=>f.kind).slice(0,4),
+      ['spec','issue','diff','history']);
+    const standard=first.packet.sourceArchive.files.find((f:{kind:string})=>f.kind==='standard');
+    assert.ok(standard);
+    assert.match(fs.readFileSync(standard.archivePath,'utf8'),/Fixture standard/);
+    const initialReads=sourceReads();
+    const materialized=initialReads.filter(args=>args[0]!=='diff'||
+      args.includes(first.job.head)&&args.includes(first.job.base));
+    assert.equal(materialized.length,5,'首次读取：两次候选 diff、一次 log、一次 ls-tree、一次规范 show');
+    const liveReads=()=>fs.readFileSync(x.ghLog,'utf8').trim().split('\n').filter(Boolean)
+      .map(line=>JSON.parse(line) as string[]).filter(args=>args.includes('graphql')).length;
+    const initialLiveReads=liveReads();
+    assert.ok(initialReads.some(args=>args[0]==='diff'&&args.includes('--binary')));
+    assert.ok(initialReads.some(args=>args[0]==='log'));
+    assert.ok(initialReads.some(args=>args[0]==='show'));
+    const second=issue();
+    assert.equal(second.job.id,first.job.id);
+    assert.equal(second.packet.sourceArchive.cacheHit,true);
+    assert.equal(second.packet.sourceArchive.manifestPath,first.packet.sourceArchive.manifestPath);
+    assert.deepEqual(sourceReads(),initialReads,'命中后不重读 diff、标准或候选历史');
+    assert.ok(liveReads()>initialLiveReads,'缓存命中仍实时读取目标与 issue/PR 状态');
+    const archive=second.packet.sourceArchive;
+    const diff=archive.files.find((f:{kind:string})=>f.kind==='diff');assert.ok(diff);
+    const original=fs.readFileSync(diff.archivePath);
+    fs.rmSync(diff.archivePath);
+    const stateBefore=fs.readFileSync(statePath);
+    const broken=x.call('next',statePath);
+    assert.notEqual(broken.status,0);
+    assert.match(broken.stderr,/原始来源缓存文件缺失/);
+    assert.deepEqual(fs.readFileSync(statePath),stateBefore);
+    fs.writeFileSync(diff.archivePath,original,{flag:'wx'});
+    const oldIssue=fs.readFileSync(x.issueSource);
+    fs.rmSync(x.issueSource);
+    const unreadable=x.call('next',statePath);
+    assert.notEqual(unreadable.status,0);
+    assert.match(unreadable.stderr,/GitHub observation:/);
+    assert.deepEqual(fs.readFileSync(statePath),stateBefore);
+    fs.writeFileSync(x.issueSource,oldIssue);
+    fs.writeFileSync(x.issueSource,'   ');
+    const empty=x.call('next',statePath);
+    assert.notEqual(empty.status,0);
+    assert.match(empty.stderr,/正文缺失/);
+    assert.deepEqual(fs.readFileSync(statePath),stateBefore);
+    fs.writeFileSync(x.issueSource,'Updated spec source\n');
+    const changedSource=issue();
+    assert.equal(changedSource.packet.sourceArchive.cacheHit,false);
+    assert.notEqual(changedSource.packet.sourceArchive.manifestPath,archive.manifestPath);
+    assert.ok(fs.existsSync(archive.manifestPath),'旧来源归档保留供审计');
+    const state=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const ticket=state.tickets[0],job=state.jobs.find((j:{id:string})=>j.id===first.job.id);
+    fs.writeFileSync(path.join(ticket.worktree,'source.txt'),'changed candidate\n');
+    git(ticket.worktree,'add','source.txt');git(ticket.worktree,'commit','-m','new candidate');
+    const newHead=git(ticket.worktree,'rev-parse','HEAD');
+    ticket.head=newHead;job.head=newHead;job.candidateVersion=core.candidateVersion(state,ticket);
+    fs.writeFileSync(statePath,JSON.stringify(state));
+    const changedCandidate=(()=>{const previousPath=process.env.PATH;
+      try {process.env.PATH=x.env.PATH;return rawSourcesForJob(state,ticket,job,statePath);}
+      finally {process.env.PATH=previousPath;}})();
+    assert.notEqual(changedCandidate.manifestPath,changedSource.packet.sourceArchive.manifestPath);
+    assert.equal(changedCandidate.candidate.head,newHead);
+    const changedDiff=changedCandidate.files.find(f=>f.kind==='diff');assert.ok(changedDiff);
+    assert.match(fs.readFileSync(changedDiff.archivePath,'utf8'),/changed candidate/);
+    const stalePlan=x.call('next',statePath);
+    assert.notEqual(stalePlan.status,0,'手工替换候选不能绕过原计划门禁');
+    assert.match(stalePlan.stderr,/plan-check 决策产物已过期/);
   } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
 });

@@ -97,7 +97,7 @@ TypeScript 宿主也可使用 `spec-delivery/skills.ts` 的 `invokeBoundSkill`�
 
 原 actor 已不可恢复时，宿主 `availability <nativeId> <jobId>` 必须返回 `state:"unavailable"` 的可信观测；然后 L1 可用 `context-reconstruct <state> <jobId> <reconstruction.json>`。请求包含 `decisionNativeId`、`expectedCandidateVersion` 和 `reconstructedPath`；重建 JSON 明确写 `kind:"l1_reconstructed"`、当前 job/候选、前序 job、`sourceLinks`、非空 `unknowns`、`suggestedSkills` 与理由。账本将其标为 `reconstructed`，保留原 actor 不可恢复证据。新会话在交接核验前不能启动其它绑定技能或提交结果。交接原文、核验文件及宿主观测的指纹变化会拒绝继续。
 
-fresh 首轮 packet 只传原始 spec/issue 链接、候选 head/base/worktree、仓库规范路径及原始测试/视觉证据；不传作者交接、regular 判断、辩解或历史索引。独立审查完成后再比较历史。普通 packet 只内联当前有限索引；完整历史按 `historyIndexPath` 读取。
+fresh 首轮 packet 只传原始 spec/issue 链接及缓存原件索引、候选 head/base/worktree、固定版本的仓库规范及原始测试/视觉证据；不传作者交接、regular 判断、辩解或前轮结果索引。独立审查完成后再比较历史。普通 packet 只内联当前有限结果索引；完整结果历史按 `historyIndexPath` 读取。
 
 `collect <state>` 批量收取已完成、已绑定的暂存结果，并共享一次易变事实观测。检查返回的 `rejected[]`；被拒绝的原始结果会保留，不能覆盖成成功。主控核对错误、候选和原生终态后决定恢复或重派。`stage` 的存在须来自宿主完成事件，不能靠扫描 actor 自行写出的文件判定任务完成。
 
@@ -122,6 +122,10 @@ fresh 首轮 packet 只传原始 spec/issue 链接、候选 head/base/worktree�
 `ci-attest <state> <accept-jobId> <request.json>` 仅在豁免确有依据时运行。`{"reason":"no_ci"}` 要求当前 PR 无检查、GitHub 工作流清单为空且目标分支无必需检查；`{"reason":"billing","notStartedIds":[...]}` 要求每个未启动检查的远端原文包含计费通知。返回的 `ciWaiver` 和 `ciConfigured` 原样放入当前验收回执；CLI 再核对证据属于同一 job、head/base 和最新检查。正常失败、待运行、未知或跳过都不会成为豁免。分支保护由 GitHub 合并操作继续执行；无检查和未付费账户本身不能证明豁免。若 GitHub API 不提供可核对的计费通知，保持阻断并交 L1 处理。
 
 本仓库的模拟 GitHub 用例只证明适配器契约及故障恢复；实际目标仓库的权限、保护规则和远端合并仍需在真实宿主运行时观察，不将模拟结果记为真实远端验收。
+
+`next` 为同一工单候选的实现、审查和交接相关 agent packet 建立 `raw-sources/` 原始来源归档。清单按仓库、工单、候选 `head/base`、已批准计划来源版本以及当前 spec/工单正文指纹固定；每项记录原始 URL 或 Git 对象、抓取时间、字节数、SHA-256 和归档路径。Git diff、候选提交历史和适用于改动路径的 `AGENTS.md`/`CLAUDE.md` 从固定提交读取，命中后验证归档字节并复用。每次请求仍重新读取两份 issue 正文以发现来源变化；请求失败、缓存缺失或内容损坏会使 `next` 明确失败。旧版本归档保留供审计，不能充当新候选来源。packet 的 `sourceArchive` 是原始资料索引，fresh 的 `rawSources.sourceIndex` 只包含这些原件；作者报告、regular 报告和裁决结论不进入归档。相关历史限于候选提交，不扫描无关全仓历史。
+
+来源缓存仅减少固定资料的重复物化，不能替代易变远端事实。`observe`、`guard` 及验收、合并、关闭、最终审计继续走实时 GitHub 查询；当前作者自检和技能版本门禁保持原有校验。调用次数口径：同候选同正文的再次 `next` 仍有目标状态和两次 issue 正文查询，但不再运行候选 `git diff`、`git log`、`git ls-tree` 或规范 `git show`；CLI 测试以受控 Git 命令日志核对这些调用。
 
 默认作者技能保留双轴自检。v3 的 PR 审查在 regular 和独立 fresh 两轮各执行一次固定版本的 `prReview` 绑定。默认包位于 `spec-delivery/review-skills/code-review-from-claude/`，其 `SKILL.md` 保留五视角、独立确认与 **≥50** 规则；`automation-context.md`、`automation-contract.json` 和 `observation-ledger.ts` 分别说明工作流输入/回执、必需子任务及原始观察与同义事实关联，完整包指纹写入运行账本。`pr-review` 归档原始报告与宿主终态，`review-report` 命令按稳定标记发布报告原文。核心只根据当前候选、技能版本及明确阻断结论推进；替代包可采用其它审查方法。fresh 完成后若同候选同技能版本两轮阻断结论相反，独立 L1 读取原始报告并留下裁决产物，随后仍须独立 L2 验收与 CI。CI 未配置或有证据的计费未启动才可按角色规则豁免；实际执行失败不可豁免，并回到 L3 修复。CI 仍在正常执行时保留队首、等待状态事件；长期环境阻断由 L1 对账、重规划或释放队首，不能改成通过。
 

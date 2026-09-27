@@ -37,7 +37,15 @@ function fixture(phase: 'implement' | 'integrate', withPr = false, prepareTask?:
   const bin = path.join(root, 'bin'); fs.mkdirSync(bin);
   fs.writeFileSync(path.join(bin, 'gh'), `#!/usr/bin/env node
 const fs=require('fs'),a=process.argv.slice(2);
-if(!a.includes('graphql')){console.error('unexpected gh '+a.join(' '));process.exit(2);}
+if(!a.includes('graphql')){
+  const endpoint=String(a.at(-1));
+  const number=endpoint==='repos/example/test/issues/100'?100:
+    endpoint==='repos/example/test/issues/101'?101:0;
+  if(!number){console.error('unexpected gh '+a.join(' '));process.exit(2);}
+  console.log(JSON.stringify({number,title:number===100?'Spec':'Task',body:'Actual candidate recovery source',
+    html_url:'https://github.com/example/test/issues/'+number,state:'open',assignees:[]}));
+  process.exit(0);
+}
 const base=fs.readFileSync(${JSON.stringify(targetFile)},'utf8').trim();
 const pr=fs.readFileSync(${JSON.stringify(prFile)},'utf8').trim();
 const query=a.find(x=>x.startsWith('query='))||'';

@@ -258,6 +258,17 @@ export function issue(repo: Repo, number: number): IssueFact {
   };
 }
 
+/** Editorial source only. Status, dependencies and comments remain live observations. */
+export function issueSource(repo: Repo, number: number) {
+  integer(number, 'issue number');
+  const endpoint = `${pathFor(repo)}/issues/${number}`;
+  const raw = object(api(repo, endpoint), endpoint);
+  const identity = issueIdentity(raw, repo);
+  sameRepository(identity, repo);
+  if (identity.number !== number) fail('issue source number differs from request');
+  return { number, url: identity.url, title: string(raw.title, 'issue.title'), body: nullableText(raw.body, 'issue.body') };
+}
+
 /** PR conversation comments use the issue-comments endpoint, but a PR is not an issue fact. */
 export function prComments(repo: Repo, number: number) {
   integer(number, 'PR number');

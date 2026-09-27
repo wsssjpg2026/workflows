@@ -15,6 +15,7 @@ import * as engine from './spec-delivery/core.ts';
 import * as gh from './spec-delivery/github.ts';
 import { normalizeResult, resultPaths, metrics } from './spec-delivery/host.ts';
 import { compareMetrics } from './spec-delivery/metrics.ts';
+import { rawSourcesForJob, type RawSourceIndex } from './spec-delivery/raw-sources.ts';
 import * as skills from './spec-delivery/skills.ts';
 import { summarize } from './spec-delivery/summary.ts';
 import {prepareJob as prepareZcodeJob} from './spec-delivery/adapters/zcode.mjs';
@@ -648,7 +649,7 @@ export function initialize(inputs: engine.Inputs, cwd = process.cwd()) {
     next: '宿主转发给真实 L1 会话；L1 读取来源并生成 ExecutionPlan 后调用 plan',
     resources: { cpus: os.availableParallelism(), freeMemoryBytes: os.freemem(), loadAverage: os.loadavg() } };
 }
-export function packet(s: engine.State, j: engine.Job, statePath: string) {
+export function packet(s: engine.State, j: engine.Job, statePath: string, sourceArchive?: RawSourceIndex) {
   const t = s.tickets.find(t => t.key === j.ticket);
   const disagreement=j.action==='adjudicate' && s.protocol===engine.currentProtocol && t
     ? engine.activeReviewDisagreement(s,t) : undefined;
@@ -716,10 +717,15 @@ export function packet(s: engine.State, j: engine.Job, statePath: string) {
           instruction:'按绑定的 code-review 技能分别委派 Standards 与 Spec 轴，保留两路原始结果；需要的 issue/spec 与规范来源由本 packet 提供。' }
       : null,
     objectiveEvidence: objective, prior: relevant.slice(-20), historyIndexPath: freshInitial || j.fresh && j.action !== 'review-report' ? '' : priorPath,
-    rawSources: freshInitial ? {specUrl:`https://${s.repo.host}/${s.repo.slug}/issues/${s.spec}`,
+    sourceArchive: sourceArchive || null,
+    rawSources: freshInitial || freshChild ? {specUrl:`https://${s.repo.host}/${s.repo.slug}/issues/${s.spec}`,
       issueUrl:`https://${s.repo.host}/${s.repo.slug}/issues/${t?.number || s.spec}`,
       candidate:{head:j.head,base:j.base,worktree:t?.worktree || ''},tests:t?.evidence.tests || null,
-      visual:t?.evidence.visual || null,standards:['AGENTS.md','CLAUDE.md'].map(name=>path.join(s.repo.root,name)).filter(fs.existsSync)} : null,
+      visual:t?.evidence.visual || null,
+      standards:sourceArchive ? sourceArchive.files.filter(file=>file.kind==='standard').map(file=>file.archivePath)
+        : ['AGENTS.md','CLAUDE.md'].map(name=>path.join(s.repo.root,name)).filter(fs.existsSync),
+      archivePath:sourceArchive?.manifestPath || null,
+      sourceIndex:sourceArchive?.files || []} : null,
     finding: freshInitial ? null : j.finding || null,
     dispute: freshInitial ? null : j.dispute ? Object.fromEntries(Object.entries(j.dispute).map(([key, id]) => [key, resultPaths(statePath, id).result])) : null,
     reviewDisagreement: disagreement && regular?.result && fresh?.result ? {
@@ -2361,7 +2367,12 @@ export async function main(argv: string[]): Promise<unknown> {
         if (j.action === 'implement') ensureDecisionArtifacts(s, engine.ticket(s, j.ticket), 'plan-check');
         const record = s.v3?.dispatchRecords.find(d => d.jobId === j.id);
         if (j.executor === 'agent' && s.protocol === engine.currentProtocol) j.dispatchToken ||= record?.token || randomUUID();
-        const p = packet(s, j, statePath); const file = path.join(path.dirname(statePath), 'packets', sha(j.id).slice(0, 20) + '.json'); write(file, p);
+        const sourceTicket=s.tickets.find(t=>t.key===j.ticket);
+        const sourceArchive=j.executor==='agent' && sourceTicket?.worktree &&
+          ['implement','author-review','pr-review','review-lens','skill-child','replan','integrate','accept'].includes(j.action)
+          ? rawSourcesForJob(s,sourceTicket,j,statePath) : undefined;
+        const p = packet(s, j, statePath, sourceArchive);
+        const file = path.join(path.dirname(statePath), 'packets', sha(j.id).slice(0, 20) + '.json'); write(file, p);
         if (j.executor === 'agent' && s.protocol === engine.currentProtocol && !record) {
           const requestPath = path.join(path.dirname(statePath), 'dispatch', `${sha(j.id).slice(0, 20)}.json`);
           const previous = s.jobs.find(x=>x.id===j.contextIntent?.predecessorJobId || x.id===j.contextIntent?.parentJobId);

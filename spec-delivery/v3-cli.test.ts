@@ -1453,6 +1453,7 @@ test('批准计划到 implement 内嵌双轴作者自检只采纳一次，并生
     const head=git(worktree,'rev-parse','HEAD');
     x.env.DSH_HOME=path.join(x.temp,'controller-home');
     x.env.DSH_SESSION_ID='controller-session';
+    x.env.DSH_SHELL='controller-shell';
     x.env.DSH_ADAPTER_WORKER='1';
     x.env.DSH_PERMISSION_MODE='controller-mode';
     x.env.DSH_APP_HINT='retained';
@@ -1871,7 +1872,8 @@ test('单账本 v3 组合回放：依赖、并行实现、独立审查、补充�
       SPEC_DELIVERY_HOST_ADAPTER:path.join(x.temp,'bin','combined-host'),
       SPEC_DELIVERY_SKILL_OBSERVER:path.join(x.temp,'bin','combined-skill-observer'),
       DSH_HOME:path.join(x.temp,'controller-home'),DSH_SESSION_ID:'controller-session',
-      DSH_ADAPTER_WORKER:'1',DSH_PERMISSION_MODE:'controller-mode',DSH_APP_HINT:'inherited'});
+      DSH_SHELL:'controller-shell',DSH_ADAPTER_WORKER:'1',DSH_PERMISSION_MODE:'controller-mode',
+      DSH_APP_HINT:'inherited'});
     const remote=()=>JSON.parse(fs.readFileSync(remotePath,'utf8'));
     const updateRemote=(mutate:(value:ReturnType<typeof remote>)=>void)=>{
       const value=remote();mutate(value);fs.writeFileSync(remotePath,JSON.stringify(value));

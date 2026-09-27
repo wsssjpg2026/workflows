@@ -29,7 +29,7 @@ const recovering = (s: engine.State, j: engine.Job) => s.tickets.some(t => t.key
 const sha = (x: string | Buffer) => createHash('sha256').update(x).digest('hex');
 function testCommandEnv(explicit?:Record<string,string>) {
   const inherited={...process.env};
-  const controllerKeys=new Set(['DSH_HOME','DSH_SESSION_ID','DSH_ADAPTER_WORKER','DSH_PERMISSION_MODE']);
+  const controllerKeys=new Set(['DSH_HOME','DSH_SESSION_ID','DSH_SHELL','DSH_ADAPTER_WORKER','DSH_PERMISSION_MODE']);
   for(const name of Object.keys(inherited))
     if(name.startsWith('SPEC_DELIVERY_')||controllerKeys.has(name))delete inherited[name];
   return {...inherited,...explicit};

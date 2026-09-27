@@ -940,40 +940,48 @@ test('批量 collect 每项重查资格：首个回执触发 recovery 后跳过�
     for(const job of [...children,independent]) {
       assert.equal(h.call('dispatch',statePath,job.id).status,'running');
     }
-    const ordered=JSON.parse(fs.readFileSync(statePath,'utf8'));
-    const ids=[h.parentJob.id,...children.map((j:{id:string})=>j.id),independent.id];
-    // Preserve all public CLI-created records; vary only their order to exercise
-    // the legitimate batch sequence parent → same-ticket siblings → independent ticket.
-    ordered.v3.dispatchRecords.sort((a:{jobId:string},b:{jobId:string})=>
-      ids.indexOf(a.jobId)-ids.indexOf(b.jobId));
-    fs.writeFileSync(statePath,JSON.stringify(ordered));
-    const managed=ordered.v3.dispatchRecords.filter((d:{managed?:boolean})=>d.managed);
-    assert.deepEqual(managed.map((d:{jobId:string})=>d.jobId),ids);
-    const tokens=new Map(managed.map((d:{jobId:string;token:string})=>[d.jobId,d.token]));
-    const siblingEvents=children.map((j:{id:string})=>ordered.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===j.id).events.length);
-    const ticket=ordered.tickets.find((t:{key:string})=>t.key==='101');
-    fs.appendFileSync(path.join(ticket.worktree,'source.txt'),'uncommitted candidate work\n');
     const checks=path.join(x.temp,'cross-ticket-checks.json');
     fs.writeFileSync(checks,JSON.stringify({scopeReason:'Independent ticket acceptance',
       commands:[{name:'smoke',argv:['true'],timeoutSeconds:5}]}));
+    const first=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const firstToken=first.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===independent.id).token;
+    h.host.set(db=>{
+      db.actors[firstToken].state='completed';
+      db.actors[firstToken].result={complete:true,status:'planned',evidencePath:x.planEvidence,
+        data:{planPath:x.planPath,checksPath:checks}};
+    });
+    assert.equal(h.call('collect',statePath,independent.id).polled[0].status,'completed');
+    const independentCheck=h.call('next',statePath).jobs.find((j:{ticket:string;action:string})=>
+      j.ticket==='102'&&j.action==='plan-check');
+    assert.ok(independentCheck);
+    assert.equal(h.call('dispatch',statePath,independentCheck.id).status,'running');
+    const ordered=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const ids=[h.parentJob.id,...children.map((j:{id:string})=>j.id),independentCheck.id];
+    const collectable=ordered.v3.dispatchRecords.filter((d:{managed?:boolean;jobId:string})=>
+      d.managed && ordered.jobs.some((j:{id:string;status:string})=>j.id===d.jobId&&['leased','running'].includes(j.status)));
+    assert.deepEqual(collectable.map((d:{jobId:string})=>d.jobId),ids);
+    const tokens=new Map(collectable.map((d:{jobId:string;token:string})=>[d.jobId,d.token]));
+    const siblingEvents=children.map((j:{id:string})=>ordered.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===j.id).events.length);
+    const ticket=ordered.tickets.find((t:{key:string})=>t.key==='101');
+    fs.appendFileSync(path.join(ticket.worktree,'source.txt'),'uncommitted candidate work\n');
     h.host.set(db=>{
       db.actors[tokens.get(h.parentJob.id)].state='completed';
       db.actors[tokens.get(h.parentJob.id)].result={complete:true,status:'implemented',evidencePath:x.planEvidence};
-      db.actors[tokens.get(independent.id)].state='completed';
-      db.actors[tokens.get(independent.id)].result={complete:true,status:'planned',evidencePath:x.planEvidence,
-        data:{planPath:x.planPath,checksPath:checks}};
+      db.actors[tokens.get(independentCheck.id)].state='completed';
+      db.actors[tokens.get(independentCheck.id)].result={complete:true,status:'pass',evidencePath:x.planEvidence};
     });
     const collected=h.call('collect',statePath);
-    assert.deepEqual(collected.polled.map((p:{jobId:string})=>p.jobId),[h.parentJob.id,independent.id]);
+    assert.deepEqual(collected.polled.map((p:{jobId:string})=>p.jobId),[h.parentJob.id,independentCheck.id]);
     assert.equal(collected.polled[0].status,'uncertain');
     assert.equal(collected.polled[1].status,'completed');
     const after=JSON.parse(fs.readFileSync(statePath,'utf8'));
     assert.equal(after.tickets.find((t:{key:string})=>t.key==='101').phase,'recovery');
-    assert.equal(after.jobs.find((j:{id:string})=>j.id===independent.id).status,'done');
+    assert.equal(after.jobs.find((j:{id:string})=>j.id===independentCheck.id).status,'done');
     for(const [index,child] of children.entries())
       assert.equal(after.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===child.id).events.length,siblingEvents[index]);
     for(const token of tokens.values())
       assert.equal(h.host.get().startTokens.filter((started:string)=>started===token).length,1);
+    assert.equal(h.host.get().startTokens.filter((started:string)=>started===firstToken).length,1);
   } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
 });
 

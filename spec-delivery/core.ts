@@ -31,7 +31,7 @@ export interface ProtocolV3 {
   skillInvocations: SkillInvocation[];
   skillMigrations?: { at: string; evidencePath: string;
     changes: { capability: SkillCapability; previousFingerprint: string; nextFingerprint: string }[] }[];
-  dispatchRecords: Record<string, Json>[];
+  dispatchRecords: DispatchRecord[];
 }
 export function initialProtocolV3(): ProtocolV3 {
   return { executionPath: 'legacy-v02', decisionRecords: [], skillInvocations: [], dispatchRecords: [] };
@@ -42,6 +42,21 @@ export interface Capabilities { framework: string; mainModel?: string; modelRout
 export interface NativeSession {
   source: 'native_host'; observationId: string; jobId: string; nativeId: string; provider: string; model: string;
   observedAt: string; evidencePath: string; evidenceDigest: string;
+}
+export interface HostEventRef { kind: 'start' | 'query' | 'collect' | 'cancel' | 'capabilities' | 'error'; evidencePath: string; digest: string; at: string }
+export interface HostInstanceRecord {
+  key: string; nativeId: string | null; state: 'requested' | 'running' | 'completed' | 'cancelled' | 'unknown';
+  session?: NativeSession; firstSeenAt: string; lastSeenAt: string; events: HostEventRef[];
+  startedAt?: string; completedAt?: string; cancelledAt?: string; rawUsage?: Json; bindingError?: string;
+}
+export interface DispatchRecord {
+  jobId: string; attempt: number; token: string; targetHost: string; requestedModel: string;
+  packetPath: string; requestPath: string; requestDigest: string;
+  status: 'prepared' | 'starting' | 'running' | 'completed' | 'uncertain' | 'cancelled';
+  createdAt: string; updatedAt: string; nativeId?: string; uncertainty?: string;
+  /** A live CLI process owns the host round trip; a dead PID is recovered by querying the token. */
+  operationPid?: number; managed?: boolean;
+  events: HostEventRef[]; instances: HostInstanceRecord[];
 }
 export interface L1DecisionRecord {
   id: string; kind: 'execution-plan' | 'ticket-plan' | 'plan-check' | 'replan' | 'adjudication' | 'spec-audit' | 'resolve';
@@ -126,6 +141,7 @@ export interface Job {
   tier: Tier; model: string; executor: 'agent' | 'main' | 'command'; fresh: boolean; contextKey: string;
   head: string; base: string; tests: number; status: 'leased' | 'running' | 'done' | 'cancelled';
   nativeId: string; result?: Result; finding?: Finding;
+  dispatchToken?: string;
   inputVersion?: string; candidateVersion?: string; session?: NativeSession; decisionArtifactDigest?: string; decisionArtifactFiles?: string[];
   timing?: { leasedAt: string; boundAt?: string; startedAt?: string; resultAt?: string; completedAt?: string; cancelledAt?: string };
   usage?: { inputTokens?: number; outputTokens?: number; cost?: number; currency?: string; modelMs?: number };

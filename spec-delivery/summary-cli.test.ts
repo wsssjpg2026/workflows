@@ -30,7 +30,7 @@ const job = (id: string, status: e.Job['status'], executor: e.Job['executor'] = 
 });
 
 /** 最小但完整的合法账本；`protocol: undefined` 表示无 protocol 字段的旧账本。 */
-function ledger(status: e.State['status'], protocol: 2 | undefined): e.State {
+function ledger(status: e.State['status'], protocol: 2 | 3 | undefined): e.State {
   const state: e.State = {
     schema: 1, protocol, id: 'summary-cli-fixture', revision: 7,
     inputs: { spec: 12, targetBranch: 'codex/test-deepseek-harness', models: { L1: 'large', L2: 'middle', L3: 'small' } },
@@ -44,7 +44,8 @@ function ledger(status: e.State['status'], protocol: 2 | undefined): e.State {
     auditEpoch: 1, validationOwner: '14',
     events: [{ revision: 7, message: 'fixture', at: '2026-01-01T00:00:00.000Z' }],
   };
-  if (protocol === undefined) delete (state as { protocol?: 2 }).protocol;
+  if (protocol === 3) state.v3 = e.initialProtocolV3();
+  if (protocol === undefined) delete state.protocol;
   return state;
 }
 
@@ -89,8 +90,8 @@ function spawnLiveHolder(): { pid: number; stop: () => void } {
   return { pid: child.pid, stop: () => { try { child.kill('SIGKILL'); } catch { /* 已退出 */ } } };
 }
 
-test('protocol:2 账本：退出 0、stdout 恰为 summarize 的单个 JSON 对象、零副作用', () => {
-  const state = ledger('running', 2);
+test('protocol:3 账本：退出 0、stdout 恰为 summarize 的单个 JSON 对象、零副作用', () => {
+  const state = ledger('running', 3);
   const f = setup('running', JSON.stringify(state, null, 2) + '\n');
   try {
     const before = digest(f.dir);
@@ -374,7 +375,7 @@ test('help 的 commands 列出 summary <state.json>，version 行为不变', () 
     const parsed = JSON.parse(help.stdout);
     assert.ok(Array.isArray(parsed.commands), 'help.commands 不是数组');
     assert.ok(parsed.commands.includes('summary <state.json>'), `help.commands 缺少 summary：${help.stdout}`);
-    assert.equal(parsed.version, '0.2.0', 'version 号被改动');
+    assert.equal(parsed.version, '0.3.0', 'version 号被改动');
     const version = f.call('version');
     assert.equal(version.status, 0, version.stderr);
     assert.equal(JSON.parse(version.stdout).version, parsed.version);
@@ -398,6 +399,9 @@ test('同族只读命令 inspect/metrics 对同一 fixture 行为不变，且不
   const state = ledger('running', 2);
   const f = setup('readonly-peers', JSON.stringify(state, null, 2) + '\n');
   try {
+    const lock = f.statePath + '.lock';
+    fs.mkdirSync(lock);
+    fs.writeFileSync(path.join(lock, 'owner.json'), JSON.stringify({ pid: 2147483647, host: os.hostname() }));
     const before = digest(f.dir);
     const inspect = f.call('inspect', f.statePath);
     assert.equal(inspect.status, 0, `inspect 退出码非 0；stderr=${inspect.stderr}`);
@@ -410,6 +414,7 @@ test('同族只读命令 inspect/metrics 对同一 fixture 行为不变，且不
     assert.deepEqual(parsed.byStatus, { leased: 2, running: 1, done: 1, cancelled: 1 });
     assert.equal(fs.readFileSync(f.statePath, 'utf8'), JSON.stringify(state, null, 2) + '\n', 'inspect/metrics 改写了状态文件');
     assert.equal(digest(f.dir), before, 'inspect/metrics 在 fixture 目录留下新增或改动');
+    assert.equal(fs.existsSync(lock + '.recovery'), false, 'inspect/metrics 不应尝试恢复状态锁');
     assert.equal(calls(f), '');
   } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
 });

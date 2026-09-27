@@ -16,7 +16,7 @@ function setup() {
   fs.mkdirSync(path.join(root,'.agents','worktrees'),{recursive:true});const wt=path.join(root,'.agents','worktrees','task');git(root,'worktree','add','-b','task',wt,head);
   fs.appendFileSync(path.join(root,'.git','info','exclude'),'\n/.agents/\n/bin/\n/evidence.md\n/plan.json\n');
   const run=path.join(root,'.agents','workflow-runs','test');fs.mkdirSync(run,{recursive:true});const statePath=path.join(run,'state.json');
-  const s:e.State={schema:1,protocol:2,id:'cli-fixture',revision:0,inputs:{spec:100,targetBranch:'main',models:{L1:'large',L2:'middle',L3:'small'}},spec:100,repo:{root,slug:'example/test',host:'github.com',defaultBranch:'main'},status:'running',policy:{agents:8,issues:3,tests:1,noProgress:3,rounds:4},tickets:[],jobs:[],specCriteria:['done'],planEvidence:'',auditEpoch:1,events:[],facts:{base:head,issueStates:{100:'OPEN',101:'OPEN'},prs:{},at:''}};
+  const s:e.State={schema:1,protocol:3,v3:e.initialProtocolV3(),id:'cli-fixture',revision:0,inputs:{spec:100,targetBranch:'main',models:{L1:'large',L2:'middle',L3:'small'}},spec:100,repo:{root,slug:'example/test',host:'github.com',defaultBranch:'main'},status:'running',policy:{agents:8,issues:3,tests:1,noProgress:3,rounds:4},tickets:[],jobs:[],specCriteria:['done'],planEvidence:'',auditEpoch:1,events:[],facts:{base:head,issueStates:{100:'OPEN',101:'OPEN'},prs:{},at:''}};
   const t=e.buildTicket({number:101,kind:'software',dependencies:[],criteria:['done'],visual:false},head);t.phase='plan';t.head=head;t.branch='task';t.worktree=wt;s.tickets.push(t);
   const j=e.reserve(s)[0];fs.writeFileSync(statePath,JSON.stringify(s));
   fs.mkdirSync(path.join(root,'bin'));const log=path.join(run,'gh.log');
@@ -63,12 +63,12 @@ test('临时测试配额保留失败证据并释放，模型切换保留已经�
 });
 test('旧运行必须对账迁移，保留旧结果并重新排队未完成审查；退役后不能复活',()=>{
   const x=setup();try {
-    delete x.s.protocol;x.j.status='done';x.j.result={model:x.j.model,complete:true,status:'planned',evidencePath:path.join(x.root,'evidence.md')};
+    delete x.s.protocol;delete x.s.v3;x.j.status='done';x.j.result={model:x.j.model,complete:true,status:'planned',evidencePath:path.join(x.root,'evidence.md')};
     x.t.phase='fresh';x.t.evidence.regular={head:x.head,base:x.head,path:'old-review'};fs.writeFileSync(x.statePath,JSON.stringify(x.s));
     assert.notEqual(x.call('next',x.statePath).status,0);
     const proof=path.join(x.run,'proof.json');fs.writeFileSync(proof,JSON.stringify({evidencePath:path.join(x.root,'evidence.md'),reason:'run replaced'}));
     const upgrade=x.call('upgrade',x.statePath,proof);assert.equal(upgrade.status,0,upgrade.stderr);
-    const saved=JSON.parse(fs.readFileSync(x.statePath,'utf8'));assert.equal(saved.protocol,2);assert.equal(saved.tickets[0].phase,'queued');assert.deepEqual(saved.tickets[0].evidence,{});assert.equal(saved.jobs[0].result.status,'planned');
+    const saved=JSON.parse(fs.readFileSync(x.statePath,'utf8'));assert.equal(saved.protocol,3);assert.equal(saved.v3.executionPath,'legacy-v02');assert.equal(saved.tickets[0].phase,'queued');assert.deepEqual(saved.tickets[0].evidence,{});assert.equal(saved.jobs[0].result.status,'planned');
     assert.equal(x.call('retire',x.statePath,proof).status,0);
     for(const operation of ['next','resume','resolve'])assert.notEqual(x.call(operation,x.statePath,proof).status,0);
     assert.equal(x.call('inspect',x.statePath).status,0);
@@ -121,7 +121,7 @@ else console.log(JSON.stringify({number:100,html_url:'https://github.com/example
 });
 test('旧协议的已完成 agent 可以先登记原结果再升级，无需伪造停止',()=>{
   const x=setup();try {
-    delete x.s.protocol;e.bind(x.s,x.j.id,{nativeId:'old-run/planner',model:x.j.model});fs.writeFileSync(x.statePath,JSON.stringify(x.s));
+    delete x.s.protocol;delete x.s.v3;e.bind(x.s,x.j.id,{nativeId:'old-run/planner',model:x.j.model});fs.writeFileSync(x.statePath,JSON.stringify(x.s));
     const result=path.join(x.run,'legacy-result.json');fs.writeFileSync(result,JSON.stringify({model:x.j.model,complete:true,status:'planned',evidencePath:path.join(x.root,'evidence.md'),head:x.j.head,base:x.j.base,data:{planPath:path.join(x.root,'plan.json'),checksPath:path.join(x.root,'plan.json')}}));
     const submitted=x.call('submit',x.statePath,x.j.id,result);assert.equal(submitted.status,0,submitted.stderr);
     const proof=path.join(x.run,'proof.json');fs.writeFileSync(proof,JSON.stringify({evidencePath:path.join(x.root,'evidence.md')}));

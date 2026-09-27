@@ -4,6 +4,10 @@
 
 运行环境：Node.js 24+、Git、已授权的 `gh`，以及能执行命令、读写文件、选择指定模型并查询任务状态的 agent 宿主。核心维护依赖、队列、资源与证据门禁；模型由宿主真实调用。退出主会话不会自行唤醒后台模型。
 
+## v0.3 过渡范围
+
+`version` 报告 `0.3.0`。新建运行写入协议 `3`，summary 继续输出独立的 `schemaVersion: 1`。协议 3 先复用现有软件交付阶段，并在账本的 `v3` 命名空间预留决策、技能调用和派发记录；空集合不代表这些能力已执行或取得证据。当前阶段仍使用下文的旧审查和宿主流程，分离式决策、可插拔技能与持久派发由后续工单逐项接入。此仓库的开发候选不会自动更新正式安装版。
+
 ## 启动只需五项
 
 在目标仓库中向实际使用 L1 的主 agent 说明：
@@ -104,7 +108,7 @@
 
 确定性命令先保存结果再提交状态。同一 job 的命令进程已退出且结果存在时，`execute/drive` 使用原结果恢复；不会重跑已完成验证。认领使用预期基线 SHA 创建 branch/worktree，并用稳定评论标记对账。若命令退出但没有结果，`drive` 返回 `recoveryRequired`；L1 先确认其子进程和不确定远端动作，再用上述 recover 对账授权恢复。锁等待有界；锁的恢复者自身异常退出时，L1 核对 `.lock.recovery` 的持有者后恢复，不能删仍在使用的锁。
 
-旧版运行可以直接 `inspect/metrics/summary`，也可用 `bind/stage/collect/submit` 登记原租约已经完成的结果；继续新派发前先对账并排空在途任务，再执行 `upgrade <state> <evidence.json>`，内容为 `{evidencePath}`。迁移保留全部原结果和已完成工单，未完成验证从队列重新获取证据，不混用旧版部分审查。查看已完成的历史运行无需迁移。
+旧版运行（无 `protocol` 或协议 `2`）可以直接 `inspect/metrics/summary`，也可用 `bind/stage/collect/submit` 登记原租约已经完成的结果；新派发由版本门禁拒绝。继续派发前先对账并排空在途任务，再显式执行 `upgrade <state> <evidence.json>`，内容为 `{evidencePath}`。命令先把原账本逐字节备份到返回的 `backupPath`，再迁移到协议 `3`；保留原结果与已完成工单，未完成验证从队列重新获取证据，不混用旧版部分审查。`paused` 和 `waiting_human` 状态保持原样，退役运行不能升级或复活。查看历史运行无需迁移；未知协议会明确报错。
 
 `reconfigure <state> <models.json>` 在无在途任务时调整路由，文件为 `{models,capabilities,evidencePath}`；保留已完成任务的原模型与证据，仅新派发使用新模型。`retire <state> <reason.json>` 需要 `{reason,evidencePath}`，要求已停止所有任务；保留证据和未交付资源，常规调度无法复活它。
 

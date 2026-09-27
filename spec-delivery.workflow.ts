@@ -18,7 +18,7 @@ import { summarize } from './spec-delivery/summary.ts';
 export * from './spec-delivery/core.ts';
 
 const home = path.dirname(fileURLToPath(import.meta.url));
-export const workflowVersion = '0.2.0';
+export const workflowVersion = '0.3.0';
 const rolesPath = path.join(home, 'spec-delivery', 'roles.md');
 const active = (j: engine.Job) => j.status === 'leased' || j.status === 'running';
 const sha = (x: string) => createHash('sha256').update(x).digest('hex');
@@ -37,10 +37,25 @@ function git(root: string, ...argv: string[]) { return command(root, 'git', argv
 function safeFile(file: string) { engine.ensure(file && fs.statSync(file).isFile(), `工件不存在：${file}`); return file; }
 function localHead(t: engine.Ticket) { return git(t.worktree, 'rev-parse', 'HEAD'); }
 function clean(t: engine.Ticket) { return git(t.worktree, 'status', '--porcelain') === ''; }
-function allowCompletion(s: engine.State) { engine.ensure(s.status !== 'retired', '已退役运行不能接收执行结果'); }
+function supportedLedger(s: engine.State) {
+  engine.ensure(s.schema === 1, '不支持的状态版本');
+  engine.ensure(s.protocol === undefined || s.protocol === 2 || s.protocol === engine.currentProtocol,
+    `不支持的运行协议：${String(s.protocol)}`);
+  if (s.protocol === engine.currentProtocol) {
+    engine.ensure(s.v3?.executionPath === 'legacy-v02' && Array.isArray(s.v3.decisionRecords) &&
+      Array.isArray(s.v3.skillInvocations) && Array.isArray(s.v3.dispatchRecords),
+      '运行协议 3 缺少过渡执行路径或记录边界');
+  }
+}
+function allowCompletion(s: engine.State) {
+  supportedLedger(s);
+  engine.ensure(s.status !== 'retired', '已退役运行不能接收执行结果');
+}
 function requireProtocol(s: engine.State) {
-  engine.ensure(s.protocol === 2, '旧版运行须先核对并停止在途任务，再执行 upgrade；inspect/metrics/summary 可直接读取');
+  supportedLedger(s);
   engine.ensure(s.status !== 'retired', '运行已退役；只允许 inspect/metrics/summary，保留账本和资源');
+  engine.ensure(s.protocol === engine.currentProtocol,
+    '旧版运行须先核对并停止在途任务，再执行 upgrade 迁移到协议 3；inspect/metrics/summary 可直接读取');
 }
 function lock(file: string) {
   const dir = file + '.lock';
@@ -127,7 +142,8 @@ function summarizeLedger(statePath: string) {
     if (error instanceof SyntaxError) throw new Error(`状态文件不是合法 JSON：${(error as Error).message}`);
     throw new Error(`状态文件不可读：${statePath}；${(error as Error).message}`);
   }
-  engine.ensure(isRecord(raw) && raw.schema === 1, '不支持的状态版本');
+  engine.ensure(isRecord(raw), '不支持的状态版本');
+  supportedLedger(raw as unknown as engine.State);
   return summarize(ensureSummaryShape(raw as Record<string, unknown>));
 }
 export function observe(s: engine.State, jobs?: engine.Job[]): engine.LiveFacts {
@@ -178,15 +194,20 @@ export function initialize(inputs: engine.Inputs, cwd = process.cwd()) {
   const file = path.join(repo.root, '.agents', 'workflow-runs', `spec-${spec}-${sha(inputs.targetBranch).slice(0, 8)}`, 'state.json');
   if (fs.existsSync(file)) {
     const prior = read<engine.State>(file);
+    supportedLedger(prior);
     engine.ensure(prior.status!=='retired','该运行已明确退役，不能由 init 自动复活；保留账本和资源');
     engine.ensure(JSON.stringify(prior.inputs.models) === JSON.stringify(inputs.models), '已有运行使用其他模型；先核对/停止旧任务后再重新配置，避免重复派发');
-    return { statePath: file, resumed: true, next: 'inspect 后实时 reconcile；不得重新认领已有任务' };
+    return { statePath: file, resumed: true, protocol: prior.protocol ?? 1,
+      migrationRequired: prior.protocol !== engine.currentProtocol,
+      next: prior.protocol === engine.currentProtocol
+        ? 'inspect 后实时 reconcile；不得重新认领已有任务'
+        : '旧运行只读；继续派发前先对账、停止在途任务并显式 upgrade' };
   }
   const parent = gh.issue(repo, spec), children = gh.subIssues(repo, spec);
   engine.ensure(parent.state === 'OPEN', '目标 spec 已关闭'); engine.ensure(children.length, '目标 spec 尚无可读取的既有 sub-issues');
   const base = gh.targetHead(repo, inputs.targetBranch);
   excludeRuntime(repo.root);
-  const s: engine.State = { schema: 1, protocol: 2, id: randomUUID(), revision: 0, inputs, spec, repo, status: 'planning', tickets: [], jobs: [],
+  const s: engine.State = { schema: 1, protocol: engine.currentProtocol, v3: engine.initialProtocolV3(), id: randomUUID(), revision: 0, inputs, spec, repo, status: 'planning', tickets: [], jobs: [],
     specCriteria: [], planEvidence: '', auditEpoch: 1, events: [],
     facts: { base, issueStates: Object.fromEntries([parent, ...children].map(i => [String(i.number), i.state])), prs: {}, at: new Date().toISOString() } };
   engine.event(s, '读取当前仓库和既有 spec/sub-issues；等待 L1 主 agent 制定执行安排');
@@ -551,9 +572,14 @@ export async function main(argv: string[]): Promise<unknown> {
   if (!op || op === 'help') return { workflow: 'spec-delivery', input: ['spec', 'targetBranch', 'models.L1', 'models.L2', 'models.L3'],
     version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan <state> <plan.json>', 'drive <state>', 'next <state>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'stage <state> <jobId> <result-json>', 'collect <state>', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'test <state> <jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'metrics <state>', 'resume <state>', 'zcode <state>'] };
   engine.ensure(file, '缺少输入文件/状态路径');
-  // summary 在 lock() 之前返回：既不创建/等待/恢复/删除状态锁，也不进入任何写路径或协议门禁。
+  // summary 在 lock() 之前返回：只验证可读协议，不创建/等待/恢复/删除状态锁，也不进入写路径。
   if (op === 'summary') return summarizeLedger(path.resolve(file));
   if (op === 'init') return initialize(read<engine.Inputs>(file));
+  // 历史读取不触发锁恢复、GitHub 观测或状态写入。
+  if (op === 'inspect' || op === 'metrics') {
+    const state = read<engine.State>(path.resolve(file)); supportedLedger(state);
+    return op === 'inspect' ? { ...state, rolesPath } : metrics(state);
+  }
   if (op === 'execute') { engine.ensure(extra, '需要 command jobId'); return executeCommand(path.resolve(file), extra); }
   if (op === 'test') {engine.ensure(extra && fourth,'需要 jobId 与测试请求文件');return runTest(path.resolve(file),extra,read(fourth));}
   if (op === 'stage') {
@@ -580,14 +606,15 @@ export async function main(argv: string[]): Promise<unknown> {
   }
   const statePath = path.resolve(file), release = lock(statePath);
   try {
-    const s = read<engine.State>(statePath); engine.ensure(s.schema === 1, '不支持的状态版本');
-    if (op === 'inspect') return { ...s, rolesPath };
-    if (op === 'metrics') return metrics(s);
+    const s = read<engine.State>(statePath); supportedLedger(s);
     engine.ensure(s.status !== 'retired', '已退役运行只允许 inspect/metrics/summary，不能自动复活');
     if (op === 'upgrade') {
       engine.ensure(extra && !s.jobs.some(active), '升级前先对账并确认所有在途任务已停止或完整提交');
       const proof=read<{evidencePath:string}>(extra);safeFile(proof.evidencePath);
-      if(s.protocol===2)return {statePath,status:s.status,upgraded:false};
+      if(s.protocol===engine.currentProtocol)return {statePath,status:s.status,upgraded:false};
+      const backup = path.join(path.dirname(statePath), 'migrations', `pre-v3-${randomUUID()}.json`);
+      fs.mkdirSync(path.dirname(backup), {recursive:true});
+      fs.copyFileSync(statePath, backup, fs.constants.COPYFILE_EXCL);
       // 老轮次的确认 ID 与分组方法不同，不混用部分 regular/fresh 通过结果。
       for(const t of s.tickets) if(['self','verify','publish','review','fresh','accept','merge','integrate'].includes(t.phase) || t.reason==='waiting_ci') {
         t.phase='queued';t.epoch++;t.evidence={};t.reason='旧运行已迁移；从队首重新验证候选';
@@ -597,9 +624,9 @@ export async function main(argv: string[]): Promise<unknown> {
         if(!fs.existsSync(output))write(output,j.result);
       }
       if(s.status!=='complete'){s.specAudit=undefined;s.auditEpoch++;}
-      s.validationOwner=undefined;s.protocol=2;
-      engine.event(s,`迁移为运行协议 2；保留全部原结果和已完成工单。对账依据：${proof.evidencePath}`);
-      save(statePath,s);return {statePath,status:s.status,upgraded:true};
+      s.validationOwner=undefined;s.protocol=engine.currentProtocol;s.v3=engine.initialProtocolV3();
+      engine.event(s,`迁移为运行协议 3；原账本备份：${backup}；保留全部原结果和已完成工单。对账依据：${proof.evidencePath}`);
+      save(statePath,s);return {statePath,status:s.status,upgraded:true,backupPath:backup};
     }
     if(!['bind','submit','reconcile','retire'].includes(op))requireProtocol(s);
     if (op === 'zcode') return renderZcode(s, statePath);
@@ -667,7 +694,7 @@ export async function main(argv: string[]): Promise<unknown> {
         if (observation.state === 'stopped' || observation.state === 'lost') {
           engine.ensure(!j.testExecution || !processAlive(j.testExecution.pid),'测试进程仍在运行，不能释放预算');
           engine.ensure(!j.testExecution || observation.processTreeStopped===true,'中断测试须核对整个进程树');
-          if(j.executor!=='agent' && /^command:\d+:/.test(j.nativeId) && s.protocol===2) {
+          if(j.executor!=='agent' && /^command:\d+:/.test(j.nativeId) && s.protocol!==undefined) {
             engine.ensure(!processAlive(Number(j.nativeId.split(':')[1])) && observation.processTreeStopped===true,'命令恢复须确认父进程与整个进程树已停止');
             if(observation.commandDisposition==='recover') {
               j.commandRecovery={nativeId:j.nativeId,evidencePath:observation.evidencePath,at:new Date().toISOString()};
@@ -683,7 +710,7 @@ export async function main(argv: string[]): Promise<unknown> {
         // completed 必须读取并提交原结果，不重做外部动作；running 保留原租约。
       }
       const observed=observe(s);
-      if(s.protocol===2)engine.reconcileFacts(s,observed);else s.facts=observed;
+      if(s.protocol!==undefined)engine.reconcileFacts(s,observed);else s.facts=observed;
       engine.event(s, '实时核对宿主、GitHub 和候选；没有将 journal 回放当作新验证');
     } else if (op === 'resolve') {
       engine.ensure(extra, '需要 L1 根据已取得事实生成的解除阻塞决定');

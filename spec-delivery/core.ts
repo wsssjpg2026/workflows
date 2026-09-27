@@ -3,6 +3,20 @@ import { createHash } from 'node:crypto';
 export type Tier = 'L1' | 'L2' | 'L3';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export interface Inputs { spec: number | string; targetBranch: string; models: Record<Tier, string> }
+export const currentProtocol = 3;
+/**
+ * v3 的持久扩展点。现阶段仍执行 v0.2 软件交付阶段；这些空集合只是以后
+ * 决策、技能调用和派发记录的独立命名空间，不构成已取得执行证据。
+ */
+export interface ProtocolV3 {
+  executionPath: 'legacy-v02';
+  decisionRecords: Record<string, Json>[];
+  skillInvocations: Record<string, Json>[];
+  dispatchRecords: Record<string, Json>[];
+}
+export function initialProtocolV3(): ProtocolV3 {
+  return { executionPath: 'legacy-v02', decisionRecords: [], skillInvocations: [], dispatchRecords: [] };
+}
 export interface Policy { agents: number; issues: number; tests: number; noProgress: number; rounds: number }
 export interface Capabilities { framework: string; mainModel: string; modelRouting: 'per_agent' | 'per_run'; models: string[] }
 export interface Finding {
@@ -58,7 +72,8 @@ export interface Job {
 }
 export interface State {
   schema: 1; id: string; revision: number; inputs: Inputs; spec: number;
-  protocol?: 2;
+  protocol?: 2 | 3;
+  v3?: ProtocolV3;
   repo: { root: string; slug: string; host: string; defaultBranch: string };
   status: 'planning' | 'running' | 'waiting_human' | 'blocked' | 'complete' | 'paused' | 'retired';
   policy?: Policy; capabilities?: Capabilities; specCriteria: string[]; planEvidence: string;

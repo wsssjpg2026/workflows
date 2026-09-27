@@ -2,8 +2,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { candidateVersion, ensure, event, currentProtocol, verifyNativeSession, type Job, type SkillBinding, type SkillCapability,
-  type SkillInvocation, type SkillMode, type SkillResult, type SkillStatus, type State } from './core.ts';
+  inputVersion, type SkillChildRequest, type Tier, type SkillInvocation, type SkillMode, type SkillResult, type SkillStatus, type State } from './core.ts';
 
 const digest = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex');
 const capabilities: SkillCapability[] = ['implementation', 'diagnosis', 'authorReview', 'prReview', 'handoff'];
@@ -78,6 +79,168 @@ export interface SkillSourceBundle {
 }
 export interface PreparedSkillCall { invocation: SkillInvocation; source: SkillSourceBundle; nativeEntry?: string; alreadyStarted: boolean }
 
+export interface SkillChildSpec {
+  key: string; instruction: string; tier: Tier; required?: boolean; independent?: boolean;
+  skillCapability?: SkillCapability; head?: string;
+}
+function activeParent(s: State, invocationId: string) {
+  ensure(s.status === 'running' && s.v3, 'workflow 未运行或缺少技能账本');
+  const invocation = s.v3.skillInvocations.find(i => i.id === invocationId);
+  ensure(invocation && !invocation.result, '父技能调用不存在或已完成');
+  const job = s.jobs.find(j => j.id === invocation.jobId);
+  ensure(job && job.status === 'running' && job.session &&
+    JSON.stringify(job.session) === JSON.stringify(invocation.session), '父技能调用没有正在运行的真实宿主');
+  const t = job.ticket === '$spec' ? undefined : s.tickets.find(x => x.key === job.ticket);
+  ensure(invocation.candidateVersion === candidateVersion(s, t) && job.inputVersion === inputVersion(s),
+    '父技能调用的输入或候选已过期');
+  verifySkillBinding(bindingFor(s, invocation.capability));
+  return { invocation, job };
+}
+export function skillChildState(s: State, child: SkillChildRequest) {
+  const job = child.jobIds.length ? s.jobs.find(j => j.id === child.jobIds.at(-1)) : undefined;
+  if (child.pending) return 'pending' as const;
+  if (!job) return 'pending' as const;
+  if (job.status === 'cancelled') return 'failed' as const;
+  if (job.status !== 'done') return 'running' as const;
+  return job.result?.complete && job.result.status === 'completed' ? 'completed' as const : 'failed' as const;
+}
+/** A request key is stable across process restarts; its definition cannot be silently changed. */
+export function delegateSkillChildren(s: State, invocationId: string, specs: SkillChildSpec[]) {
+  const { invocation, job } = activeParent(s, invocationId);
+  ensure(Array.isArray(specs) && specs.length > 0 && new Set(specs.map(x => x.key)).size === specs.length,
+    '技能委派需要非空且不重复的子任务 key');
+  s.v3!.skillChildren ??= [];
+  const rows: SkillChildRequest[] = [];
+  for (const spec of specs) {
+    ensure(spec && typeof spec.key === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(spec.key) &&
+      typeof spec.instruction === 'string' && spec.instruction.trim() &&
+      ['L1', 'L2', 'L3'].includes(spec.tier) &&
+      (spec.required === undefined || typeof spec.required === 'boolean') &&
+      (spec.independent === undefined || typeof spec.independent === 'boolean') &&
+      Object.keys(spec).every(key=>['key','instruction','tier','required','independent','skillCapability','head'].includes(key)),
+      '技能子任务定义无效；模型只能来自已确认的 L1/L2/L3 路由');
+    ensure(!spec.skillCapability || capabilities.includes(spec.skillCapability), '子任务引用未知技能能力');
+    ensure(spec.head === undefined || /^[0-9a-f]{40}$/.test(spec.head), '子任务候选 head 必须是完整提交 SHA');
+    ensure(!spec.head || spec.head === job.head || ['implement', 'integrate'].includes(job.action),
+      '只读父任务不能指定不同候选 head');
+    const dependency = spec.skillCapability ? verifySkillBinding(bindingFor(s, spec.skillCapability)) : undefined;
+    const expected: Omit<SkillChildRequest, 'jobIds' | 'pending' | 'requestedAt'> = {
+      id: `${invocationId}:child:${spec.key}`, parentInvocationId: invocationId, key: spec.key,
+      instruction: spec.instruction, tier: spec.tier, model: s.inputs.models[spec.tier],
+      required: spec.required !== false, independent: spec.independent !== false || job.fresh,
+      fresh: job.fresh, candidateVersion: invocation.candidateVersion, inputVersion: inputVersion(s),
+      head: spec.head || job.head, base: job.base, ...(dependency ? {skillCapability: spec.skillCapability,
+        dependencyFingerprint: dependency.fingerprint} : {}),
+    };
+    const existing = s.v3!.skillChildren.find(x => x.id === expected.id);
+    if (existing) {
+      const comparable = Object.fromEntries(Object.entries(existing).filter(([k]) => !['jobIds','pending','requestedAt'].includes(k)));
+      ensure(JSON.stringify(comparable) === JSON.stringify(expected), '相同子任务 key 的委派定义或版本已改变');
+      rows.push(existing); continue;
+    }
+    const row: SkillChildRequest = {...expected, jobIds: [], pending: true, requestedAt: new Date().toISOString()};
+    s.v3!.skillChildren.push(row); rows.push(row);
+  }
+  event(s, `${invocation.capability} 请求 ${rows.length} 个已登记子任务`);
+  return rows;
+}
+export function retrySkillChildren(s: State, invocationId: string, keys: string[]) {
+  activeParent(s, invocationId);
+  ensure(Array.isArray(keys) && keys.length > 0 && new Set(keys).size === keys.length,
+    '重试需要不重复的子任务 key');
+  const rows = keys.map(key => {
+    const row = s.v3!.skillChildren?.find(x => x.parentInvocationId === invocationId && x.key === key);
+    ensure(row && skillChildState(s, row) === 'failed', `子任务 ${key} 尚未失败，不能重复派发`);
+    const last = s.jobs.find(j => j.id === row.jobIds.at(-1));
+    ensure(last?.status === 'done' || last?.status === 'cancelled' && last.stopConfirmation,
+      '失败子任务仍有未停止的宿主租约');
+    row.pending = true; return row;
+  });
+  event(s, `${invocationId} 显式重试 ${rows.length} 个子任务`);
+  return rows;
+}
+export function skillChildrenSnapshot(s: State, invocationId: string) {
+  const { invocation } = activeParent(s, invocationId);
+  const children = (s.v3!.skillChildren || []).filter(x => x.parentInvocationId === invocationId).map(x => {
+    const job = x.jobIds.length ? s.jobs.find(j => j.id === x.jobIds.at(-1)) : undefined;
+    return { key: x.key, requestId: x.id, state: skillChildState(s, x), required: x.required,
+      tier: x.tier, requestedModel: x.model, observedModel: job?.session?.model || null,
+      nativeId: job?.nativeId || null, jobId: job?.id || null, attempts: x.jobIds.length,
+      fresh: x.fresh, independent: x.independent, candidateVersion: x.candidateVersion,
+      skillCapability: x.skillCapability || null, dependencyFingerprint: x.dependencyFingerprint || null,
+      result: job?.result || null };
+  });
+  return { invocationId, parentJobId: invocation.jobId,
+    waiting: children.some(x => ['pending','running'].includes(x.state) || x.required && x.state !== 'completed'), children };
+}
+export function requireSkillChildrenComplete(s: State, invocationId: string) {
+  const rows = (s.v3?.skillChildren || []).filter(x => x.parentInvocationId === invocationId);
+  const invocation=s.v3?.skillInvocations.find(i=>i.id===invocationId);
+  const parent=invocation && s.jobs.find(j=>j.id===invocation.jobId);
+  ensure(invocation && parent, '技能子任务缺少父调用');
+  const authored=rows.filter(x=>x.required && x.head!==parent.head);
+  if(authored.length) {
+    const t=s.tickets.find(t=>t.key===parent.ticket);
+    ensure(t?.worktree && ['implement','integrate'].includes(parent.action), '子任务候选来源与父任务不符');
+    const current=execFileSync('git',['rev-parse','HEAD'],{cwd:t.worktree,encoding:'utf8'}).trim();
+    ensure(authored.every(x=>x.head===current), '技能子任务证据不是当前已提交候选 head');
+  }
+  for (const child of rows) {
+    ensure(['completed','failed'].includes(skillChildState(s, child)), `技能子任务 ${child.key} 尚有在途租约`);
+    if (!child.required) continue;
+    ensure(skillChildState(s, child) === 'completed', `必需技能子任务 ${child.key} 尚未完成`);
+    if (child.skillCapability) {
+      const binding = verifySkillBinding(bindingFor(s, child.skillCapability));
+      ensure(binding.fingerprint === child.dependencyFingerprint, `子任务 ${child.key} 的引用技能版本已改变`);
+    }
+  }
+}
+
+/** Reattach the same invocation after the old host is proven stopped; child receipts remain in place. */
+export function resumeSkillCall(s: State, invocationId: string, replacement: Job,
+  host: SkillHostCapabilities, evidencePath: string) {
+  ensure(s.status === 'running' && s.v3, 'workflow 未运行或缺少技能账本');
+  const invocation = s.v3.skillInvocations.find(i => i.id === invocationId);
+  ensure(invocation && !invocation.result, '仅能续接未完成的技能调用');
+  const previous = s.jobs.find(j => j.id === invocation.jobId);
+  ensure(previous?.status === 'cancelled' && previous.stopConfirmation &&
+    previous.stopConfirmation.processTreeStopped, '旧父任务尚未由宿主确认完整停止');
+  ensure(replacement.status === 'running' && replacement.session && replacement.nativeId &&
+    replacement.id !== previous.id && replacement.ticket === previous.ticket &&
+    replacement.epoch === previous.epoch && replacement.action === previous.action &&
+    replacement.tier === previous.tier && replacement.model === previous.model &&
+    replacement.candidateVersion === previous.candidateVersion &&
+    replacement.inputVersion === previous.inputVersion && replacement.head === previous.head &&
+    replacement.base === previous.base, '续接任务与原父调用的角色或候选不一致');
+  verifyNativeSession(s,replacement.session,replacement.nativeId,replacement.tier);
+  ensure(replacement.session.nativeId !== invocation.session.nativeId &&
+    replacement.session.observationId !== invocation.session.observationId, '续接必须使用新的原生执行者');
+  ensure(fs.statSync(evidencePath).isFile() && fs.readFileSync(evidencePath,'utf8').trim(), '续接需要非空宿主依据');
+  const binding = verifySkillBinding(bindingFor(s,invocation.capability));
+  ensure(binding.fingerprint === invocation.bindingFingerprint &&
+    invocation.candidateVersion === candidateVersion(s,
+      replacement.ticket === '$spec' ? undefined : s.tickets.find(t=>t.key===replacement.ticket)) &&
+    replacement.inputVersion === inputVersion(s), '旧调用的技能或候选版本已变化');
+  if (invocation.mode === 'native_explicit')
+    ensure(host.nativeExplicit?.supported && host.nativeExplicit.registrations.some(r=>
+      r.entry===invocation.nativeEntry && r.sourcePath===binding.sourcePath && r.fingerprint===binding.fingerprint),
+      '新宿主没有原调用的同版本原生技能入口');
+  else ensure(host.sourceExecution?.allowed && host.sourceExecution.acceptsOriginalFiles,
+    '新宿主不能加载已归档的原始技能及依赖');
+  ensure(!s.v3.skillInvocations.some(i=>i!==invocation && i.jobId===replacement.id && !i.result),
+    '续接 actor 已启动另一技能调用');
+  const prior = { previousJobId: previous.id, previousSession: invocation.session,
+    jobId: replacement.id, session: replacement.session, evidencePath: path.resolve(evidencePath),
+    evidenceSha256: digest(fs.readFileSync(evidencePath)),
+    previousHostCapabilityPath: invocation.hostCapabilityPath,
+    previousHostCapabilitySha256: invocation.hostCapabilitySha256,
+    at: new Date().toISOString() };
+  invocation.resumeHistory ??= []; invocation.resumeHistory.push(prior);
+  invocation.jobId = replacement.id; invocation.session = replacement.session;
+  event(s, `${invocation.id} 由 ${previous.id} 续接到 ${replacement.id}；已完成子结果保留`);
+  return invocation;
+}
+
 function sourceBundle(binding: SkillBinding): SkillSourceBundle {
   return { capability: binding.capability, name: binding.name, sourcePath: binding.sourcePath, fingerprint: binding.fingerprint,
     files: binding.files.map(file => ({ relativePath: file.relativePath, sourcePath: file.path,
@@ -105,6 +268,10 @@ export function prepareSkillCall(s: State, job: Job, capability: SkillCapability
     return { invocation: existing, source: JSON.parse(fs.readFileSync(existing.sourceArchivePath, 'utf8')),
       nativeEntry: existing.nativeEntry, alreadyStarted: true };
   }
+  ensure(!s.v3!.skillInvocations.some(i => !i.result && i.capability === capability && i.jobId !== job.id &&
+    s.jobs.some(old => old.id === i.jobId && old.status === 'cancelled' && old.ticket === job.ticket &&
+      old.epoch === job.epoch && old.action === job.action && old.candidateVersion === job.candidateVersion)),
+    '同候选旧父技能调用待续接；使用 skill-resume，不能重做已有专业步骤');
   const registration = host.nativeExplicit?.supported && Array.isArray(host.nativeExplicit.registrations)
     ? host.nativeExplicit.registrations.find(r =>
       r.sourcePath === binding.sourcePath && r.fingerprint === binding.fingerprint && !!r.entry)
@@ -134,6 +301,15 @@ function nonblank(file: string) {
   ensure(fs.statSync(file).isFile() && fs.readFileSync(file).toString('utf8').trim().length > 0, `技能产物为空：${file}`);
   return file;
 }
+function verifyResumeHistory(invocation: SkillInvocation) {
+  for (const resume of invocation.resumeHistory || []) {
+    ensure(digest(fs.readFileSync(nonblank(resume.evidencePath))) === resume.evidenceSha256,
+      '技能续接宿主依据已改变');
+    if (resume.previousHostCapabilityPath)
+      ensure(digest(fs.readFileSync(nonblank(resume.previousHostCapabilityPath))) ===
+        resume.previousHostCapabilitySha256, '原宿主技能能力观测已改变');
+  }
+}
 function archiveArtifact(invocation: SkillInvocation, leaf: string, original: string) {
   const archived = path.join(path.dirname(invocation.sourceArchivePath), leaf);
   fs.mkdirSync(path.dirname(archived), { recursive: true });
@@ -146,6 +322,7 @@ export function finishSkillCall(s: State, invocationId: string, outcome: SkillOu
   ensure(s.protocol === currentProtocol && s.v3, '只有 v3 运行能收取技能结果');
   const invocation = s.v3.skillInvocations.find(i => i.id === invocationId);
   ensure(invocation, `未知技能调用 ${invocationId}`);
+  verifyResumeHistory(invocation);
   if (invocation.result) {
     ensure(invocation.result.status === outcome.status && invocation.result.blocking === outcome.blocking &&
       invocation.result.originalOutputPath === (outcome.rawOutputPath ? path.resolve(outcome.rawOutputPath) : undefined) &&
@@ -169,6 +346,7 @@ export function finishSkillCall(s: State, invocationId: string, outcome: SkillOu
     '技能外围回执缺少明确状态或阻断结论');
   ensure(outcome.status !== 'pass' || outcome.blocking === false, 'pass 不能同时声明阻断');
   ensure(outcome.status !== 'changes_required' || outcome.blocking === true, 'changes_required 必须声明阻断');
+  if (outcome.status === 'pass' || outcome.status === 'changes_required') requireSkillChildrenComplete(s, invocationId);
   const hostReceiptPath = nonblank(path.resolve(outcome.hostReceiptPath));
   const hostReceipt = JSON.parse(fs.readFileSync(hostReceiptPath, 'utf8')) as Record<string, unknown>;
   ensure(hostReceipt.invocationId === invocation.id && hostReceipt.jobId === job.id && hostReceipt.nativeId === job.nativeId &&
@@ -217,6 +395,9 @@ export function verifySkillResultFiles(s: State, job: Job, invocationIds: string
   for (const id of invocationIds) {
     const invocation = s.v3?.skillInvocations.find(i => i.id === id);
     ensure(invocation && invocation.jobId === job.id && invocation.result, '外层结果引用未完成的技能调用');
+    verifyResumeHistory(invocation);
+    if (invocation.result.status === 'pass' || invocation.result.status === 'changes_required')
+      requireSkillChildrenComplete(s, invocation.id);
     const binding = bindingFor(s, invocation.capability);
     verifySkillBinding(binding);
     ensure(binding.fingerprint === invocation.bindingFingerprint, '技能调用版本与运行绑定不符');

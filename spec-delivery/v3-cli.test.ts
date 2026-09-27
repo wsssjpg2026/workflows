@@ -3,11 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { normalizeResult, resultPaths } from './host.ts';
 
 const entry = fileURLToPath(new URL('../spec-delivery.workflow.ts', import.meta.url));
+const sha = (value:string) => createHash('sha256').update(value).digest('hex');
 const git = (cwd: string, ...argv: string[]) => execFileSync('git', argv, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const inputs = { spec: 100, targetBranch: 'main', models: { L1: 'large', L2: 'middle', L3: 'small' } };
 
@@ -144,6 +146,53 @@ function approvedImplementation(x: ReturnType<typeof fixture>) {
   assert.equal(x.call('bind', statePath, checking.id, binding).status, 0);
   assert.equal(x.call('stage', statePath, checking.id, JSON.stringify({ complete: true, status: 'pass', evidencePath: x.planEvidence })).status, 0);
   return { statePath, checks, binding };
+}
+
+function skillChildHarness(x: ReturnType<typeof fixture>) {
+  const { statePath, binding } = approvedImplementation(x), host = controlledHost(x);
+  const observer = path.join(x.temp, 'bin', 'skill-observer');
+  fs.writeFileSync(observer, `#!/usr/bin/env node
+const fs=require('fs');const [op,id,job]=process.argv.slice(2);
+const state=JSON.parse(fs.readFileSync(${JSON.stringify(statePath)},'utf8'));
+if(op==='capabilities') console.log(JSON.stringify({source:'native_host',jobId:job,capability:id,
+  capabilities:{sourceExecution:{allowed:true,acceptsOriginalFiles:true}}}));
+else if(op==='result') {
+  const invocation=state.v3.skillInvocations.find(i=>i.id===id);
+  if(!invocation||invocation.jobId!==job)process.exit(2);
+  const source=JSON.parse(fs.readFileSync(invocation.sourceArchivePath,'utf8'));
+  console.log(JSON.stringify({source:'native_host',invocationId:id,jobId:job,nativeId:invocation.session.nativeId,
+    observationId:invocation.session.observationId,mode:invocation.mode,
+    bindingFingerprint:invocation.bindingFingerprint,terminal:true,
+    loadedFiles:source.files.map(f=>({relativePath:f.relativePath,sha256:f.sha256}))}));
+} else process.exit(2);
+`);
+  fs.chmodSync(observer,0o755); x.env.SPEC_DELIVERY_SKILL_OBSERVER = observer;
+  const call = (...args: string[]) => {
+    const result=x.call(...args); assert.equal(result.status,0,result.stderr);
+    return JSON.parse(result.stdout);
+  };
+  const parentJob = call('next',statePath).jobs.find((j: {action:string})=>j.action==='implement');
+  assert.ok(parentJob);
+  x.observe('parent-skill-actor',parentJob.id,'small');
+  fs.writeFileSync(binding,JSON.stringify({nativeId:'parent-skill-actor'}));
+  call('bind',statePath,parentJob.id,binding);
+  const request=path.join(x.temp,'skill-request.json');
+  fs.writeFileSync(request,JSON.stringify({capability:'implementation'}));
+  const parent=call('skill-start',statePath,parentJob.id,request);
+  const file=(name:string,value:unknown)=>{const p=path.join(x.temp,name);fs.writeFileSync(p,JSON.stringify(value));return p;};
+  const finishSkill=(invocationId:string)=>{
+    const raw=path.join(x.temp,`skill-${sha(invocationId).slice(0,12)}.md`);
+    fs.writeFileSync(raw,'Actual complete professional work\n');
+    return call('skill-finish',statePath,invocationId,file(`out-${sha(invocationId).slice(0,12)}.json`,
+      {status:'pass',blocking:false,rawOutputPath:raw,evidencePaths:[raw]}));
+  };
+  const complete=(jobId:string,status:'completed'|'failed'='completed',data?:object)=>{
+    const state=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const d=state.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===jobId);assert.ok(d);
+    host.set(db=>{db.actors[d.token].state='completed';db.actors[d.token].result={complete:true,status,evidencePath:x.planEvidence,data};});
+    call('dispatch',statePath,jobId);
+  };
+  return { statePath, host, parent, parentJob, call, file, finishSkill, complete };
 }
 
 test('v3 公开 CLI 从五项输入初始化、规划、认领并登记一次 agent 结果', () => {
@@ -630,5 +679,141 @@ test('派发请求文件被改写后禁止调用宿主，即使改写者填入�
     const recovered=x.call('dispatch',statePath,planning.id);assert.equal(recovered.status,0,recovered.stderr);
     assert.equal(JSON.parse(recovered.stdout).status,'running');
     assert.equal(host.get().starts,1);
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('技能双子任务走公开 CLI 预算和持久派发；乱序完成、失败重试及父门禁', () => {
+  const x=fixture();
+  try {
+    const h=skillChildHarness(x), invocationId=h.parent.invocationId;
+    const request=h.file('two-children.json',{children:[
+      {key:'standards',tier:'L3',instruction:'Check standards independently'},
+      {key:'spec',tier:'L3',instruction:'Check spec independently'},
+    ]});
+    h.call('skill-delegate',h.statePath,invocationId,request);
+    h.call('skill-delegate',h.statePath,invocationId,request);
+    const first=h.call('next',h.statePath).jobs.filter((j:{action:string})=>j.action==='skill-child');
+    assert.equal(first.length,2);
+    assert.deepEqual(first.map((j:{model:string})=>j.model),['small','small']);
+    const state=JSON.parse(fs.readFileSync(h.statePath,'utf8'));
+    assert.equal(state.v3.skillChildren.length,2);
+    assert.equal(state.jobs.filter((j:{status:string;executor:string})=>
+      ['leased','running'].includes(j.status)&&j.executor==='agent').length+1,4,
+    '主控、父 actor 和两个子 actor 占满四个 agent 槽位');
+    const childPacket=JSON.parse(fs.readFileSync(first[0].packetPath,'utf8'));
+    assert.equal(childPacket.skillChild.parentInvocationId,invocationId);
+    assert.equal(childPacket.skillChild.independent,true);
+    assert.equal(childPacket.skillChild.candidateVersion,first[0].candidateVersion);
+    x.observe('parent-skill-actor',first[0].id,'small');
+    const reused=h.file('reused-native.json',{nativeId:'parent-skill-actor'});
+    const denied=x.call('bind',h.statePath,first[0].id,reused);
+    assert.notEqual(denied.status,0);assert.match(denied.stderr,/不能复用父会话/);
+    for(const child of first) h.call('dispatch',h.statePath,child.id);
+    h.complete(first[1].id);
+    const midway=h.call('skill-continue',h.statePath,invocationId);
+    assert.equal(midway.waiting,true);
+    assert.deepEqual(midway.children.map((c:{state:string})=>c.state),['running','completed']);
+    const early=x.call('skill-finish',h.statePath,invocationId,
+      h.file('premature.json',{status:'pass',blocking:false,rawOutputPath:x.planEvidence,evidencePaths:[x.planEvidence]}));
+    assert.notEqual(early.status,0);assert.match(early.stderr,/技能子任务.*在途租约/);
+    h.complete(first[0].id,'failed');
+    assert.deepEqual(h.call('skill-continue',h.statePath,invocationId).children.map((c:{state:string})=>c.state),
+      ['failed','completed']);
+    h.call('skill-retry',h.statePath,invocationId,h.file('retry.json',{keys:['standards']}));
+    const retry=h.call('next',h.statePath).jobs.find((j:{action:string})=>j.action==='skill-child');
+    assert.ok(retry);assert.notEqual(retry.id,first[0].id);
+    h.call('dispatch',h.statePath,retry.id);h.complete(retry.id);
+    assert.equal(h.call('skill-continue',h.statePath,invocationId).waiting,false);
+    assert.equal(h.host.get().starts,3,'失败只重试一个子任务，不重跑已完成兄弟任务');
+    assert.equal(h.finishSkill(invocationId).status,'pass');
+    const after=JSON.parse(fs.readFileSync(h.statePath,'utf8'));
+    assert.equal(after.jobs.filter((j:{action:string})=>j.action==='skill-child').length,3);
+    assert.deepEqual(after.v3.skillChildren.map((c:{jobIds:string[]})=>c.jobIds.length),[2,1]);
+    assert.notEqual(x.call('skill-delegate',h.statePath,invocationId,request).status,0);
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('技能可在五项并行结果后追加确认任务；引用替代技能版本并从账本续接', () => {
+  const x=fixture();
+  try {
+    const alternate=path.join(x.temp,'.agents','skills','code-review','method.md');
+    fs.writeFileSync(alternate,'Alternate professional method\n');
+    const h=skillChildHarness(x), invocationId=h.parent.invocationId;
+    h.call('skill-delegate',h.statePath,invocationId,h.file('lenses.json',{children:
+      Array.from({length:5},(_,n)=>({key:`lens-${n}`,tier:'L2',instruction:`Independent lens ${n}`}))}));
+    const seen=new Set<string>();
+    while(h.call('skill-continue',h.statePath,invocationId).waiting) {
+      const offered=h.call('next',h.statePath).jobs.filter((j:{action:string})=>j.action==='skill-child');
+      for(const child of offered) if(!seen.has(child.id)) {h.call('dispatch',h.statePath,child.id);seen.add(child.id);}
+      const state=JSON.parse(fs.readFileSync(h.statePath,'utf8'));
+      const running=state.jobs.filter((j:{action:string;status:string})=>j.action==='skill-child'&&j.status==='running');
+      assert.ok(running.length>0);
+      h.complete(running.at(-1).id);
+      assert.ok(state.jobs.filter((j:{action:string;status:string})=>j.action==='skill-child'&&
+        ['leased','running'].includes(j.status)).length<=2,'并行数遵守父 actor 占用后的预算');
+    }
+    assert.equal(seen.size,5);
+    const firstSnapshot=h.call('skill-continue',h.statePath,invocationId);
+    assert.equal(firstSnapshot.children.length,5);
+    h.call('skill-delegate',h.statePath,invocationId,h.file('confirmations.json',{children:[
+      {key:'confirm-a',tier:'L2',instruction:'Confirm earlier evidence',skillCapability:'authorReview'},
+      {key:'confirm-b',tier:'L1',instruction:'Independent second confirmation'},
+    ]}));
+    const next=h.call('next',h.statePath).jobs.filter((j:{action:string})=>j.action==='skill-child');
+    assert.equal(next.length,2);
+    const nested=next.find((j:{part:string})=>j.part==='confirm-a');assert.ok(nested);
+    const packet=JSON.parse(fs.readFileSync(nested.packetPath,'utf8'));
+    const binding=JSON.parse(fs.readFileSync(h.statePath,'utf8')).v3.skillBindings.find((b:{capability:string})=>b.capability==='authorReview');
+    assert.equal(packet.skillChild.dependencyFingerprint,binding.fingerprint);
+    assert.ok(binding.files.some((f:{relativePath:string})=>f.relativePath==='method.md'));
+    for(const child of next) h.call('dispatch',h.statePath,child.id);
+    const nestedCall=h.call('skill-start',h.statePath,nested.id,h.file('nested-skill.json',{capability:'authorReview'}));
+    assert.equal(h.finishSkill(nestedCall.invocationId).status,'pass');
+    h.complete(nested.id,'completed',{skillInvocationIds:[nestedCall.invocationId]});
+    h.complete(next.find((j:{part:string})=>j.part==='confirm-b').id);
+    const final=h.call('skill-continue',h.statePath,invocationId);
+    assert.equal(final.waiting,false);assert.equal(final.children.length,7);
+    assert.equal(h.finishSkill(invocationId).status,'pass');
+    assert.equal(h.host.get().starts,7);
+    const saved=JSON.parse(fs.readFileSync(h.statePath,'utf8'));
+    assert.equal(saved.jobs.filter((j:{action:string})=>j.action==='skill-child').length,7);
+    assert.ok(saved.v3.skillChildren.every((c:{candidateVersion:string})=>
+      c.candidateVersion===h.parentJob.candidateVersion));
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('父技能宿主中断后由新 actor 续接同一调用，已完成子结果保持原任务与身份', () => {
+  const x=fixture();
+  try {
+    const h=skillChildHarness(x), invocationId=h.parent.invocationId;
+    h.call('skill-delegate',h.statePath,invocationId,h.file('resume-children.json',{children:[
+      {key:'first',tier:'L2',instruction:'First independent result'},
+      {key:'second',tier:'L2',instruction:'Second independent result'},
+    ]}));
+    const children=h.call('next',h.statePath).jobs.filter((j:{action:string})=>j.action==='skill-child');
+    for(const child of children)h.call('dispatch',h.statePath,child.id);
+    h.complete(children[0].id);
+    const proof=path.join(x.temp,'parent-stopped.md');fs.writeFileSync(proof,'Host confirmed old parent process tree stopped');
+    h.call('reconcile',h.statePath,h.file('parent-stop.json',[{jobId:h.parentJob.id,
+      nativeId:'parent-skill-actor',state:'stopped',evidencePath:proof,processTreeStopped:true}]));
+    const replacement=h.call('next',h.statePath).jobs.find((j:{action:string})=>j.action==='implement');
+    assert.ok(replacement);
+    const packet=JSON.parse(fs.readFileSync(replacement.packetPath,'utf8'));
+    assert.equal(packet.skillResume.invocationId,invocationId);
+    h.call('dispatch',h.statePath,replacement.id);
+    const before=x.call('skill-start',h.statePath,replacement.id,
+      h.file('replacement-skill.json',{capability:'implementation'}));
+    assert.notEqual(before.status,0);assert.match(before.stderr,/skill-resume/);
+    const resumed=h.call('skill-resume',h.statePath,invocationId,
+      h.file('resume.json',{jobId:replacement.id,evidencePath:proof}));
+    assert.equal(resumed.parentJobId,replacement.id);
+    assert.deepEqual(resumed.children.map((c:{state:string})=>c.state),['completed','running']);
+    h.complete(children[1].id);
+    assert.equal(h.finishSkill(invocationId).status,'pass');
+    const saved=JSON.parse(fs.readFileSync(h.statePath,'utf8'));
+    assert.equal(saved.v3.skillInvocations.find((i:{id:string})=>i.id===invocationId).resumeHistory.length,1);
+    assert.equal(saved.v3.skillChildren[0].jobIds[0],children[0].id);
+    assert.equal(saved.jobs.filter((j:{action:string})=>j.action==='skill-child').length,2);
+    assert.equal(h.host.get().starts,3,'两个子任务和一个新父任务各启动一次');
   } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
 });

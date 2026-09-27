@@ -17,6 +17,8 @@
 
 实际调用结束后保留原始输出和专业证据，由执行者给出 `pass`、`changes_required`、`incomplete` 或 `skipped` 及阻断结论，宿主将真实执行身份/模式写入回执并使用 `skill-finish` 收取。外围只整理引用，不能补造发现或评分。完整实现回执必须在 `data.skillInvocationIds` 引用已完成的实现或诊断技能及原始 handoff 技能调用；未完成、跳过、空白或缺失产物均不能满足门禁。若技能或依赖指纹变化，先由维护者显式迁移并重取受影响证据。
 
+技能需要专业子任务时，以 `skill-delegate` 按当前父调用登记稳定 key、角色 tier、明确指令及独立上下文要求。由核心的 `next` 和宿主 `dispatch` 按同一预算执行；技能从 `skill-continue` 读取每项结果后可继续请求后续子任务。子 actor 只执行 packet 的 `skillChild.instruction`，返回 `completed`、`failed` 或 `incomplete` 和真实证据；引用另一技能时先按 `skillChild.skillCapability` 通过绑定调用并在 `data.skillInvocationIds` 附其完成 ID。失败子任务由父调用显式 `skill-retry`，不得私下另派 actor。父宿主中断时，先对账停机，再由新 actor 按 packet 的 `skillResume` 续接原技能调用与已完成子结果。
+
 ## 主会话转发与 L1 决策
 
 宿主主会话可使用与 L1 不同的模型。它向用户收集 spec、目标分支和三个模型，从 cwd 识别仓库，转发任务、展示状态，并执行 CLI 已授权的确定性动作。主会话身份被记录为宿主观测值或 `unknown`，绝不充当 L1 决策证明。
@@ -205,6 +207,7 @@ CI按下列规则处理，无需逐次请求用户批准：
 | `claim` | `claimed` | `data:{branch,worktree,head,claimCommentUrl}`；worktree绝对路径，位于当前仓库`.agents/worktrees/` |
 | `plan`、`replan` | `planned` | `data:{planPath,checksPath}`；两者为已存在的计划与验证清单文件；随后由`plan-check`批准 |
 | `plan-check` | `pass`、`changes` | `changes`附`data.reason`；`pass`可用`data.checksPath`提交复核后的清单 |
+| `skill-child` | `completed`、`failed` | 按 `skillChild` 请求执行；任一状态都保留原始证据；未完成执行使用 `complete:false,status:"incomplete"`；引用技能时 `data.skillInvocationIds` 指向真实通过的调用 |
 | `implement`、`integrate` | `implemented`、`replan` | 两种完成状态都必须有真实已提交候选`head/base`与`handoffPath`；`replan`另附`data.reason`，适用时`data.visualEvidence`；WIP/冲突由工作区恢复入口保全，不报作已验证候选 |
 | `self-standards`、`self-spec` | `reviewed` | 顶层`findings`必填，允许空数组；两个轴各自提交 |
 | `verify` | `pass`、`fail` | 由`execute`生成；失败时`data.failureSignature`及原始日志 |

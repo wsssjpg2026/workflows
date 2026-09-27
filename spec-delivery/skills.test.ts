@@ -6,7 +6,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import * as core from './core.ts';
 import * as skills from './skills.ts';
-import { main } from '../spec-delivery.workflow.ts';
+import { main, packet } from '../spec-delivery.workflow.ts';
 
 const sha = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex');
 const original = {
@@ -241,4 +241,30 @@ test('较早 v3 运行缺少技能绑定时可在无在途 actor 后显式固定
     else process.env.HOME = previousHome;
     x.cleanup();
   }
+});
+
+test('fresh 父调用强制子任务独立上下文，技能文字不能改写三档模型路由', () => {
+  const x=setup();
+  try {
+    x.j.action='self-spec';x.j.fresh=true;x.t.phase='self';
+    const invocation=skills.prepareSkillCall(x.s,x.j,'authorReview',
+      {sourceExecution:{allowed:true,acceptsOriginalFiles:true}},x.statePath).invocation;
+    assert.throws(()=>skills.delegateSkillChildren(x.s,invocation.id,[
+      {key:'bad',instruction:'Try a different model',tier:'L3',model:'large'} as skills.SkillChildSpec
+    ]),/模型只能来自/);
+    const rows=skills.delegateSkillChildren(x.s,invocation.id,[
+      {key:'independent',instruction:'Check independently',tier:'L3',independent:false}
+    ]);
+    assert.equal(rows[0].model,'small');assert.equal(rows[0].fresh,true);
+    assert.equal(rows[0].independent,true);
+    const child=core.reserve(x.s).find(j=>j.action==='skill-child');assert.ok(child);
+    assert.equal(child.fresh,true);assert.equal(child.contextIntent?.kind,'independent');
+    assert.notEqual(child.contextKey,x.j.contextKey);
+    assert.equal(child.parentInvocationId,invocation.id);
+    assert.equal(child.candidateVersion,x.j.candidateVersion);
+    const task=packet(x.s,child,x.statePath);
+    assert.deepEqual(task.prior,[]);
+    assert.equal(task.blockingReason,'');
+    assert.deepEqual(task.objectiveEvidence,{tests:undefined,visual:undefined});
+  } finally {x.cleanup();}
 });

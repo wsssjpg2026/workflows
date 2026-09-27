@@ -220,6 +220,10 @@ function recoverOnRejectedResult(s: engine.State, j: engine.Job, statePath: stri
     enterWorkspaceRecovery(s, t, statePath, `回执无法采用：${error.message}`, j.id, observed);
 }
 function recordRejectedReceipt(s: engine.State, j: engine.Job, statePath: string, error: Error, immutable = false) {
+  if (j.action === 'skill-child') {
+    engine.event(s, `${j.id} 技能子任务回执待修复：${error.message}`);
+    return;
+  }
   const t = s.tickets.find(t => t.key === j.ticket);
   if (t && active(j) && t.epoch === j.epoch && s.status !== 'retired') {
     const recorded = engine.recordFailure(s, t, { id: `${j.id}:receipt_validation`, category: 'receipt_validation',
@@ -465,26 +469,39 @@ export function initialize(inputs: engine.Inputs, cwd = process.cwd()) {
 }
 export function packet(s: engine.State, j: engine.Job, statePath: string) {
   const t = s.tickets.find(t => t.key === j.ticket);
+  const child = j.childRequestId ? s.v3?.skillChildren?.find(x => x.id === j.childRequestId) : undefined;
+  const resumableSkill=s.v3?.skillInvocations.find(i=>!i.result && i.jobId!==j.id &&
+    s.jobs.some(old=>old.id===i.jobId&&old.status==='cancelled'&&old.ticket===j.ticket&&
+      old.epoch===j.epoch&&old.action===j.action&&old.candidateVersion===j.candidateVersion));
   const out = path.join(path.dirname(statePath), 'jobs', sha(j.id).slice(0, 20));
   const authored = ['implement', 'publish', 'integrate', 'replan'].includes(j.action);
-  const prior = s.jobs.filter(x => x.ticket === j.ticket && x.status === 'done' && x.result &&
+  const prior = (child ? [] : s.jobs.filter(x => x.ticket === j.ticket && x.status === 'done' && x.result &&
     (j.action === 'review-report' ? x.epoch === j.epoch && ['review-lens', 'confirm', 'adjudicate'].includes(x.action)
-      : !j.fresh && (authored || ['review-lens', 'confirm', 'review-report'].includes(x.action))))
+      : !j.fresh && (authored || ['review-lens', 'confirm', 'review-report'].includes(x.action)))))
     .map(x => { archiveResult(statePath,x); return { action: x.action, epoch: x.epoch, head: x.head, base: x.base, status: x.result!.status,
       resultPath: resultPaths(statePath,x.id).result }; });
   // 旧结果保持完整归档；每次派发只带当前轮的索引，完整历史按需读取。
   const relevant = prior.filter(x => x.epoch === j.epoch || x.head === j.head);
   const priorPath = path.join(out, 'prior-index.json');
   write(priorPath, prior);
-  const objective = j.fresh && ['review-lens', 'confirm'].includes(j.action)
+  const objective = j.fresh && (child || ['review-lens', 'confirm'].includes(j.action))
     ? { tests: t?.evidence.tests, visual: t?.evidence.visual } : t?.evidence || {};
   return { jobId: j.id, action: j.action, tier: j.tier, model: j.model, executor: j.executor, fresh: j.fresh, contextKey: j.contextKey,
+    contextIntent: j.contextIntent || null,
+    skillChild: child ? { requestId: child.id, parentInvocationId: child.parentInvocationId,
+      instruction: child.instruction, required: child.required, independent: child.independent,
+      candidateVersion: child.candidateVersion, inputVersion: child.inputVersion,
+      skillCapability: child.skillCapability || null, dependencyFingerprint: child.dependencyFingerprint || null,
+      resultStatuses: ['completed', 'failed', 'incomplete'] } : null,
+    skillResume: resumableSkill ? { invocationId: resumableSkill.id, command: 'skill-resume',
+      sourceArchivePath: resumableSkill.sourceArchivePath,
+      note: '旧宿主已确认停止；先以新原生会话及宿主能力续接此调用，读取已完成子结果，不重跑。' } : null,
     dispatchToken: j.dispatchToken || '',
     inputVersion: j.inputVersion || '', candidateVersion: j.candidateVersion || '',
     repo: s.repo, spec: s.spec, issue: t?.number || s.spec, targetBranch: s.inputs.targetBranch,
     branch: t?.branch || '', worktree: t?.worktree || '', pr: t?.pr || 0, expectedHead: j.head, expectedBase: j.base,
     criteria: t?.criteria || s.specCriteria, visualRequired: t?.visual || false, closeout: t?.closeout || false,
-    blockingReason: j.fresh && ['review-lens','confirm'].includes(j.action) ? '' : t?.reason || t?.lastProblem || '',
+    blockingReason: j.fresh && (child || ['review-lens','confirm'].includes(j.action)) ? '' : t?.reason || t?.lastProblem || '',
     planPath: j.fresh && j.action !== 'plan-check' ? '' : t?.planPath || '', checksPath: t?.checksPath || '',
     handoffPath: j.fresh && j.action !== 'replan' ? '' : authored ? t?.handoffPath || '' : t?.reviewHandoff || '',
     sourceUrl: `https://${s.repo.host}/${s.repo.slug}/issues/${t?.number || s.spec}`,
@@ -494,14 +511,18 @@ export function packet(s: engine.State, j: engine.Job, statePath: string) {
     lens: j.action === 'review-lens' ? engine.lenses[Number(j.part)] : '',
     skillBindings: s.v3?.skillBindings?.map(b => ({ capability: b.capability, name: b.name,
       sourcePath: b.sourcePath, fingerprint: b.fingerprint })) || [],
-    skillCall: j.action === 'implement'
+    skillCall: child?.skillCapability
+      ? { capabilities: [child.skillCapability], command: 'skill-start', finishCommand: 'skill-finish',
+          resultField: 'data.skillInvocationIds', note: '通过已固定的能力绑定调用引用技能，并提交原始宿主回执。' }
+      : j.action === 'implement'
       ? { capabilities: ['implementation', 'diagnosis', 'handoff'], command: 'skill-start',
           finishCommand: 'skill-finish', resultField: 'data.skillInvocationIds',
           note: '按计划显式调用已绑定 implement 或 diagnosing-bugs；完成候选后显式调用原始 handoff。宿主执行真实技能后提交外围回执。' }
       : null,
     rolesPath, outputDirectory: out, resultPath: path.join(out, 'result.json'),
     resourceGrant: { agentSlots: j.executor === 'agent' ? 1 : 0, testBatches: j.tests, nestedAgents: false },
-    note: '读角色约束与来源；仅执行本 job。main loop 和并行审查由内核调度，agent 不自行派隐藏子 agent。' };
+    note: child ? '执行技能请求的本子任务；独立上下文要求由宿主证明。不要派隐藏 agent；以 completed、failed 或 incomplete 返回结果。' :
+      '读角色约束与来源；仅执行本 job。main loop 和并行审查由内核调度，agent 不自行派隐藏子 agent。' };
 }
 function claimLease(s: engine.State, j: engine.Job, statePath: string) {
   if (j.action !== 'claim') return true;
@@ -1088,7 +1109,7 @@ export async function main(argv: string[]): Promise<unknown> {
   const [op, file, extra, fourth] = argv;
   if(op==='version')return {workflow:'spec-delivery',version:workflowVersion};
   if (!op || op === 'help') return { workflow: 'spec-delivery', input: ['spec', 'targetBranch', 'models.L1', 'models.L2', 'models.L3'],
-    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan-context <state>', 'decision-context <state>', 'plan <state> <plan.json>', 'observe-main <state> <native-id>', 'drive <state>', 'next <state>', 'dispatch <state> <jobId>', 'dispatch-cancel <state> <jobId>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'skill-start <state> <jobId> <host-capabilities.json>', 'skill-finish <state> <invocationId> <outcome.json>', 'migrate-skills <state> <migration.json>', 'stage <state> <jobId> <result-json>', 'collect <state> [jobId]', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'test <state> <jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'recover-workspace <state> <ticket> <decision.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'metrics <state>', 'resume <state>', 'zcode <state>'] };
+    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan-context <state>', 'decision-context <state>', 'plan <state> <plan.json>', 'observe-main <state> <native-id>', 'drive <state>', 'next <state>', 'dispatch <state> <jobId>', 'dispatch-cancel <state> <jobId>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'skill-start <state> <jobId> <host-capabilities.json>', 'skill-delegate <state> <invocationId> <children.json>', 'skill-continue <state> <invocationId>', 'skill-retry <state> <invocationId> <keys.json>', 'skill-resume <state> <invocationId> <resume.json>', 'skill-finish <state> <invocationId> <outcome.json>', 'migrate-skills <state> <migration.json>', 'stage <state> <jobId> <result-json>', 'collect <state> [jobId]', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'test <state> <jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'recover-workspace <state> <ticket> <decision.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'metrics <state>', 'resume <state>', 'zcode <state>'] };
   engine.ensure(file, '缺少输入文件/状态路径');
   // summary 在 lock() 之前返回：只验证可读协议，不创建/等待/恢复/删除状态锁，也不进入写路径。
   if (op === 'summary') return summarizeLedger(path.resolve(file));
@@ -1179,6 +1200,10 @@ export async function main(argv: string[]): Promise<unknown> {
       engine.ensure(j.session, '技能调用需要真实宿主会话观测'); verifySessionArtifact(j.session);
       const request = read<{capability:engine.SkillCapability}>(fourth);
       engine.ensure(skills.skillCapabilities.includes(request.capability), '未知技能能力，不能查询宿主或启动调用');
+      if (j.action === 'skill-child') {
+        const child=s.v3?.skillChildren?.find(x=>x.id===j.childRequestId);
+        engine.ensure(child?.skillCapability===request.capability, '子任务只能调用已声明并固定版本的引用技能');
+      }
       const observation = skillObservation(statePath, 'capabilities', request.capability, j.id);
       engine.ensure(observation.raw.capability === request.capability && observation.raw.capabilities,
         '技能宿主未返回当前能力的实际调用入口');
@@ -1194,6 +1219,49 @@ export async function main(argv: string[]): Promise<unknown> {
         bindingFingerprint: prepared.invocation.bindingFingerprint, alreadyStarted: prepared.alreadyStarted,
         instruction: prepared.alreadyStarted ? '已登记调用；先查询宿主状态，不重复启动' :
           '宿主按 mode 执行已授权技能；native_explicit 调原生入口，source_execution 加载 sourceArchivePath 的原始文件。终态后提交 skill-finish。' };
+    }
+    if (op === 'skill-delegate') {
+      engine.ensure(extra && fourth, '需要父调用 ID 与子任务请求文件');
+      const request=read<{children:skills.SkillChildSpec[]}>(fourth);
+      const invocation=s.v3?.skillInvocations.find(i=>i.id===extra);
+      const parent=invocation && s.jobs.find(j=>j.id===invocation.jobId);
+      const ticket=parent && s.tickets.find(t=>t.key===parent.ticket);
+      for(const child of request.children || []) if(child.head && child.head!==parent?.head) {
+        engine.ensure(parent && ticket?.worktree && localHead(ticket)===child.head && clean(ticket),
+          '技能子任务候选 head 必须是当前已提交且干净的工作区');
+      }
+      skills.delegateSkillChildren(s,extra,request.children);
+      const snapshot=skills.skillChildrenSnapshot(s,extra);
+      save(statePath,s); return snapshot;
+    }
+    if (op === 'skill-retry') {
+      engine.ensure(extra && fourth, '需要父调用 ID 与失败子任务 key 文件');
+      const request=read<{keys:string[]}>(fourth);
+      skills.retrySkillChildren(s,extra,request.keys);
+      const snapshot=skills.skillChildrenSnapshot(s,extra);
+      save(statePath,s); return snapshot;
+    }
+    if (op === 'skill-resume') {
+      engine.ensure(extra && fourth, '需要旧调用 ID 与续接请求文件');
+      const request=read<{jobId:string;evidencePath:string}>(fourth);
+      safeFile(request.evidencePath);
+      const invocation=s.v3?.skillInvocations.find(i=>i.id===extra);
+      const replacement=s.jobs.find(j=>j.id===request.jobId);
+      engine.ensure(invocation && replacement?.session, '旧调用或新原生执行者不存在');
+      verifySessionArtifact(replacement.session);
+      const observation=skillObservation(statePath,'capabilities',invocation.capability,replacement.id);
+      engine.ensure(observation.raw.capability===invocation.capability && observation.raw.capabilities,
+        '续接宿主没有确认技能调用能力');
+      skills.resumeSkillCall(s,extra,replacement,observation.raw.capabilities as skills.SkillHostCapabilities,
+        path.resolve(request.evidencePath));
+      invocation.hostCapabilityPath=observation.file;
+      invocation.hostCapabilitySha256=sha(fs.readFileSync(observation.file,'utf8'));
+      const snapshot=skills.skillChildrenSnapshot(s,extra);
+      save(statePath,s);return {...snapshot, sourceArchivePath:invocation.sourceArchivePath};
+    }
+    if (op === 'skill-continue') {
+      engine.ensure(extra, '需要父调用 ID');
+      return skills.skillChildrenSnapshot(s,extra);
     }
     if (op === 'skill-finish') {
       engine.ensure(extra && fourth, '需要技能调用 ID 与外围回执文件');
@@ -1411,7 +1479,11 @@ export async function main(argv: string[]): Promise<unknown> {
           j.status = 'cancelled';
           j.stopConfirmation = {state:observation.state,evidencePath:observation.evidencePath,processTreeStopped:observation.processTreeStopped===true,at:new Date().toISOString()};
           j.timing??={leasedAt:''};j.timing.cancelledAt=new Date().toISOString();delete j.testExecution;
-          if (j.ticket === '$spec') s.specAudit = undefined;
+          if (j.action === 'skill-child') {
+            engine.event(s, `${j.id} 技能子任务已由宿主确认停止；父调用等待显式 skill-retry`);
+          } else if (s.v3?.skillInvocations.some(i=>i.jobId===j.id&&!i.result)) {
+            engine.event(s, `${j.id} 父技能执行者已停止；保留调用与子任务证据，等待新角色通过 skill-resume 续接`);
+          } else if (j.ticket === '$spec') s.specAudit = undefined;
           else {
             const t = engine.ticket(s, j.ticket);
             if (t.failures?.some(f => f.jobId === j.id)) engine.finalizeRejectedReceipt(s, t, j);

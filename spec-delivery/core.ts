@@ -22,6 +22,17 @@ export interface SkillInvocation {
   mode: SkillMode; nativeEntry?: string; session: NativeSession;
   candidateVersion: string; head: string; base: string; startedAt: string;
   sourceArchivePath: string; hostCapabilityPath?: string; hostCapabilitySha256?: string; result?: SkillResult;
+  resumeHistory?: { previousJobId: string; previousSession: NativeSession; jobId: string;
+    session: NativeSession; evidencePath: string; evidenceSha256: string;
+    previousHostCapabilityPath?: string; previousHostCapabilitySha256?: string; at: string }[];
+}
+/** A skill owns the topology; the workflow owns every lease, role, and result. */
+export interface SkillChildRequest {
+  id: string; parentInvocationId: string; key: string; instruction: string;
+  tier: Tier; model: string; required: boolean; independent: boolean; fresh: boolean;
+  candidateVersion: string; inputVersion: string; head: string; base: string;
+  skillCapability?: SkillCapability; dependencyFingerprint?: string;
+  jobIds: string[]; pending: boolean; requestedAt: string;
 }
 /** v3 持久账本；旧固定审查调度仍由后续迁移票替换。 */
 export interface ProtocolV3 {
@@ -29,12 +40,13 @@ export interface ProtocolV3 {
   decisionRecords: L1DecisionRecord[];
   skillBindings?: SkillBinding[];
   skillInvocations: SkillInvocation[];
+  skillChildren?: SkillChildRequest[];
   skillMigrations?: { at: string; evidencePath: string;
     changes: { capability: SkillCapability; previousFingerprint: string; nextFingerprint: string }[] }[];
   dispatchRecords: DispatchRecord[];
 }
 export function initialProtocolV3(): ProtocolV3 {
-  return { executionPath: 'legacy-v02', decisionRecords: [], skillInvocations: [], dispatchRecords: [] };
+  return { executionPath: 'legacy-v02', decisionRecords: [], skillInvocations: [], skillChildren: [], dispatchRecords: [] };
 }
 export interface Policy { agents: number; issues: number; tests: number; noProgress: number; rounds: number }
 export interface Capabilities { framework: string; mainModel?: string; modelRouting: 'per_agent' | 'per_run'; models: string[] }
@@ -83,7 +95,7 @@ export interface ExecutionPlan { capabilities: Capabilities; policy: Policy; tic
   inputVersion?: string; sourceVersion?: string; decisionNativeId?: string;
 }
 export type Phase = 'claim' | 'plan' | 'plan_check' | 'implement' | 'queued' | 'self' | 'verify' | 'publish' | 'review' | 'fresh' | 'accept' | 'integrate' | 'replan' | 'recovery' | 'merge' | 'close' | 'cleanup' | 'done' | 'human' | 'blocked';
-export type Action = 'claim' | 'plan' | 'plan-check' | 'implement' | 'self-standards' | 'self-spec' | 'verify' | 'publish' | 'review-lens' | 'confirm' | 'adjudicate' | 'review-report' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'spec-audit' | 'spec-close';
+export type Action = 'claim' | 'plan' | 'plan-check' | 'implement' | 'self-standards' | 'self-spec' | 'verify' | 'publish' | 'review-lens' | 'confirm' | 'adjudicate' | 'review-report' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'spec-audit' | 'spec-close' | 'skill-child';
 export interface Evidence {
   head: string; base: string; path: string;
   /** These are separate observations: a remote PR head need not equal an unpushed local head. */
@@ -149,6 +161,9 @@ export interface Job {
   testExecution?: { pid: number; granted: boolean; startedAt: string; worktree?: string; evidenceDirectory?: string };
   commandRecovery?: { nativeId: string; evidencePath: string; at: string };
   stopConfirmation?: { state: 'stopped' | 'lost'; evidencePath: string; processTreeStopped: boolean; at: string };
+  parentInvocationId?: string; childRequestId?: string;
+  contextIntent?: { kind: 'independent' | 'continue'; parentJobId?: string; fresh: boolean;
+    lineage?: string; predecessorJobId?: string };
 }
 export interface State {
   schema: 1; id: string; revision: number; inputs: Inputs; spec: number;
@@ -436,6 +451,34 @@ export function reserve(s: State): Job[] {
   if (s.protocol === currentProtocol && s.planEvidence)
     ensure(currentDecision(s, 'execution-plan', '$spec', globalDecisionVersion(s)), 'L1 执行图或资源决策缺失或已过期');
   const created: Job[] = [];
+  // Child requests are durable before leasing. They use exactly the same agent and test
+  // counters as top-level jobs; a live parent remains in the active count.
+  for (const child of s.v3?.skillChildren || []) {
+    if (!child.pending) continue;
+    const parent = s.v3?.skillInvocations.find(i => i.id === child.parentInvocationId);
+    const owner = parent && s.jobs.find(j => j.id === parent.jobId);
+    if (!parent || parent.result || !owner || !busy(owner)) continue;
+    const t = owner.ticket === '$spec' ? undefined : s.tickets.find(x => x.key === owner.ticket);
+    if (child.inputVersion !== inputVersion(s) || child.candidateVersion !== candidateVersion(s, t) ||
+        child.base !== owner.base ||
+        (child.head !== owner.head && !['implement', 'integrate'].includes(owner.action))) continue;
+    const active = s.jobs.filter(busy);
+    if (active.filter(j => j.executor === 'agent').length + 2 > s.policy.agents ||
+        active.reduce((n, j) => n + j.tests, 0) > s.policy.tests) continue;
+    const attempt = child.jobIds.length + 1;
+    const id = `${child.id}:try-${attempt}`;
+    ensure(!s.jobs.some(j => j.id === id), '技能子任务租约 ID 重复');
+    const j: Job = { id, ticket: owner.ticket, epoch: owner.epoch, action: 'skill-child', part: child.key,
+      tier: child.tier, model: child.model, executor: 'agent', fresh: child.fresh,
+      contextKey: child.independent ? `${child.id}:context:try-${attempt}` : owner.contextKey,
+      contextIntent: { kind: child.independent ? 'independent' : 'continue', parentJobId: owner.id,
+        fresh: child.fresh },
+      head: child.head, base: child.base, tests: 0, status: 'leased', nativeId: '',
+      inputVersion: child.inputVersion, candidateVersion: child.candidateVersion,
+      parentInvocationId: parent.id, childRequestId: child.id,
+      timing: { leasedAt: new Date().toISOString() } };
+    child.pending = false; child.jobIds.push(id); s.jobs.push(j); created.push(j);
+  }
   const list = candidates(s);
   for (const c of list) {
     const key = c.t?.key || '$spec', epoch = c.t?.epoch || s.auditEpoch;
@@ -481,6 +524,18 @@ export function bind(s: State, id: string, ref: { nativeId: string; model?: stri
     verifyNativeSession(s, ref.session, ref.nativeId, j.tier);
     ensure(ref.session.jobId === j.id, '宿主观测不是当前任务的原生会话');
     ensure(j.model === s.inputs.models[j.tier], '已派发任务的模型请求与当前配置不符');
+    if (j.parentInvocationId && j.contextIntent?.kind === 'independent') {
+      const invocation = s.v3?.skillInvocations.find(i => i.id === j.parentInvocationId);
+      ensure(invocation, '技能子任务缺少父调用');
+      const parentSessions=[invocation.session,...(invocation.resumeHistory || []).map(x=>x.previousSession)];
+      ensure(parentSessions.every(session=>ref.nativeId !== session.nativeId &&
+        ref.session.observationId !== session.observationId),
+        '独立技能子任务不能复用父会话');
+      for (const sibling of s.jobs.filter(x => x.id !== j.id && x.parentInvocationId === j.parentInvocationId &&
+        x.contextIntent?.kind === 'independent' && x.session))
+        ensure(ref.nativeId !== sibling.nativeId && ref.session.observationId !== sibling.session!.observationId,
+          '独立技能子任务不能复用兄弟会话');
+    }
     if (j.session) ensure(JSON.stringify(j.session) === JSON.stringify(ref.session), '同一租约的会话观测不能被替换');
     j.session = ref.session;
   } else ensure(ref.model === j.model, '实际派发模型与任务不符');
@@ -537,6 +592,26 @@ export function submit(s: State, id: string, r: Result) {
         '工单计划复核必须由独立 L1 原生会话完成');
     }
   }
+  if (j.action === 'skill-child') {
+    ensure(j.parentInvocationId && j.childRequestId, '技能子任务缺少父调用与请求');
+    const child = s.v3?.skillChildren?.find(x => x.id === j.childRequestId && x.parentInvocationId === j.parentInvocationId);
+    const parent = s.v3?.skillInvocations.find(x => x.id === j.parentInvocationId);
+    ensure(child && parent && !parent.result && child.jobIds.at(-1) === j.id, '技能子任务不是当前父调用的有效租约');
+    ensure((r.complete && ['completed', 'failed'].includes(r.status)) || (!r.complete && r.status === 'incomplete'),
+      '技能子任务必须明确 completed、failed 或 incomplete');
+    if (child.skillCapability && r.complete && r.status === 'completed') {
+      const ids = r.data?.skillInvocationIds;
+      ensure(Array.isArray(ids) && ids.length === 1, '引用其他技能的子任务必须登记一次实际技能调用');
+      const nested = s.v3!.skillInvocations.find(x => x.id === ids[0]);
+      ensure(nested && nested.jobId === j.id && nested.capability === child.skillCapability &&
+        nested.bindingFingerprint === child.dependencyFingerprint && nested.result?.status === 'pass' &&
+        !nested.result.blocking, '子任务引用技能未按固定能力版本真实完成');
+    }
+    j.result = r; j.status = 'done';
+    j.timing ??= { leasedAt: '' }; j.timing.completedAt = new Date().toISOString();
+    event(s, `${child.key} 技能子任务 ${r.status}；结果返回 ${parent.id}`);
+    return;
+  }
   const allowed: Record<Action, string[]> = {
     claim: ['claimed'], plan: ['planned'], 'plan-check': ['pass', 'changes'], implement: ['implemented', 'replan'],
     'self-standards': ['reviewed'], 'self-spec': ['reviewed'], verify: ['pass', 'fail'], publish: ['published'],
@@ -544,6 +619,7 @@ export function submit(s: State, id: string, r: Result) {
     accept: ['ready', 'gap', 'conflict', 'waiting_ci', 'needs_human', 'blocked'], integrate: ['implemented', 'replan'],
     replan: ['planned'], merge: ['merged', 'waiting_merge'], close: ['closed'], cleanup: ['cleaned'],
     'spec-audit': ['complete', 'needs_closeout', 'waiting_human', 'blocked'], 'spec-close': ['closed'],
+    'skill-child': ['completed', 'failed'],
   };
   if (r.complete) ensure(allowed[j.action].includes(r.status), `${j.action} 不接受完成状态 ${r.status}；跳过不能算通过`);
   const t = j.ticket === '$spec' ? undefined : ticket(s, j.ticket);

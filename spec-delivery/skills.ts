@@ -4,16 +4,13 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import {skillCapabilities,skillPackageNames,skillIdentity} from './skill-package.mjs';
 import { candidateVersion, ensure, event, currentProtocol, verifyNativeSession, type Job, type SkillBinding, type SkillCapability,
   inputVersion, type SkillChildRequest, type Tier, type SkillInvocation, type SkillMode, type SkillResult, type SkillStatus, type State } from './core.ts';
 
 const digest = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex');
-const capabilities: SkillCapability[] = ['implementation', 'diagnosis', 'authorReview', 'prReview', 'handoff'];
-const defaultNames: Record<SkillCapability, string> = {
-  implementation: 'implement', diagnosis: 'diagnosing-bugs', authorReview: 'code-review',
-  prReview: 'code-review-from-claude', handoff: 'handoff',
-};
-export const skillCapabilities = capabilities;
+const capabilities: readonly SkillCapability[] = skillCapabilities;
+export {skillCapabilities};
 /** A materialized candidate must use its own skill packages, never the caller's HOME. */
 export function configuredSkillRoot(): string | undefined {
   const configured=process.env.SPEC_DELIVERY_SKILL_ROOT;
@@ -34,7 +31,7 @@ export function defaultSkillPaths(root?: string): Record<SkillCapability, string
   const installed=root===undefined?configuredSkillRoot():root;
   const sourceRoot=installed || path.join(os.homedir(), '.agents', 'skills');
   const paths=Object.fromEntries(capabilities.map(capability =>
-    [capability, path.join(sourceRoot, defaultNames[capability], 'SKILL.md')])) as Record<SkillCapability, string>;
+    [capability, path.join(sourceRoot, skillPackageNames[capability], 'SKILL.md')])) as Record<SkillCapability, string>;
   if (installed === undefined) {
     paths.authorReview=path.join(path.dirname(fileURLToPath(import.meta.url)),
       'review-skills','code-review','SKILL.md');
@@ -67,16 +64,10 @@ export function resolveSkill(capability: SkillCapability, inputPath: string): Sk
     }
   };
   walk(root);
-  const source = fs.readFileSync(sourcePath, 'utf8');
-  const header = source.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
-  ensure(header && source.slice(header[0].length).trim(), `技能缺少有效 frontmatter 或正文：${sourcePath}`);
-  const name = header[1].match(/^name:\s*['"]?([^'"\r\n]+)['"]?\s*$/m)?.[1]?.trim();
-  ensure(name, `技能缺少 name：${sourcePath}`);
   // disable-model-invocation limits unsolicited model selection. The workflow's bound stage is an explicit call.
   files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
-  return { capability, name, sourcePath, files,
-    fingerprint: digest(JSON.stringify({ sourcePath, name, files: files.map(({relativePath, sha256}) => [relativePath, sha256]) })),
-    pinnedAt: new Date().toISOString() };
+  const identity=skillIdentity(sourcePath,fs.readFileSync(sourcePath,'utf8'),files);
+  return { capability, ...identity, sourcePath, files, pinnedAt: new Date().toISOString() };
 }
 export function defaultSkillBindings(root?: string) {
   const paths = defaultSkillPaths(root);

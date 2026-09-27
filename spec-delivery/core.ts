@@ -1,11 +1,12 @@
 /** 可移植的调度内核。语义判断由 L1/2/3 提供；转换、预算和证据版本由代码约束。 */
 import { createHash } from 'node:crypto';
 import {historicalReviewLenses,historicalBlocking,validateHistoricalConfirmation} from './legacy-review.ts';
+import {skillCapabilities as packageCapabilities, type SkillPackageCapability} from './skill-package.mjs';
 export type Tier = 'L1' | 'L2' | 'L3';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export interface Inputs { spec: number | string; targetBranch: string; models: Record<Tier, string> }
 export const currentProtocol = 3;
-export type SkillCapability = 'implementation' | 'diagnosis' | 'authorReview' | 'prReview' | 'handoff';
+export type SkillCapability = SkillPackageCapability;
 export type SkillMode = 'native_explicit' | 'source_execution';
 export type SkillStatus = 'pass' | 'changes_required' | 'incomplete' | 'skipped';
 export interface SkillFile { path: string; relativePath: string; sha256: string }
@@ -268,12 +269,11 @@ export interface State {
 }
 /** Historical protocol 2 review labels; protocol 3 delegates topology to its bound skill. */
 export const lenses = historicalReviewLenses;
-const requiredSkillCapabilities: SkillCapability[] = ['implementation','diagnosis','authorReview','prReview','handoff'];
 export function unifiedSkillsReady(s: State) {
   const bindings=s.v3?.skillBindings;
   return s.protocol===currentProtocol && s.v3?.executionPath==='unified-v03' &&
-    Array.isArray(bindings) && bindings.length===requiredSkillCapabilities.length &&
-    requiredSkillCapabilities.every(capability=>bindings.filter(b=>b?.capability===capability &&
+    Array.isArray(bindings) && bindings.length===packageCapabilities.length &&
+    packageCapabilities.every(capability=>bindings.filter(b=>b?.capability===capability &&
       !!b.fingerprint && !!b.sourcePath && Array.isArray(b.files) && b.files.length>0).length===1);
 }
 export function ensure(condition: unknown, message: string): asserts condition { if (!condition) throw new Error(message); }
@@ -355,7 +355,36 @@ function matchingReviews(s: State, t: Ticket) {
 }
 export function ticket(s: State, key: string) { const t = s.tickets.find(t => t.key === key); ensure(t, `未知工单 ${key}`); return t; }
 const busy = (j: Job) => j.status === 'leased' || j.status === 'running';
-const tierFor = (a: Action): Tier => ['claim', 'plan', 'plan-check', 'replan', 'adjudicate', 'spec-audit', 'spec-close', 'verify', 'cleanup'].includes(a) ? 'L1' : ['implement', 'author-review', 'self-standards', 'self-spec', 'publish'].includes(a) ? 'L3' : 'L2';
+interface ActionMetadata {
+  tier: Tier; fresh: boolean; authored: boolean; skills: readonly SkillCapability[]; rawSource: boolean;
+}
+/** Every action declares its routing and packet sources in one exhaustive table. */
+export const actionMetadata = {
+  claim:           {tier:'L1',fresh:false,authored:false,skills:[],rawSource:false},
+  plan:            {tier:'L1',fresh:true, authored:false,skills:[],rawSource:false},
+  'plan-check':    {tier:'L1',fresh:true, authored:false,skills:[],rawSource:false},
+  implement:       {tier:'L3',fresh:false,authored:true, skills:['implementation','diagnosis','authorReview','handoff'],rawSource:true},
+  'author-review': {tier:'L3',fresh:false,authored:false,skills:['authorReview'],rawSource:true},
+  'self-standards':{tier:'L3',fresh:false,authored:false,skills:[],rawSource:false},
+  'self-spec':     {tier:'L3',fresh:false,authored:false,skills:[],rawSource:false},
+  verify:          {tier:'L1',fresh:false,authored:false,skills:[],rawSource:false},
+  publish:         {tier:'L3',fresh:false,authored:true, skills:[],rawSource:false},
+  'pr-review':     {tier:'L2',fresh:false,authored:false,skills:['prReview'],rawSource:true},
+  'review-lens':   {tier:'L2',fresh:false,authored:false,skills:[],rawSource:true},
+  confirm:         {tier:'L2',fresh:false,authored:false,skills:[],rawSource:false},
+  adjudicate:      {tier:'L1',fresh:true, authored:false,skills:[],rawSource:false},
+  'review-report': {tier:'L2',fresh:false,authored:false,skills:[],rawSource:false},
+  accept:          {tier:'L2',fresh:true, authored:false,skills:[],rawSource:true},
+  integrate:       {tier:'L2',fresh:false,authored:true, skills:[],rawSource:true},
+  replan:          {tier:'L1',fresh:true, authored:true, skills:[],rawSource:true},
+  merge:           {tier:'L2',fresh:false,authored:false,skills:[],rawSource:false},
+  close:           {tier:'L2',fresh:false,authored:false,skills:[],rawSource:false},
+  cleanup:         {tier:'L1',fresh:false,authored:false,skills:[],rawSource:false},
+  'spec-audit':    {tier:'L1',fresh:true, authored:false,skills:[],rawSource:false},
+  'spec-close':    {tier:'L1',fresh:false,authored:false,skills:[],rawSource:false},
+  'skill-child':   {tier:'L2',fresh:false,authored:false,skills:[],rawSource:true},
+  'repair-receipt':{tier:'L2',fresh:false,authored:false,skills:[],rawSource:false},
+} as const satisfies Record<Action,ActionMetadata>;
 const boundAuthorReview = (s: State) => unifiedSkillsReady(s);
 // agent 的测试按实际执行申请，不能在整段读代码/推理时间占住测试批次。
 const hasTests = (a: Action) => a === 'verify' ? 1 : 0;
@@ -662,11 +691,11 @@ export function reserve(s: State): Job[] {
     if (c.action === 'claim' && inFlightIssues.size >= s.policy.issues) continue;
     // 所有合并、关闭以及 spec 终结共用一个提交通道。
     if (['merge', 'close', 'spec-close'].includes(c.action) && active.some(j => ['merge', 'close', 'spec-close'].includes(j.action))) continue;
-    const tier = tierFor(c.action);
+    const tier = actionMetadata[c.action].tier;
     if (s.protocol === currentProtocol && c.action === 'implement')
       ensure(c.t && currentDecision(s, 'plan-check', c.t.key, candidateVersion(s, c.t)),
         `#${c.t?.number} 缺少当前输入与候选的独立 L1 计划复核`);
-    const fresh = c.t?.phase === 'fresh' || ['plan', 'plan-check', 'accept', 'replan', 'spec-audit', 'adjudicate'].includes(c.action);
+    const fresh = c.t?.phase === 'fresh' || actionMetadata[c.action].fresh;
     const contextIntent=contextIntentFor(s,key,c.action,part,fresh);
     const predecessor=s.jobs.find(x=>x.id===contextIntent.predecessorJobId);
     const lineage=contextIntent.lineage!;

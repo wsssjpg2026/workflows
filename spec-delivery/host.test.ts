@@ -7,6 +7,7 @@ import {createHash} from 'node:crypto';
 import { stripTypeScriptTypes } from 'node:module';
 import { normalizeResult } from './host.ts';
 import { renderZcode, stageResult, packet } from '../spec-delivery.workflow.ts';
+import {skillCapabilities} from './skill-package.mjs';
 import type { State, Job } from './core.ts';
 function setup() {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'workflow-host-'));
@@ -44,7 +45,9 @@ test('ZCode 每个 job 独立原生 run，快任务报告不等待其它模型�
       return {token,jobId:j.id,targetHost:'zcode',requestedModel:j.model,packetPath,requestPath,
         requestDigest:sha(fs.readFileSync(requestPath,'utf8')),status:'prepared'};
     });
-    x.s.v3={dispatchRecords:records} as any;
+    x.s.v3={executionPath:'unified-v03',decisionRecords:[],skillInvocations:[],dispatchRecords:records,
+      skillBindings:skillCapabilities.map(capability=>({capability,sourcePath:'/fixture/SKILL.md',
+        fingerprint:'fixture',files:[{path:'/fixture/SKILL.md',relativePath:'SKILL.md',sha256:'fixture'}]}))} as any;
     const runs=renderZcode(x.s,x.file) as {arguments:{path:string;subagent_model:string}}[];
     assert.equal(runs.length,2);assert.notEqual(runs[0].arguments.path,runs[1].arguments.path);
     assert.deepEqual(runs.map(r=>r.arguments.subagent_model),[x.j.model,slowJob.model]);

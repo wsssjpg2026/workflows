@@ -9,6 +9,7 @@ import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {scriptForJob} from './adapters/zcode.mjs';
 import {renderZcode} from '../spec-delivery.workflow.ts';
+import {skillCapabilities} from './skill-package.mjs';
 
 const adapter=fileURLToPath(new URL('./adapters/zcode.mjs',import.meta.url));
 function fixture(bridgeEnabled=true){
@@ -198,7 +199,10 @@ test('zcode 入口按持久派发记录生成不同模型的独立 CreateWorkflo
       requestedModel:d.model,packetPath:d.packetPath,requestPath:d.requestPath,
       requestDigest:createHash('sha256').update(fs.readFileSync(d.requestPath)).digest('hex'),
       status:'prepared'}));
-    const state={protocol:3,v3:{dispatchRecords:records},tickets:[],
+    const state={schema:1,protocol:3,status:'running',
+      v3:{executionPath:'unified-v03',decisionRecords:[],skillInvocations:[],dispatchRecords:records,
+        skillBindings:skillCapabilities.map(capability=>({capability,sourcePath:'/fixture/SKILL.md',
+          fingerprint:'fixture',files:[{path:'/fixture/SKILL.md',relativePath:'SKILL.md',sha256:'fixture'}]}))},tickets:[],
       jobs:[a,b].map(d=>({id:d.jobId,status:'leased',executor:'agent',model:d.model,ticket:d.jobId}))};
     const output=renderZcode(state as any,x.statePath) as {jobId:string;token:string;arguments:{path:string;subagent_model:string}}[];
     assert.equal(output.length,2);assert.notEqual(output[0].arguments.path,output[1].arguments.path);

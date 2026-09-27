@@ -31,6 +31,7 @@ function fixture(failingTest=false,spoofCoverage=false){
     scripts:{test:'node --test spec-delivery/smoke.test.js'}}));
   add('spec-delivery.workflow.ts',"console.log(JSON.stringify({workflow:'spec-delivery',version:'0.3.0'}));\n");
   const copied=add('spec-delivery/candidate.mjs',fs.readFileSync(materializer));fs.chmodSync(copied,0o755);
+  add('spec-delivery/skill-package.mjs',fs.readFileSync(new URL('./skill-package.mjs',import.meta.url)));
   add('spec-delivery/source.ts','export const source = 1;\n');
   add('spec-delivery/replay-coverage.json',JSON.stringify({schemaVersion:1,
     evidenceLevel:'isolated synthetic fixture',requirements:[{id:'smoke',
@@ -116,6 +117,16 @@ test('候选物化器自身必须属于固定 SHA，不能从工作区热补丁�
     fs.appendFileSync(path.join(x.repo,'spec-delivery','candidate.mjs'),'\n// changed working tree\n');
     const rejected=x.call('materialize',x.repo,x.commit,x.install,x.external);
     assert.notEqual(rejected.status,0);assert.match(rejected.stderr,/自身与目标提交不同/);
+    assert.equal(fs.existsSync(x.install),false);
+  }finally{x.cleanup();}
+});
+
+test('技能身份规则也必须属于固定 SHA，不能从工作区热补丁安装',()=>{
+  const x=fixture();
+  try{
+    fs.appendFileSync(path.join(x.repo,'spec-delivery','skill-package.mjs'),'\n// changed after commit\n');
+    const rejected=x.call('materialize',x.repo,x.commit,x.install,x.external);
+    assert.notEqual(rejected.status,0);assert.match(rejected.stderr,/技能身份规则与目标提交不同/);
     assert.equal(fs.existsSync(x.install),false);
   }finally{x.cleanup();}
 });

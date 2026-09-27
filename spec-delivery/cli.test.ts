@@ -241,11 +241,10 @@ test('确认命令进程树已停止后可取消并退役，无须重新执行�
     assert.equal(JSON.parse(fs.readFileSync(x.statePath,'utf8')).jobs[0].status,'cancelled');
   } finally {fs.rmSync(x.root,{recursive:true,force:true});}
 });
-test('公开 CLI 创建 PR 与完成评论遇响应丢失后按稳定操作标记对账',()=>{
+test('缺少技能绑定的过渡 v3 账本只读，所有执行入口零远端写入',()=>{
   const x=setup();try {
-    // This focused operation-intent fixture predates bound author reviews; the
-    // full v3 replay above proves the same lost-response path with live review.
-    const remote=deliveryRemote(x,{state:'OPEN'});remote.update({loseCreate:true,loseComment:true});
+    // The full v3 lifecycle replay covers legal lost-create/lost-comment recovery.
+    const remote=deliveryRemote(x,{state:'OPEN'});
     x.s.jobs=[];x.t.phase='publish';x.s.validationOwner=x.t.key;
     x.t.evidence.self={head:x.head,base:x.head,path:path.join(x.root,'evidence.md')};
     x.t.evidence.tests={head:x.head,base:x.head,path:path.join(x.root,'evidence.md'),
@@ -255,11 +254,27 @@ test('公开 CLI 创建 PR 与完成评论遇响应丢失后按稳定操作标�
     const body=path.join(x.run,'body.md'),completion=path.join(x.run,'completion.md'),request=path.join(x.run,'publish-request.json');
     fs.writeFileSync(body,'Implements issue criteria.');fs.writeFileSync(completion,'Author checks complete.');
     fs.writeFileSync(request,JSON.stringify({title:'Deliver task',bodyPath:body,completionPath:completion}));
-    const first=x.call('publish-pr',x.statePath,j.id,request);assert.equal(first.status,0,first.stderr);
-    const second=x.call('publish-pr',x.statePath,j.id,request);assert.equal(second.status,0,second.stderr);
-    assert.equal(remote.read().creates,1);assert.equal(remote.read().posts,1);
-    assert.equal(JSON.parse(first.stdout).data.operationId,JSON.parse(second.stdout).data.operationId);
-    assert.match(remote.read().prs[0].body,/spec-delivery:cli-fixture:101:pr:/);
+    const testRequest=path.join(x.run,'test-request.json');fs.writeFileSync(testRequest,JSON.stringify({argv:[process.execPath,'-e','process.exit(0)'],timeoutSeconds:5,reason:'must stay read-only'}));
+    const mergeRequest=path.join(x.run,'merge-request.json');fs.writeFileSync(mergeRequest,JSON.stringify({strategy:'merge'}));
+    const before=fs.readFileSync(x.statePath),beforeRemote=fs.readFileSync(remote.remote);
+    for(const args of [
+      ['publish-pr',x.statePath,j.id,request],['execute',x.statePath,j.id],
+      ['test',x.statePath,j.id,testRequest],['merge-pr',x.statePath,j.id,mergeRequest],
+      ['guard',x.statePath,j.id],['next',x.statePath],['dispatch',x.statePath,j.id],
+      ['collect',x.statePath],['stage',x.statePath,j.id,'{}'],['ci-attest',x.statePath,j.id,testRequest],
+    ]){
+      const denied=x.call(...args);assert.notEqual(denied.status,0,`${args[0]} unexpectedly ran`);
+      assert.match(denied.stderr,/缺少完整技能绑定/);
+    }
+    assert.throws(()=>packet(x.s,j,x.statePath),/缺少完整技能绑定/);
+    assert.throws(()=>stageResult(x.statePath,j.id,{}),/缺少完整技能绑定/);
+    assert.deepEqual(fs.readFileSync(x.statePath),before);
+    assert.deepEqual(fs.readFileSync(remote.remote),beforeRemote);
+    assert.equal(remote.read().creates,0);assert.equal(remote.read().posts,0);
+    assert.equal(remote.read().merges,0);
+    assert.equal(fs.existsSync(path.join(x.run,'actions')),false);
+    for(const readOnly of ['inspect','metrics','migration-context'])
+      assert.equal(x.call(readOnly,x.statePath).status,0,`${readOnly} must remain readable`);
   } finally {fs.rmSync(x.root,{recursive:true,force:true});}
 });
 test('公开 CLI 的无 CI 豁免要求当前 PR 空检查及远端空工作流清单',()=>{
@@ -295,20 +310,26 @@ test('合并响应不确定时复用固定意图，远端已合并则不再写�
     assert.equal(JSON.parse(result.stdout).status,'merged');assert.equal(remote.read().merges,0);
   } finally {fs.rmSync(x.root,{recursive:true,force:true});}
 });
-test('PR 创建请求是否生效未知且远端未出现时，不重发同一写请求',()=>{
+test('部分技能绑定也不能借已有发布意图重试远端写入',()=>{
   const x=setup();try {
-    const remote=deliveryRemote(x,{state:'OPEN'});remote.update({dropCreate:true});
+    const remote=deliveryRemote(x,{state:'OPEN'});
     x.s.jobs=[];x.t.phase='publish';x.s.validationOwner=x.t.key;
     x.t.evidence.self={head:x.head,base:x.head,path:path.join(x.root,'evidence.md')};
     x.t.evidence.tests={head:x.head,base:x.head,path:path.join(x.root,'evidence.md')};
     const j=e.reserve(x.s)[0];j.nativeId='native-publisher';j.status='running';
-    delete x.s.v3!.skillBindings;fs.writeFileSync(x.statePath,JSON.stringify(x.s));
+    x.s.v3!.skillBindings=x.s.v3!.skillBindings!.filter(binding=>binding.capability!=='handoff');
+    fs.writeFileSync(x.statePath,JSON.stringify(x.s));
     const body=path.join(x.run,'body.md'),completion=path.join(x.run,'completion.md'),request=path.join(x.run,'request.json');
     fs.writeFileSync(body,'body');fs.writeFileSync(completion,'completion');
     fs.writeFileSync(request,JSON.stringify({title:'PR',bodyPath:body,completionPath:completion}));
-    assert.notEqual(x.call('publish-pr',x.statePath,j.id,request).status,0);
+    const attempt=path.join(x.run,'actions',createHash('sha256').update(j.id).digest('hex').slice(0,20)+'.pr-create.attempt.json');
+    fs.mkdirSync(path.dirname(attempt),{recursive:true});fs.writeFileSync(attempt,'{}');
+    const before=fs.readFileSync(x.statePath),beforeRemote=fs.readFileSync(remote.remote);
     const retry=x.call('publish-pr',x.statePath,j.id,request);assert.notEqual(retry.status,0);
-    assert.match(retry.stderr,/不能盲目重发/);assert.equal(remote.read().creates,1);
+    assert.match(retry.stderr,/缺少完整技能绑定/);
+    assert.deepEqual(fs.readFileSync(x.statePath),before);
+    assert.deepEqual(fs.readFileSync(remote.remote),beforeRemote);
+    assert.equal(remote.read().creates,0);assert.equal(remote.read().posts,0);
   } finally {fs.rmSync(x.root,{recursive:true,force:true});}
 });
 test('公开 CLI 清理前再次读取 MERGED+CLOSED，并保留脏 worktree',()=>{
@@ -323,4 +344,56 @@ test('公开 CLI 清理前再次读取 MERGED+CLOSED，并保留脏 worktree',()
     assert.ok(fs.existsSync(path.join(x.t.worktree,'uncommitted.txt')));
     assert.equal(remote.read().state,'MERGED');
   } finally {fs.rmSync(x.root,{recursive:true,force:true});}
+});
+
+test('锁定的 worktree 保留远端分支；远端删除失败后仍可重试清理',()=>{
+  const x=setup();try {
+    const remote=deliveryRemote(x,{state:'MERGED'});remote.update({issueState:'CLOSED'});
+    const bare=path.join(x.run,'origin.git');git(x.root,'init','--bare',bare);
+    git(x.root,'remote','add','origin',bare);git(x.root,'push','origin','main','task');
+    const actualGit=execFileSync('which',['git'],{encoding:'utf8'}).trim();
+    const shim=path.join(x.root,'bin','git');fs.writeFileSync(shim,`#!/usr/bin/env node
+const cp=require('child_process');const a=process.argv.slice(2);
+if(a[0]==='remote'&&a[1]==='get-url')console.log('https://github.com/example/test.git');
+else{const r=cp.spawnSync(${JSON.stringify(actualGit)},a,{stdio:'inherit'});process.exit(r.status??1);}
+`);fs.chmodSync(shim,0o755);
+    x.s.jobs=[];x.t.phase='cleanup';x.t.pr=201;x.s.validationOwner=undefined;
+    const j=e.reserve(x.s)[0];assert.equal(j.action,'cleanup');
+    git(x.root,'worktree','lock',x.t.worktree,'--reason','another user is inspecting this checkout');
+    fs.writeFileSync(x.statePath,JSON.stringify(x.s));
+    const before=git(x.root,'ls-remote','--heads','origin','refs/heads/task');
+    const denied=x.call('execute',x.statePath,j.id);
+    assert.notEqual(denied.status,0);assert.match(denied.stderr,/锁定|仍在使用/);
+    assert.equal(git(x.root,'ls-remote','--heads','origin','refs/heads/task'),before);
+    assert.ok(fs.existsSync(x.t.worktree));
+    const recover=(suffix:string)=>{
+      const bound=JSON.parse(fs.readFileSync(x.statePath,'utf8')).jobs[0];
+      const proof=path.join(x.run,`stopped-${suffix}.json`);
+      fs.writeFileSync(proof,JSON.stringify([{jobId:j.id,nativeId:bound.nativeId,state:'stopped',
+        processTreeStopped:true,commandDisposition:'recover',evidencePath:path.join(x.root,'evidence.md')}]));
+      const result=x.call('reconcile',x.statePath,proof);assert.equal(result.status,0,result.stderr);
+    };
+    git(x.root,'worktree','unlock',x.t.worktree);
+    recover('locked');
+    const failOnce=path.join(x.run,'fail-remote-delete-once');fs.writeFileSync(failOnce,'pending');
+    fs.writeFileSync(shim,`#!/usr/bin/env node
+const cp=require('child_process'),fs=require('fs');const a=process.argv.slice(2);
+if(a[0]==='remote'&&a[1]==='get-url')console.log('https://github.com/example/test.git');
+else if(a[0]==='push'&&a.at(-1)===':refs/heads/task'&&fs.existsSync(${JSON.stringify(failOnce)})){
+  fs.unlinkSync(${JSON.stringify(failOnce)});console.error('injected remote delete failure');process.exit(17);
+}else{const r=cp.spawnSync(${JSON.stringify(actualGit)},a,{stdio:'inherit'});process.exit(r.status??1);}
+`);fs.chmodSync(shim,0o755);
+    const first=x.call('execute',x.statePath,j.id);
+    assert.notEqual(first.status,0);assert.match(first.stderr,/injected remote delete failure/);
+    assert.equal(fs.existsSync(x.t.worktree),false,'本地 worktree 已安全移除');
+    assert.equal(git(x.root,'ls-remote','--heads','origin','refs/heads/task'),before,
+      '远端失败保留原分支，供重试或人工检查');
+    recover('remote-failed');
+    const retry=x.call('execute',x.statePath,j.id);assert.equal(retry.status,0,retry.stderr);
+    assert.equal(git(x.root,'ls-remote','--heads','origin','refs/heads/task'),'');
+    assert.equal(JSON.parse(fs.readFileSync(x.statePath,'utf8')).tickets[0].phase,'done');
+  }finally{
+    if(fs.existsSync(x.t.worktree))try{git(x.root,'worktree','unlock',x.t.worktree);}catch{}
+    fs.rmSync(x.root,{recursive:true,force:true});
+  }
 });

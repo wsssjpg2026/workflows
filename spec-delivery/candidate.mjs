@@ -5,6 +5,7 @@ import path from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {execFileSync,spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
+import {skillPackageNames,externalSkillPackages,originalSkillBaselines,skillIdentity} from './skill-package.mjs';
 
 const self=fileURLToPath(import.meta.url);
 const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
@@ -16,13 +17,6 @@ const safeRelative=relative=>{
     !relative.split('/').some(part=>!part||part==='.'||part==='..')&&
     !relative.includes('\\')&&!relative.includes('\0'),'候选含不安全的相对路径');
   return relative;
-};
-const packageNames={implementation:'implement',diagnosis:'diagnosing-bugs',
-  authorReview:'code-review',prReview:'code-review-from-claude',handoff:'handoff'};
-const externalPackages=new Set(['implement','diagnosing-bugs','handoff']);
-const originalSkillBaselines={
-  implement:'6d3fd9e83b8f36e5213854779db49b256a457a7ebb4a503e53fa7dcff696adc3',
-  handoff:'7c62de979fdc7ac32fb5ddb2146156c917f80ee070d30fadc9d40343c4b6ed25',
 };
 
 function tracked(repo,commit){
@@ -74,15 +68,6 @@ function packageContents(directory){
   ensure(found.some(file=>file.relative==='SKILL.md'),'技能包缺少 SKILL.md');
   return found.sort((a,b)=>a.relative.localeCompare(b.relative));
 }
-function skillFingerprint(sourcePath,files){
-  const source=fs.readFileSync(sourcePath,'utf8');
-  const header=source.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
-  ensure(header&&source.slice(header[0].length).trim(),'技能缺少有效 frontmatter 或正文');
-  const name=header[1].match(/^name:\s*['"]?([^'"\r\n]+)['"]?\s*$/m)?.[1]?.trim();
-  ensure(name,'技能缺少 name');
-  return {name,fingerprint:sha(JSON.stringify({sourcePath,name,
-    files:files.map(file=>[file.relativePath,file.sha256])}))};
-}
 function materialize(repoInput,commit,installInput,skillRootInput){
   ensure(path.isAbsolute(repoInput)&&path.isAbsolute(installInput)&&path.isAbsolute(skillRootInput),
     '仓库、安装和外部技能来源必须为绝对路径');
@@ -97,6 +82,10 @@ function materialize(repoInput,commit,installInput,skillRootInput){
   const entries=tracked(repo,commit),script=entries.find(x=>x.relative==='spec-delivery/candidate.mjs');
   ensure(script&&git(repo,'cat-file','blob',script.oid).equals(fs.readFileSync(self)),
     '物化器自身与目标提交不同；先从固定提交运行');
+  const identityModule=entries.find(x=>x.relative==='spec-delivery/skill-package.mjs');
+  ensure(identityModule&&git(repo,'cat-file','blob',identityModule.oid).equals(
+    fs.readFileSync(path.join(path.dirname(self),'skill-package.mjs'))),
+    '技能身份规则与目标提交不同；先从固定提交运行');
   ensure(entries.some(x=>x.relative==='spec-delivery.workflow.ts')&&
     entries.some(x=>x.relative==='package.json')&&
     entries.some(x=>x.relative==='spec-delivery/replay-coverage.json')&&
@@ -120,8 +109,8 @@ function materialize(repoInput,commit,installInput,skillRootInput){
     for(const entry of entries)writeFile(install,entry.relative,git(repo,'cat-file','blob',entry.oid),
       entry.mode,{kind:'git',object:entry.oid},files);
     const skills=[];
-    for(const [capability,packageName] of Object.entries(packageNames)){
-      const external=externalPackages.has(packageName);
+    for(const [capability,packageName] of Object.entries(skillPackageNames)){
+      const external=externalSkillPackages.includes(packageName);
       const sourceDirectory=external?path.join(skillRoot,packageName):
         path.join(install,'spec-delivery','review-skills',packageName);
       const contents=packageContents(sourceDirectory),copied=[];
@@ -140,7 +129,7 @@ function materialize(repoInput,commit,installInput,skillRootInput){
           `外部技能来源在复制期间变化：${packageName}`);
       }
       const sourcePath=path.join(install,'skills',packageName,'SKILL.md');
-      const identity=skillFingerprint(sourcePath,copied);
+      const identity=skillIdentity(sourcePath,fs.readFileSync(sourcePath,'utf8'),copied);
       skills.push({capability,package:packageName,source:external?sourceDirectory:
         `git:${commit}:spec-delivery/review-skills/${packageName}`,
         sourcePath,files:copied,...identity});
@@ -191,7 +180,8 @@ function verify(installInput,expectedSha){
   ensure(sha(bytes)===expectedSha,'候选清单与冻结记录不符');
   const manifest=JSON.parse(bytes.toString('utf8'));
   ensure(manifest.schemaVersion===1&&/^[0-9a-f]{40,64}$/.test(manifest.candidateCommit)&&
-    Array.isArray(manifest.files)&&Array.isArray(manifest.skills)&&manifest.skills.length===5,
+    Array.isArray(manifest.files)&&Array.isArray(manifest.skills)&&
+    manifest.skills.length===Object.keys(skillPackageNames).length,
     '候选清单格式不完整');
   for(const [name,expectedSha256] of Object.entries(originalSkillBaselines)){
     const record=manifest.sourceBaselines?.[name];
@@ -239,7 +229,7 @@ function verify(installInput,expectedSha){
     actualDirectories.every(directory=>expectedDirectories.has(directory)),
     '候选安装包含清单之外的目录');
   for(const skill of manifest.skills){
-    ensure(packageNames[skill.capability]===skill.package,'候选技能能力与包不匹配');
+    ensure(skillPackageNames[skill.capability]===skill.package,'候选技能能力与包不匹配');
     const sourcePath=path.join(install,'skills',skill.package,'SKILL.md');
     ensure(skill.sourcePath===sourcePath,'候选技能路径与安装目录不符');
     const prefix=`skills/${skill.package}/`;
@@ -248,7 +238,7 @@ function verify(installInput,expectedSha){
       [file.path.slice(prefix.length),file.sha256]).sort((a,b)=>a[0].localeCompare(b[0]));
     ensure(JSON.stringify(declared)===JSON.stringify(installed),
       `候选技能依赖清单不完整：${skill.capability}`);
-    const identity=skillFingerprint(sourcePath,skill.files);
+    const identity=skillIdentity(sourcePath,fs.readFileSync(sourcePath,'utf8'),skill.files);
     ensure(identity.name===skill.name&&identity.fingerprint===skill.fingerprint,
       `候选技能包指纹不符：${skill.capability}`);
   }

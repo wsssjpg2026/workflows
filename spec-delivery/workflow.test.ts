@@ -1,6 +1,31 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import * as e from './core.ts';
+import {skillCapabilities} from './skill-package.mjs';
+
+test('每种 Action 显式声明层级、新上下文、作者来源、技能与原始资料分类',()=>{
+  const declared=fs.readFileSync(new URL('./core.ts',import.meta.url),'utf8')
+    .match(/export type Action\s*=\s*([^;]+);/);
+  assert.ok(declared,'Action union must remain an explicit finite type');
+  const expected=[...declared[1].matchAll(/'([^']+)'/g)].map(match=>match[1]) as e.Action[];
+  assert.ok(expected.length>0,'Action union must contain concrete action names');
+  assert.deepEqual(Object.keys(e.actionMetadata).sort(),expected.sort());
+  for(const action of expected){
+    const policy=e.actionMetadata[action];
+    assert.ok(['L1','L2','L3'].includes(policy.tier),action);
+    assert.equal(typeof policy.fresh,'boolean',action);
+    assert.equal(typeof policy.authored,'boolean',action);
+    assert.equal(typeof policy.rawSource,'boolean',action);
+    assert.ok(Array.isArray(policy.skills),action);
+    assert.ok(policy.skills.every(capability=>skillCapabilities.includes(capability)),action);
+  }
+  assert.deepEqual(e.actionMetadata.implement.skills,
+    ['implementation','diagnosis','authorReview','handoff']);
+  assert.equal(e.actionMetadata['pr-review'].rawSource,true);
+  assert.equal(e.actionMetadata.publish.authored,true);
+  assert.equal(e.actionMetadata.accept.fresh,true);
+});
 
 function fixture(human = false): e.State {
   const s: e.State = { schema: 1, id: 'isolated-test', revision: 0,

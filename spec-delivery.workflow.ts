@@ -495,6 +495,9 @@ function requireUnified(s: engine.State) {
   engine.ensure(engine.unifiedSkillsReady(s),
     '统一执行路径缺少完整技能绑定；先 inspect 并显式 migrate-skills，不能回退固定审查调度');
 }
+function requireBoundV3(s: engine.State) {
+  if(s.protocol===engine.currentProtocol)requireUnified(s);
+}
 function unifiedDispatchRequired(s:engine.State,j:engine.Job) {
   return s.protocol===engine.currentProtocol&&s.v3?.executionPath==='unified-v03'&&
     j.executor==='agent'&&!j.legacyManualLease;
@@ -849,6 +852,7 @@ export function initialize(inputs: engine.Inputs, cwd = process.cwd()) {
     resources: { cpus: os.availableParallelism(), freeMemoryBytes: os.freemem(), loadAverage: os.loadavg() } };
 }
 export function packet(s: engine.State, j: engine.Job, statePath: string, sourceArchive?: RawSourceIndex) {
+  requireBoundV3(s);
   const t = s.tickets.find(t => t.key === j.ticket);
   const disagreement=j.action==='adjudicate' && s.protocol===engine.currentProtocol && t
     ? engine.activeReviewDisagreement(s,t) : undefined;
@@ -875,7 +879,7 @@ export function packet(s: engine.State, j: engine.Job, statePath: string, source
       resourceGrant:{agentSlots:1,testBatches:0,nestedAgents:false,worktreeWrite:false},
       note:'只纠正回执格式；读取原始字节及上下文后返回完整 JSON 结果。禁止实现、推送、评论、合并或修改工作区。'};
   }
-  const authored = ['implement', 'publish', 'integrate', 'replan'].includes(j.action);
+  const authored = engine.actionMetadata[j.action].authored;
   const freshInitial = j.fresh && ['review-lens', 'pr-review'].includes(j.action);
   const freshChild = !!child && j.fresh;
   const prior = (child || freshInitial ? [] : s.jobs.filter(x => x.ticket === j.ticket && x.status === 'done' && x.result &&
@@ -950,14 +954,14 @@ export function packet(s: engine.State, j: engine.Job, statePath: string, source
       ? { capabilities: [child.skillCapability], command: 'skill-start', finishCommand: 'skill-finish',
           resultField: 'data.skillInvocationIds', note: '通过已固定的能力绑定调用引用技能，并提交原始宿主回执。' }
       : j.action === 'implement'
-      ? { capabilities: ['implementation', 'diagnosis', 'authorReview', 'handoff'], command: 'skill-start',
+      ? { capabilities: engine.actionMetadata[j.action].skills, command: 'skill-start',
           finishCommand: 'skill-finish', resultField: 'data.skillInvocationIds',
           note: '按批准计划选择 implement 或 diagnosing-bugs，测试走 test 预算入口。implement 内请求 /code-review 时，在 implementation 父调用下以 skill-delegate 委派一次当前 authorReview，head 为已提交候选；diagnosis 若没有内嵌审查，完成后由单个 author-review job 补审。完成候选后调用原始 handoff。' }
       : j.action === 'author-review'
-      ? { capabilities:['authorReview'],command:'skill-start',finishCommand:'skill-finish',
+      ? { capabilities:engine.actionMetadata[j.action].skills,command:'skill-start',finishCommand:'skill-finish',
           resultField:'data.skillInvocationIds',note:'对当前候选调用已绑定作者审查技能；技能自行委派专业子任务。' }
       : j.action === 'pr-review'
-      ? { capabilities: ['prReview'], command: 'skill-start', finishCommand: 'skill-finish',
+      ? { capabilities: engine.actionMetadata[j.action].skills, command: 'skill-start', finishCommand: 'skill-finish',
           delegateCommand: 'skill-delegate', childrenCommand: 'skill-children', resultField: 'data.skillInvocationIds',
           note: '按绑定技能包的 SKILL.md 和 automation-context.md 实际执行。技能按需登记子任务；提交完成的原始报告及宿主回执。跳过/未完成必须如实返回，不能签发 reviewed。' }
       : null,
@@ -1174,7 +1178,7 @@ function verifyReviewInvocation(s:engine.State,id:string) {
 function verify(s: engine.State, j: engine.Job, statePath: string): engine.Result {
   const t = engine.ticket(s, j.ticket);
   engine.ensure(j.action === 'verify' && active(j), '该 job 不是验证任务');
-  if(s.v3?.skillBindings)requireCurrentAuthorReview(s,t);
+  requireCurrentAuthorReview(s,t);
   ensureDecisionArtifacts(s, t, 'plan-check', false);
   engine.ensure(localHead(t) === j.head && clean(t), '验证前候选必须匹配且干净');
   const manifestBytes = fs.readFileSync(t.checksPath, 'utf8');
@@ -1212,7 +1216,19 @@ function cleanup(s: engine.State, j: engine.Job, statePath: string): engine.Resu
   engine.ensure(t.worktree.startsWith(path.join(s.repo.root, '.agents', 'worktrees') + path.sep), 'worktree 不在本 workflow 的资源范围内');
   engine.ensure(t.branch && ![s.inputs.targetBranch, s.repo.defaultBranch].includes(t.branch), '禁止清理目标/默认分支');
   engine.ensure(pr.headRef === t.branch, '资源登记分支与已合并 PR 的源分支不符');
+  const listed=git(s.repo.root,'worktree','list','--porcelain').split(/\n\n/).filter(Boolean).map(block=>{
+    const lines=block.split('\n');
+    return {path:lines.find(line=>line.startsWith('worktree '))?.slice(9),
+      branch:lines.find(line=>line.startsWith('branch '))?.slice(7),
+      locked:lines.some(line=>line==='locked'||line.startsWith('locked '))};
+  });
+  const registered=listed.find(row=>row.path===path.resolve(t.worktree));
   const wtExists = fs.existsSync(t.worktree);
+  engine.ensure(!registered?.locked,'worktree 已锁定或仍在使用，保留远端分支');
+  engine.ensure(!listed.some(row=>row.branch===`refs/heads/${t.branch}`&&row.path!==path.resolve(t.worktree)),
+    '分支仍被其他 worktree 使用，保留远端分支');
+  engine.ensure(wtExists?registered?.branch===`refs/heads/${t.branch}`:!registered,
+    '登记的 worktree 状态与资源账本不符，保留远端分支');
   if (wtExists) engine.ensure(clean(t) && localHead(t) === pr.head, 'worktree 有未保存或未合并的提交，保留待处理');
   const refs = git(s.repo.root, 'for-each-ref', '--format=%(objectname)', `refs/heads/${t.branch}`);
   engine.ensure(!refs || refs === pr.head, '本地分支包含 PR 候选外的提交，保留');
@@ -1223,9 +1239,14 @@ function cleanup(s: engine.State, j: engine.Job, statePath: string): engine.Resu
   engine.ensure(gh.targetHead(s.repo, s.inputs.targetBranch) === target, '清理检查期间目标分支变化，先重新核对');
   const remoteHead = git(s.repo.root, 'ls-remote', '--heads', remote, `refs/heads/${t.branch}`).split(/\s+/)[0];
   engine.ensure(!remoteHead || remoteHead === pr.head, '远程分支已被更新，保留未合并工作');
-  // 带期望 SHA 删除远程 ref；若远程在检查后被改动，Git 拒绝删除。
-  if (remoteHead) git(s.repo.root, 'push', `--force-with-lease=refs/heads/${t.branch}:${remoteHead}`, remote, `:refs/heads/${t.branch}`);
+  // First release the local worktree. Git refuses locked or in-use worktrees;
+  // the remote branch remains available when that safety check fails.
   if (wtExists) git(s.repo.root, 'worktree', 'remove', t.worktree);
+  engine.ensure(!git(s.repo.root,'worktree','list','--porcelain').split(/\n\n/).some(block=>
+    block.split('\n').includes(`branch refs/heads/${t.branch}`)),
+    '分支仍被 worktree 使用，保留远端分支');
+  // The lease refuses to delete a remote ref that changed during local cleanup.
+  if (remoteHead) git(s.repo.root, 'push', `--force-with-lease=refs/heads/${t.branch}:${remoteHead}`, remote, `:refs/heads/${t.branch}`);
   if (refs) git(s.repo.root, 'update-ref', '-d', `refs/heads/${t.branch}`, refs);
   const evidencePath = path.join(path.dirname(statePath), 'cleanup', sha(j.id).slice(0, 16) + '.json');
   write(evidencePath, { issue: t.number, pr: t.pr, branch: t.branch, worktree: t.worktree, head: pr.head, mergedCommit: pr.mergedHead, cleaned: true });
@@ -1337,14 +1358,14 @@ function operationIntent<T extends object>(statePath:string,j:engine.Job,kind:st
   return {operationId,file};
 }
 function publishPr(statePath:string,jobId:string,request:{title:string;bodyPath:string;completionPath:string}):engine.Result {
-  const s=read<engine.State>(statePath);requireProtocol(s);
+  const s=read<engine.State>(statePath);requireUnified(s);
   const j=s.jobs.find(j=>j.id===jobId);engine.ensure(j?.action==='publish'&&active(j)&&j.nativeId,
     '只允许已绑定的当前发布任务创建 PR');
   const t=engine.ticket(s,j.ticket);
   engine.ensure(t.phase==='publish'&&t.epoch===j.epoch&&t.head===j.head&&t.base===j.base&&
     engine.freshEvidence(t,'tests')&&engine.freshEvidence(t,'self')&&
     localHead(t)===t.head&&clean(t),'发布意图的候选或测试证据已过期');
-  if(s.v3?.skillBindings)requireCurrentAuthorReview(s,t);
+  requireCurrentAuthorReview(s,t);
   engine.ensure(gh.targetHead(s.repo,s.inputs.targetBranch)===t.base,'目标分支已变化，先集成并重审');
   engine.ensure(request.title?.trim(),'PR 需要标题');
   const body=fs.readFileSync(safeFile(request.bodyPath),'utf8');
@@ -1403,7 +1424,7 @@ function publishPr(statePath:string,jobId:string,request:{title:string;bodyPath:
     data:{pr:number,commentUrl,operationId:intent.operationId}};
 }
 function mergePr(statePath:string,jobId:string,request:{strategy:'merge'|'squash'|'rebase'}):engine.Result {
-  const s=read<engine.State>(statePath);requireProtocol(s);
+  const s=read<engine.State>(statePath);requireUnified(s);
   const j=s.jobs.find(j=>j.id===jobId);engine.ensure(j?.action==='merge'&&active(j)&&j.nativeId,
     '只允许已绑定的当前合并任务操作 PR');
   const t=engine.ticket(s,j.ticket);
@@ -1420,7 +1441,7 @@ function mergePr(statePath:string,jobId:string,request:{strategy:'merge'|'squash
     const attempt=path.join(path.dirname(statePath),'actions',`${sha(j.id).slice(0,20)}.merge.attempt.json`);
     if(fs.existsSync(attempt)) uncertain='已有合并请求但远端仍开放；等待平台结果或显式 L1 对账';
     else {
-      if(s.v3?.skillBindings)requireCurrentAuthorReview(s,t);
+      requireCurrentAuthorReview(s,t);
       if(s.protocol===engine.currentProtocol)verifyReviewEvidenceFiles(s,t);
       engine.ensure(engine.mergeGate(s,t),'合并前远端 head/base、审查、验收或 CI 门禁已改变');
       write(attempt,{operationId:intent.operationId,pr:t.pr,head:t.head,base:t.base,at:new Date().toISOString()});
@@ -1448,7 +1469,7 @@ function executeCommand(statePath: string, id: string) {
   let release = lock(statePath); let s: engine.State; let j: engine.Job;
   const receiptPath=commandReceipt(statePath,id);
   try {
-    s = read<engine.State>(statePath); requireProtocol(s); engine.ensure(s.status === 'running', 'workflow 未运行；暂停后不能执行命令任务');
+    s = read<engine.State>(statePath); requireUnified(s); engine.ensure(s.status === 'running', 'workflow 未运行；暂停后不能执行命令任务');
     const found = s.jobs.find(job => job.id === id);
     engine.ensure(found && (found.executor === 'command' || found.action === 'claim') && active(found), '任务不是可执行命令'); j = found;
     engine.ensure(!recovering(s, j), '工作区正在恢复，禁止执行原命令任务');
@@ -1560,7 +1581,7 @@ function applyHostCall(statePath: string, jobId: string, call: HostCall): {
 } {
   const release = lock(statePath);
   try {
-    const s = read<engine.State>(statePath); requireProtocol(s);
+    const s = read<engine.State>(statePath); requireUnified(s);
     const d = s.v3!.dispatchRecords.find(x => x.jobId === jobId), j = s.jobs.find(x => x.id === jobId);
     engine.ensure(d && j, '派发任务不存在');
     d.events.push(call.ref); d.updatedAt = call.ref.at;
@@ -1622,7 +1643,7 @@ function dispatchRound(statePath: string, jobId: string, launch: boolean) {
   const release = lock(statePath);
   let request: engine.DispatchRecord;
   try {
-    const s = read<engine.State>(statePath); if(launch)requireUnified(s);else requireProtocol(s);
+    const s = read<engine.State>(statePath); requireUnified(s);
     const j = s.jobs.find(x => x.id === jobId), d = s.v3!.dispatchRecords.find(x => x.jobId === jobId);
     engine.ensure(j && d && j.executor === 'agent', '任务尚未预留派发意图');
     if (j.status === 'done') return { jobId, status: 'completed', nativeId: j.nativeId };
@@ -1725,7 +1746,8 @@ function cancelDispatch(statePath:string,jobId:string) {
   } finally {rel();}}
 }
 export function renderZcode(s: engine.State, statePath: string) {
-  engine.ensure(s.protocol===engine.currentProtocol&&s.v3,'ZCode 脚本只为已落盘 token 的 v3 派发生成');
+  requireUnified(s);
+  engine.ensure(s.v3,'ZCode 脚本只为已落盘 token 的 v3 派发生成');
   const entry=fileURLToPath(import.meta.url);
   return s.jobs.filter(j=>j.status==='leased'&&j.executor==='agent'&&!recovering(s,j))
     .flatMap(j=>{
@@ -1748,6 +1770,7 @@ export function consumeStaged(statePath: string, ids?: string[]) {
   const release = lock(statePath);
   try {
     let s = read<engine.State>(statePath); allowCompletion(s);
+    requireBoundV3(s);
     const jobs = s.jobs.filter(j => active(j) && j.nativeId && j.executor === 'agent' && engine.contextReady(j) &&
       s.tickets.find(t => t.key === j.ticket)?.phase !== 'recovery' && (!ids || ids.includes(j.id)) &&
       (!unifiedDispatchRequired(s,j) || (()=>{
@@ -1955,6 +1978,7 @@ function stageRawResult(statePath: string, id: string, bytes: Buffer, source: en
   let revisionId = '', parseError = '';
   try {
     const s = read<engine.State>(statePath), j = s.jobs.find(j => j.id === id); allowCompletion(s);
+    requireUnified(s);
     engine.ensure(j && j.executor === 'agent' && (active(j) || j.status === 'done'), '只能接收已登记的 agent 任务结果');
     if(unifiedDispatchRequired(s,j)&&!options.recovery&&!(source==='repair'&&options.repairJobId))
       verifiedDispatchCompletion(s,j);
@@ -2211,7 +2235,7 @@ function runTest(statePath:string,id:string,request:{argv:string[];timeoutSecond
   const executionId=randomUUID(), out=path.join(path.dirname(statePath),'experiments',`${sha(id).slice(0,16)}-${executionId}`);
   let release=lock(statePath); let worktree='', base=''; let audit:engine.State|undefined;
   try {
-    const s=read<engine.State>(statePath), j=s.jobs.find(j=>j.id===id); requireProtocol(s);
+    const s=read<engine.State>(statePath), j=s.jobs.find(j=>j.id===id); requireUnified(s);
     engine.ensure(s.status==='running' && j && j.executor==='agent' && active(j),'只能为在途 agent 任务申请测试');
     engine.ensure(!recovering(s,j), '工作区正在恢复，不能启动新测试');
     s.facts = observe(s, [j]);
@@ -2299,6 +2323,10 @@ export async function main(argv: string[]): Promise<unknown> {
     return { inputVersion: engine.inputVersion(s), sourceVersion: s.planSourceVersion || null,
       tickets: s.tickets.map(t => ({ ticket: t.key, phase: t.phase, candidateVersion: engine.candidateVersion(s, t) })) };
   }
+  // Transitional v3 ledgers are read-only until explicit, quiescent migration.
+  // This check precedes all command, host and GitHub operations, including paths
+  // with their own state lock below. Historical protocol-2 completion is preserved.
+  if(op!=='upgrade'&&op!=='migrate-skills')requireBoundV3(read<engine.State>(path.resolve(file)));
   if (op === 'execute') { engine.ensure(extra, '需要 command jobId'); return executeCommand(path.resolve(file), extra); }
   if (op === 'publish-pr' || op === 'merge-pr') {
     engine.ensure(extra&&fourth,'需要 jobId 与固定远端操作请求文件');
@@ -2329,7 +2357,7 @@ export async function main(argv: string[]): Promise<unknown> {
     return recoverResult(path.resolve(file),decision);
   }
   if (op === 'collect') {
-    const statePath = path.resolve(file), state = read<engine.State>(statePath); requireProtocol(state);
+    const statePath = path.resolve(file), state = read<engine.State>(statePath); requireUnified(state);
     const records = state.v3!.dispatchRecords.filter(d => d.managed && (!extra || d.jobId === extra) &&
       ['starting','running','completed','uncertain'].includes(d.status));
     const polled = records.map(d => dispatchRound(statePath, d.jobId, false));
@@ -2360,6 +2388,7 @@ export async function main(argv: string[]): Promise<unknown> {
   const statePath = path.resolve(file), release = lock(statePath);
   try {
     let s = read<engine.State>(statePath); supportedLedger(s);
+    if(op!=='upgrade'&&op!=='migrate-skills')requireBoundV3(s);
     engine.ensure(s.status !== 'retired', '已退役运行只允许 inspect/metrics/summary，不能自动复活');
     if (op === 'ci-attest') {
       engine.ensure(extra && fourth, '需要验收 jobId 与豁免请求');
@@ -2571,7 +2600,7 @@ export async function main(argv: string[]): Promise<unknown> {
         return { allowed: true, base: s.facts.base, at: s.facts.at };
       }
       const t = engine.ticket(s, j.ticket);
-      if(s.v3?.skillBindings)requireCurrentAuthorReview(s,t);
+      requireCurrentAuthorReview(s,t);
       if(s.protocol===engine.currentProtocol)verifyReviewEvidenceFiles(s,t);
       engine.ensure(j.action === 'merge' && engine.mergeGate(s, t), '最新的合并门禁不满足，禁止合并');
       return { allowed: true, head: t.head, base: t.base, at: s.facts.at, note: '立即使用预期 head 约束合并；远端保护仍生效，目标分支由主控串行调度' };
@@ -2620,8 +2649,7 @@ export async function main(argv: string[]): Promise<unknown> {
         const record = s.v3?.dispatchRecords.find(d => d.jobId === j.id);
         if (j.executor === 'agent' && s.protocol === engine.currentProtocol) j.dispatchToken ||= record?.token || randomUUID();
         const sourceTicket=s.tickets.find(t=>t.key===j.ticket);
-        const sourceArchive=j.executor==='agent' && sourceTicket?.worktree &&
-          ['implement','author-review','pr-review','review-lens','skill-child','replan','integrate','accept'].includes(j.action)
+        const sourceArchive=j.executor==='agent' && sourceTicket?.worktree && engine.actionMetadata[j.action].rawSource
           ? rawSourcesForJob(s,sourceTicket,j,statePath) : undefined;
         const p = packet(s, j, statePath, sourceArchive);
         const file = path.join(path.dirname(statePath), 'packets', sha(j.id).slice(0, 20) + '.json'); write(file, p);

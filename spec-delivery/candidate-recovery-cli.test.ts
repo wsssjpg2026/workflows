@@ -4,11 +4,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import * as engine from './core.ts';
 
 const entry = fileURLToPath(new URL('../spec-delivery.workflow.ts', import.meta.url));
 const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const sha = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
+const artifactDigest = (files: string[]) => sha(JSON.stringify(files.map(file => ({ file: path.resolve(file), digest: sha(fs.readFileSync(file)) }))));
 
 function fixture(phase: 'implement' | 'integrate', withPr = false, prepareTask?: (worktree: string) => string) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-candidate-'));
@@ -55,20 +58,50 @@ console.log(JSON.stringify({data:{repository}}));
     inputs: { spec: 100, targetBranch: 'main', models: { L1: 'large', L2: 'middle', L3: 'small' } },
     spec: 100, repo: { root, slug: 'example/test', host: 'github.com', defaultBranch: 'main' },
     status: 'running', policy: { agents: 4, issues: 2, tests: 1, noProgress: 2, rounds: 3 },
-    specCriteria: ['done'], planEvidence: planPath, tickets: [ticket], jobs: [],
+    specCriteria: ['done'], planEvidence: planPath, planSourceVersion: 'fixture-source-v1', tickets: [ticket], jobs: [],
     facts: { base, issueStates: { 100: 'OPEN', 101: 'OPEN' }, prs: {}, at: '' }, auditEpoch: 1, events: [],
   };
+  // This fixture starts mid-delivery. Preserve the earlier L1 authorization that
+  // a real run would have recorded before reserving an implement/integrate job.
+  const seedSession = (nativeId: string, jobId: string): engine.NativeSession => {
+    const observation = { source: 'native_host' as const, observationId: `event-${nativeId}`, jobId,
+      nativeId, provider: 'fixture', model: 'large', observedAt: '2026-09-27T00:00:00.000Z' };
+    const raw = JSON.stringify(observation), evidencePath = path.join(run, `${nativeId}.json`);
+    fs.writeFileSync(evidencePath, raw + '\n');
+    return { ...observation, evidencePath, evidenceDigest: sha(raw) };
+  };
+  engine.recordL1Decision(state, { id: 'seed-global-plan', kind: 'execution-plan', scope: '$spec',
+    inputVersion: engine.inputVersion(state), sourceVersion: state.planSourceVersion,
+    candidateVersion: engine.globalDecisionVersion(state), artifactPath: evidencePath,
+    artifactFiles: [evidencePath], artifactDigest: artifactDigest([evidencePath]),
+    session: seedSession('seed-global-l1', '$spec:execution-plan'), at: '2026-09-27T00:00:00.000Z' });
+  if (phase === 'implement') engine.recordL1Decision(state, { id: 'seed-plan-check', kind: 'plan-check', scope: ticket.key,
+    inputVersion: engine.inputVersion(state), sourceVersion: state.planSourceVersion,
+    candidateVersion: engine.candidateVersion(state, ticket), artifactPath: planPath,
+    artifactFiles: [planPath, checksPath], artifactDigest: artifactDigest([planPath, checksPath]),
+    session: seedSession('seed-check-l1', 'seed-plan-check'), at: '2026-09-27T00:00:00.000Z' });
   const job = engine.reserve(state)[0];
   fs.writeFileSync(statePath, JSON.stringify(state));
-  const env = { ...process.env, PATH: bin + path.delimiter + process.env.PATH };
+  const sessions = path.join(run, 'native-sessions.json'); fs.writeFileSync(sessions, '{}');
+  const observe = (nativeId: string, jobId: string, model: string) => {
+    const all = JSON.parse(fs.readFileSync(sessions, 'utf8'));
+    all[nativeId] = { source: 'native_host', observationId: `event-${nativeId}`, jobId,
+      nativeId, provider: 'fixture', model, observedAt: '2026-09-27T00:00:00.000Z' };
+    fs.writeFileSync(sessions, JSON.stringify(all));
+  };
+  const observer = path.join(bin, 'native-observer');
+  fs.writeFileSync(observer, `#!/usr/bin/env node\nconst fs=require('fs');const all=JSON.parse(fs.readFileSync(${JSON.stringify(sessions)},'utf8'));const [op,id,job]=process.argv.slice(2);const found=all[id];if(op!=='observe'||!found||found.jobId!==job)process.exit(2);console.log(JSON.stringify(found));\n`);
+  fs.chmodSync(observer, 0o755);
+  const env = { ...process.env, PATH: bin + path.delimiter + process.env.PATH, SPEC_DELIVERY_HOST_OBSERVER: observer };
   const call = (...args: string[]) => spawnSync(process.execPath, [entry, ...args], { cwd: root, env, encoding: 'utf8' });
   const readState = () => JSON.parse(fs.readFileSync(statePath, 'utf8')) as engine.State;
   const bindingPath = path.join(run, 'binding.json');
   fs.writeFileSync(bindingPath, JSON.stringify({ nativeId: `host-${job.id}`, model: job.model }));
+  observe(`host-${job.id}`, job.id, job.model);
   const bound = call('bind', statePath, job.id, bindingPath);
   assert.equal(bound.status, 0, bound.stderr);
   return { root, run, base, worktree, statePath, evidencePath, handoffPath, planPath, checksPath,
-    targetFile, prFile, job, call, readState };
+    targetFile, prFile, job, call, readState, observe };
 }
 
 function receipt(x: ReturnType<typeof fixture>, head: string, base: string) {
@@ -92,6 +125,7 @@ function recover(x: ReturnType<typeof fixture>, head: string, base: string) {
 function completeAgent(x: ReturnType<typeof fixture>, job: engine.Job, status: string, head: string, data: Record<string, unknown> = {}) {
   const binding = path.join(x.run, `binding-${job.action}-${job.epoch}-${job.part}.json`);
   fs.writeFileSync(binding, JSON.stringify({ nativeId: `host-${job.id}`, model: job.model }));
+  x.observe(`host-${job.id}`, job.id, job.model);
   const bound = x.call('bind', x.statePath, job.id, binding);
   assert.equal(bound.status, 0, bound.stderr);
   const staged = x.call('stage', x.statePath, job.id, JSON.stringify({ complete: true, status, head, base: job.base,
@@ -129,6 +163,7 @@ test('commit H→M requesting replan hands M to L1, preserves unpushed candidate
     assert.equal(x.readState().tickets[0].head, m, 'remote PR at H must not overwrite local M');
     const bindFile = path.join(x.run, 'replan-binding.json');
     fs.writeFileSync(bindFile, JSON.stringify({ nativeId: 'native-L1-replan', model: planning.model }));
+    x.observe('native-L1-replan', planning.id, planning.model);
     assert.equal(x.call('bind', x.statePath, planning.id, bindFile).status, 0);
     const resultFile = path.join(x.run, 'replan-result.json');
     fs.writeFileSync(resultFile, JSON.stringify({ model: planning.model, complete: true, status: 'planned',

@@ -252,7 +252,7 @@ function recoveryFile(x:ReturnType<typeof fixture>,value:unknown) {
 }
 
 function skillChildHarness(x: ReturnType<typeof fixture>, authorReviewPath?: string,
-  professional: 'implementation'|'diagnosis'='implementation') {
+  professional: 'implementation'|'diagnosis'='implementation', managedParent=false) {
   const { statePath, binding } = approvedImplementation(x), host = controlledHost(x);
   if(authorReviewPath) {
     const state=JSON.parse(fs.readFileSync(statePath,'utf8'));
@@ -284,9 +284,12 @@ else if(op==='result') {
   };
   const parentJob = call('next',statePath).jobs.find((j: {action:string})=>j.action==='implement');
   assert.ok(parentJob);
-  x.observe('parent-skill-actor',parentJob.id,'small');
-  fs.writeFileSync(binding,JSON.stringify({nativeId:'parent-skill-actor'}));
-  call('bind',statePath,parentJob.id,binding);
+  if(managedParent)call('dispatch',statePath,parentJob.id);
+  else {
+    x.observe('parent-skill-actor',parentJob.id,'small');
+    fs.writeFileSync(binding,JSON.stringify({nativeId:'parent-skill-actor'}));
+    call('bind',statePath,parentJob.id,binding);
+  }
   const request=path.join(x.temp,'skill-request.json');
   fs.writeFileSync(request,JSON.stringify({capability:professional}));
   const parent=call('skill-start',statePath,parentJob.id,request);
@@ -916,6 +919,61 @@ test('批量 collect 和 drive 跳过已停止但派发仍不确定的任务，�
     assert.equal(after.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===a.id).events.length,
       stoppedDispatch.events.length);
     assert.equal(host.get().startTokens.filter((token:string)=>token===tokenA).length,1);
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('批量 collect 每项重查资格：首个回执触发 recovery 后跳过同票子任务并收取独立票', () => {
+  const x=fixture(false,true);
+  try {
+    const plan=JSON.parse(fs.readFileSync(x.planPath,'utf8'));
+    plan.policy.agents=5;fs.writeFileSync(x.planPath,JSON.stringify(plan));
+    const h=skillChildHarness(x,undefined,'implementation',true),statePath=h.statePath;
+    const beforeChildren=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const independent=beforeChildren.jobs.find((j:{ticket:string;action:string})=>j.ticket==='102'&&j.action==='plan');
+    assert.ok(independent);
+    h.call('skill-delegate',statePath,h.parent.invocationId,h.file('same-ticket-siblings.json',{children:[
+      {key:'first',tier:'L3',instruction:'Independent first implementation review',independent:true,required:true},
+      {key:'second',tier:'L3',instruction:'Independent second implementation review',independent:true,required:true},
+    ]}));
+    const children=h.call('next',statePath).jobs.filter((j:{action:string})=>j.action==='skill-child');
+    assert.equal(children.length,2);
+    for(const job of [...children,independent]) {
+      assert.equal(h.call('dispatch',statePath,job.id).status,'running');
+    }
+    const ordered=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const ids=[h.parentJob.id,...children.map((j:{id:string})=>j.id),independent.id];
+    // Preserve all public CLI-created records; vary only their order to exercise
+    // the legitimate batch sequence parent → same-ticket siblings → independent ticket.
+    ordered.v3.dispatchRecords.sort((a:{jobId:string},b:{jobId:string})=>
+      ids.indexOf(a.jobId)-ids.indexOf(b.jobId));
+    fs.writeFileSync(statePath,JSON.stringify(ordered));
+    const managed=ordered.v3.dispatchRecords.filter((d:{managed?:boolean})=>d.managed);
+    assert.deepEqual(managed.map((d:{jobId:string})=>d.jobId),ids);
+    const tokens=new Map(managed.map((d:{jobId:string;token:string})=>[d.jobId,d.token]));
+    const siblingEvents=children.map((j:{id:string})=>ordered.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===j.id).events.length);
+    const ticket=ordered.tickets.find((t:{key:string})=>t.key==='101');
+    fs.appendFileSync(path.join(ticket.worktree,'source.txt'),'uncommitted candidate work\n');
+    const checks=path.join(x.temp,'cross-ticket-checks.json');
+    fs.writeFileSync(checks,JSON.stringify({scopeReason:'Independent ticket acceptance',
+      commands:[{name:'smoke',argv:['true'],timeoutSeconds:5}]}));
+    h.host.set(db=>{
+      db.actors[tokens.get(h.parentJob.id)].state='completed';
+      db.actors[tokens.get(h.parentJob.id)].result={complete:true,status:'implemented',evidencePath:x.planEvidence};
+      db.actors[tokens.get(independent.id)].state='completed';
+      db.actors[tokens.get(independent.id)].result={complete:true,status:'planned',evidencePath:x.planEvidence,
+        data:{planPath:x.planPath,checksPath:checks}};
+    });
+    const collected=h.call('collect',statePath);
+    assert.deepEqual(collected.polled.map((p:{jobId:string})=>p.jobId),[h.parentJob.id,independent.id]);
+    assert.equal(collected.polled[0].status,'uncertain');
+    assert.equal(collected.polled[1].status,'completed');
+    const after=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(after.tickets.find((t:{key:string})=>t.key==='101').phase,'recovery');
+    assert.equal(after.jobs.find((j:{id:string})=>j.id===independent.id).status,'done');
+    for(const [index,child] of children.entries())
+      assert.equal(after.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===child.id).events.length,siblingEvents[index]);
+    for(const token of tokens.values())
+      assert.equal(h.host.get().startTokens.filter((started:string)=>started===token).length,1);
   } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
 });
 

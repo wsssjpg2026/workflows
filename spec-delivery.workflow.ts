@@ -2376,13 +2376,24 @@ export async function main(argv: string[]): Promise<unknown> {
   }
   if (op === 'collect') {
     const statePath = path.resolve(file), state = read<engine.State>(statePath); requireUnified(state);
-    const records = state.v3!.dispatchRecords.filter(d => {
-      if (!d.managed || !['starting','running','completed','uncertain'].includes(d.status)) return false;
-      if (extra) return d.jobId === extra;
-      const job = state.jobs.find(j => j.id === d.jobId);
-      return job && active(job) && !recovering(state, job);
-    });
-    const polled = records.map(d => dispatchRound(statePath, d.jobId, false));
+    const collectable = (current:engine.State, id:string) => {
+      const dispatch=current.v3?.dispatchRecords.find(d=>d.jobId===id);
+      const job=current.jobs.find(j=>j.id===id);
+      return !!dispatch?.managed && ['starting','running','completed','uncertain'].includes(dispatch.status) &&
+        !!job && active(job) && !recovering(current,job);
+    };
+    const records = state.v3!.dispatchRecords.filter(d =>
+      d.managed && ['starting','running','completed','uncertain'].includes(d.status) &&
+      (extra ? d.jobId===extra : collectable(state,d.jobId)));
+    const polled = [];
+    for(const d of records) {
+      // A preceding receipt may move this ticket into recovery or stop its job.
+      if(!extra) {
+        const current=read<engine.State>(statePath);requireUnified(current);
+        if(!collectable(current,d.jobId))continue;
+      }
+      polled.push(dispatchRound(statePath,d.jobId,false));
+    }
     return { polled, ...consumeStaged(statePath, extra ? [extra] : undefined) };
   }
   if (op === 'bind-batch') { engine.ensure(extra, '需要宿主批次绑定文件'); return bindBatch(path.resolve(file),read(extra)); }

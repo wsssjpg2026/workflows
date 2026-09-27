@@ -113,7 +113,7 @@ fresh 首轮 packet 只传原始 spec/issue 链接及缓存原件索引、候选
 
 ## 测试与 GitHub 观测
 
-所有 agent 的测试/构建/重型核验通过 `test <state> <jobId> <request.json>` 执行，请求格式 `{argv,timeoutSeconds,env?,reason}`。cwd 为任务 worktree。测试配额按实际执行占用；不足时等待，不改用未登记的旁路命令。测试命令和确定性 `verify` 不继承控制器的 `SPEC_DELIVERY_*`、`DSH_HOME`、`DSH_SESSION_ID`、`DSH_ADAPTER_WORKER`、`DSH_PERMISSION_MODE`；其它 `DSH_*` 变量保留，命令明确给出的 `env` 最后覆盖继承值。退出码、候选、日志和失败证据保留，完成后释放配额。最终 spec 审计的测试会临时建立冻结目标 SHA 的 detached worktree，完成后清理干净的审计目录；`candidateStable:false` 的结果不能用于验收。确定性 `verify` 直接使用核心预留的配额。该协议依赖宿主和角色遵守，无法限制框架外的任意 shell 进程。
+所有 agent 的测试/构建/重型核验通过 `test <state> <jobId> <request.json>` 执行，请求格式 `{argv,timeoutSeconds,env?,reason}`。cwd 为任务 worktree。测试配额按实际执行占用；不足时等待，不改用未登记的旁路命令。测试命令和确定性 `verify` 不继承控制器的 `SPEC_DELIVERY_*`、`DSH_HOME`、`DSH_SESSION_ID`、`DSH_SHELL`、`DSH_ADAPTER_WORKER`、`DSH_PERMISSION_MODE`；其它 `DSH_*` 变量保留，命令明确给出的 `env` 最后覆盖继承值。退出码、候选、日志和失败证据保留，完成后释放配额。最终 spec 审计的测试会临时建立冻结目标 SHA 的 detached worktree，完成后清理干净的审计目录；`candidateStable:false` 的结果不能用于验收。确定性 `verify` 直接使用核心预留的配额。该协议依赖宿主和角色遵守，无法限制框架外的任意 shell 进程。
 
 测试回执的 `candidate` 分别记录观察到的 `prHead`、`targetBase`、`localHead`、`testedHead`、`testedTree` 和适用时的 `integrationHead`。未提交工作参与测试时 `testedTree` 为 `null`，另记工作区内容指纹；不能把 Git HEAD 的树称为实际测试树。确定性 `verify` 对干净工作区记录真实 Git tree，候选变动则撤销旧测试证据。合并门禁核对本地测试树、集成候选和目标基线；GitHub 检查另记实际检查提交及其 Git tree，PR merge-ref 检查与 head 检查分开对账。
 

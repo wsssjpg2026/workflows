@@ -81,9 +81,9 @@ TypeScript 宿主也可使用 `spec-delivery/skills.ts` 的 `invokeBoundSkill`�
 
 格式修订用 `kind:"revise-receipt"`，增加 `{previousRevisionId,rawPath}`。托管宿主还须提供 `continuationHostEvent`，指向当前 token 的后续 `query/collect/start` 原始事件；命令核对同一原生 actor 的续接能力、终态及权威结果字节。命令在锁内检查版本和原始修订，追加链接原件的新修订，只重新验证结果，不重新执行实现、推送、评论或合并。宿主无法可靠续接时，可用 `kind:"prepare-repair"` 加 `{previousRevisionId}` 登记独立 `repair-receipt` job；其 packet 带原始字节、错误、候选与预期 head/base，禁止工作区写入。按普通 `dispatch/collect` 收取该 job 的真实宿主身份和新回执，原 job 仍须通过全部门禁。候选变化或证据不足需按正常诊断和重规划处理。
 
-**ZCode**：先读取本机 `dynamic-workflows` 技能。`zcode <state>` 为已预留的同模型 jobs 生成原生脚本、`CreateWorkflow` 参数和 `binding` 模板。实际调用后，把返回的 `runId` 加入模板并调用 `bind-batch <state> <binding.json>`。身份格式为 `{runId,jobs:[{jobId,actorName}]}`。CLI 以 `{runId}/{actorName}` 查询宿主观测。响应不确定时先查询原生运行，不能重新启动同一批。
+**ZCode**：候选适配器见 [adapters/zcode.md](adapters/zcode.md)。`zcode <state>` 为每个已有持久 token 的 job 生成独立原生脚本和 `CreateWorkflow` 描述；顶层用可信原生工具桥接按 token 查询、创建、立即绑定 `{runId}/{actorName}`，并在每个 actor 完成时收取原始回执。技能子任务也由顶层派发，不在脚本里嵌套创建 workflow。本机 Electron launcher 不提供这些原生工具；无桥接时适配器报告能力缺口并保持未知状态。
 
-每个 actor 返回 `{resultJson,summary}`。生成脚本在该 actor 的 `ask` 完成后立即调用 `world.run` 执行 `stage`；宿主持久化结果、补入任务和模型身份、核对证据，再提交核心。actor 只负责语义结果和真实证据，不必写 `result.json` 或抄写模型 ID。先完成后绑定的结果会暂存，绑定时收取。`world.run` 日志回放不等于重新观察 GitHub。
+每个 actor 将原始 Result JSON 写入该 packet 的输出目录，生成脚本在该 actor 的 `ask` 完成后立即 `report` 文件名和 token。可信桥接从 `GetWorkflowRun` 取得终态与对应报告，适配器再把结果文件交给核心；核心先观测原生模型和上下文，逐项绑定与收取。脚本中的 `report` 不能代替宿主终态或证据门禁。
 
 **其它支持指定模型的宿主（包括 Codex）**：对已返回的 job 调用真实 agent 工具，以 `bind <state> <jobId> <binding.json>` 记录 `{nativeId}`。任务真正完成后，由宿主把语义 Result 交给 `stage <state> <jobId> <result-json>`；这是 JSON 内容参数，应使用参数数组传递。旧的 `submit <state> <jobId> <result.json>` 仍可用，但需要完整 Result 身份。当前宿主无法选择指定模型或查询任务时明确阻断。
 

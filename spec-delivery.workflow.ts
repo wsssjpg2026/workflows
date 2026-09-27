@@ -2,7 +2,7 @@
  * spec-delivery — 通用 TypeScript workflow，由宿主主会话转发，真实 L1 会话决策。
  * 用户输入仅 spec、targetBranch、models.L1/L2/L3。
  * 参考 dynamic-workflows 的显式 actors、类型化结果、有界循环与证据门禁。
- * 这是 portable host 协议入口，不是 ZCode 原生 facade 脚本；zcode 命令生成原生批次。
+ * 这是 portable host 协议入口，不是 ZCode 原生 facade 脚本；zcode 命令生成按 job 的原生运行描述。
  * 用法与框架适配：./spec-delivery/README.md；角色约束：./spec-delivery/roles.md。
  */
 import fs from 'node:fs';
@@ -17,6 +17,7 @@ import { normalizeResult, resultPaths, metrics } from './spec-delivery/host.ts';
 import { compareMetrics } from './spec-delivery/metrics.ts';
 import * as skills from './spec-delivery/skills.ts';
 import { summarize } from './spec-delivery/summary.ts';
+import {prepareJob as prepareZcodeJob} from './spec-delivery/adapters/zcode.mjs';
 export * from './spec-delivery/core.ts';
 
 const home = path.dirname(fileURLToPath(import.meta.url));
@@ -1349,42 +1350,24 @@ function cancelDispatch(statePath:string,jobId:string) {
   } finally {rel();}}
 }
 export function renderZcode(s: engine.State, statePath: string) {
-  const jobs = s.jobs.filter(j => j.status === 'leased' && j.executor === 'agent' && !recovering(s, j) &&
-    (!s.v3 || s.v3.dispatchRecords.find(d => d.jobId === j.id)?.status === 'prepared'));
-  const result: unknown[] = [];
-  for (const model of new Set(jobs.map(j => j.model))) {
-    const allJobs = jobs.filter(j => j.model === model);
-    for (let offset = 0; offset < allJobs.length; offset += 128) {
-    const group = allJobs.slice(offset, offset + 128);
-    const tasks = group.map(j => ({ id: j.id, name: `${j.ticket} ${j.action} ${j.part} ${j.epoch}`, packet: path.join(path.dirname(statePath), 'packets', sha(j.id).slice(0, 20) + '.json'), resultPath: resultPaths(statePath, j.id).result }));
-    const entry = fileURLToPath(import.meta.url);
-    const script = `// Generated from spec-delivery.workflow.ts. 每个运行只使用一个实际模型。
-interface ActorAnswer {
-  /** Result 内容的 JSON 字符串；无需 model/jobId，证据文件必须真实存在。 */ resultJson: string;
-  /** 简短摘要。 */ summary: string;
-}
-const tasks = ${JSON.stringify(tasks, null, 2)};
-phase("执行与逐项登记本批次任务");
-const outcomes = await Promise.allSettled(tasks.map(async task => {
-  const actor = agent(task.name, "按 packet 和 roles.md 执行限定任务。不要派子 agent 或嵌套 workflow。遵守测试配额。证据与交接必须实际落盘。");
-  const answer = await actor.ask<ActorAnswer>(\`读取 \${task.packet}。执行 action，返回 Result JSON 内容及摘要，不必创建 result.json，不填写 model/jobId。证据与交接文件仍须真实写出。不要修改主控状态。\`);
-  const receipt = await world.run("node", [${JSON.stringify(entry)}, "stage", ${JSON.stringify(statePath)}, task.id, answer.resultJson]);
-  if (receipt.exitCode !== 0) throw new Error(receipt.stderr);
-  report({jobId: task.id, resultPath: task.resultPath, summary: answer.summary.slice(0, 1000)});
-  return {jobId:task.id,resultPath:task.resultPath,summary:answer.summary.slice(0,1000)};
-}));
-const reportText = outcomes.map(x => x.status === "fulfilled" ? x.value.summary.slice(0,400) : "任务未完整执行，需要主控核对").join("\\n\\n");
-await artifact.markdown("batch-results", reportText, {title:"阶段任务结果", primary:true});
-return {conclusion:reportText,findings:[],verified:[],notCovered:["原生身份由主控 bind-batch 登记；报告不能代替真实门禁"],outcomes:outcomes.map(x => x.status === "fulfilled" ? {status:"fulfilled",receipt:x.value} : {status:"rejected",reason:String(x.reason)})};
-`;
-    const draft = path.join(path.dirname(statePath), 'zcode', `batch-${sha(group.map(j => j.id).join('\n')).slice(0, 20)}.dwf.ts`);
-    fs.mkdirSync(path.dirname(draft), { recursive: true }); fs.writeFileSync(draft, script);
-    result.push({ loadSkill: 'dynamic-workflows', tool: 'CreateWorkflow', arguments: { name: 'Spec 开发阶段任务', path: draft, subagent_model: model, max_concurrency: group.length }, jobIds: group.map(j => j.id),
-      binding: { model, jobs: tasks.map(t => ({jobId:t.id,actorName:t.name})) },
-      note: '调用 CreateWorkflow 后立即把实际 runId 与 binding 交给 bind-batch。每个 actor 完成后由宿主 stage 登记，不等整批完成。此命令不启动 ZCode；不确定是否已启动时先查询原生 run，不能重复启动同一批。' });
-    }
-  }
-  return result;
+  engine.ensure(s.protocol===engine.currentProtocol&&s.v3,'ZCode 脚本只为已落盘 token 的 v3 派发生成');
+  const entry=fileURLToPath(import.meta.url);
+  return s.jobs.filter(j=>j.status==='leased'&&j.executor==='agent'&&!recovering(s,j))
+    .flatMap(j=>{
+      const d=s.v3!.dispatchRecords.find(d=>d.jobId===j.id);
+      if(!d||d.status!=='prepared')return [];
+      engine.ensure(fs.existsSync(d.requestPath)&&sha(fs.readFileSync(d.requestPath,'utf8'))===d.requestDigest,
+        'ZCode 派发请求已改变');
+      const p=read<{jobId:string;model:string;dispatchToken:string;executor?:string;action?:string;
+        rolesPath:string;outputDirectory:string}>(d.packetPath);
+      engine.ensure(p.jobId===j.id&&p.model===d.requestedModel&&p.dispatchToken===d.token&&
+        (p.executor==='agent'||p.action==='repair-receipt'),'ZCode packet 与持久派发请求不符');
+      const directory=path.join(path.dirname(statePath),'zcode','tokens',sha(d.token).slice(0,32));
+      const prepared=prepareZcodeJob({workflowEntry:entry},d,p,directory);
+      return [{jobId:j.id,token:d.token,requestPath:d.requestPath,scriptSha256:prepared.scriptSha256,
+        loadSkill:'dynamic-workflows',tool:'CreateWorkflow',arguments:prepared.createWorkflow,
+        note:'每个 job 有一个独立原生 workflow；顶层先按 token 查询，再创建并立即绑定已观测 actor。结果由 GetWorkflowRun 逐项收取，不能嵌套创建或靠批次模板绑定。'}];
+    });
 }
 export function consumeStaged(statePath: string, ids?: string[]) {
   const release = lock(statePath);

@@ -138,9 +138,11 @@ export interface ExecutionPlan { capabilities: Capabilities; policy: Policy; tic
   inputVersion?: string; sourceVersion?: string; decisionNativeId?: string;
 }
 export type Phase = 'claim' | 'plan' | 'plan_check' | 'implement' | 'queued' | 'self' | 'verify' | 'publish' | 'review' | 'fresh' | 'accept' | 'integrate' | 'replan' | 'recovery' | 'merge' | 'close' | 'cleanup' | 'done' | 'human' | 'blocked';
-export type Action = 'claim' | 'plan' | 'plan-check' | 'implement' | 'author-review' | 'self-standards' | 'self-spec' | 'verify' | 'publish' | 'review-lens' | 'confirm' | 'adjudicate' | 'review-report' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'spec-audit' | 'spec-close' | 'skill-child' | 'repair-receipt';
+export type Action = 'claim' | 'plan' | 'plan-check' | 'implement' | 'author-review' | 'self-standards' | 'self-spec' | 'verify' | 'publish' | 'pr-review' | 'review-lens' | 'confirm' | 'adjudicate' | 'review-report' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'spec-audit' | 'spec-close' | 'skill-child' | 'repair-receipt';
 export interface Evidence {
   head: string; base: string; path: string;
+  /** The outer PR gate pins the professional result, not its review method. */
+  skillFingerprint?: string; skillInvocationId?: string; rawReportSha256?: string; commentUrl?: string;
   /** These are separate observations: a remote PR head need not equal an unpushed local head. */
   prHead?: string | null; targetBase?: string; testedHead?: string; testedTree?: string;
   integrationHead?: string | null;
@@ -225,6 +227,7 @@ export interface State {
   retired?: { at: string; evidencePath: string; reason: string };
   events: { revision: number; message: string; at?: string }[];
 }
+/** Protocol 2 compatibility; protocol 3 delegates review topology to its bound skill. */
 export const lenses = ['规范', '明显缺陷', 'Git 历史', '历史 PR 评论', '代码注释'];
 export function ensure(condition: unknown, message: string): asserts condition { if (!condition) throw new Error(message); }
 export function event(s: State, message: string) { s.revision++; s.events.push({ revision: s.revision, message, at: new Date().toISOString() }); }
@@ -271,6 +274,21 @@ export function recordL1Decision(s: State, record: L1DecisionRecord) {
 }
 export function freshEvidence(t: Ticket, key: keyof Ticket['evidence']) {
   const e = t.evidence[key]; return !!e && e.head === t.head && e.base === t.base && !!e.path;
+}
+function currentReviewEvidence(s: State, t: Ticket, key: 'regular' | 'fresh') {
+  if (!freshEvidence(t, key)) return false;
+  if (s.protocol !== currentProtocol) return true;
+  const e = t.evidence[key]!, binding = s.v3?.skillBindings?.find(b => b.capability === 'prReview');
+  const invocation = s.v3?.skillInvocations.find(i => i.id === e.skillInvocationId);
+  return !!binding && !!invocation && invocation.capability === 'prReview' &&
+    invocation.bindingFingerprint === binding.fingerprint && e.skillFingerprint === binding.fingerprint &&
+    invocation.head === t.head && invocation.base === t.base && invocation.result?.status === 'pass' &&
+    !invocation.result.blocking && e.path === invocation.result.rawOutputPath &&
+    e.rawReportSha256 === invocation.result.rawOutputSha256 && !!e.commentUrl;
+}
+function matchingReviews(s: State, t: Ticket) {
+  return currentReviewEvidence(s, t, 'regular') && currentReviewEvidence(s, t, 'fresh') &&
+    (s.protocol !== currentProtocol || t.evidence.regular!.skillFingerprint === t.evidence.fresh!.skillFingerprint);
 }
 export function ticket(s: State, key: string) { const t = s.tickets.find(t => t.key === key); ensure(t, `未知工单 ${key}`); return t; }
 const busy = (j: Job) => j.status === 'leased' || j.status === 'running';
@@ -418,7 +436,7 @@ export function mergeGate(s: State, t: Ticket) {
   const live = s.facts.prs[String(t.pr)];
   return s.validationOwner === t.key && !!live && live.state === 'OPEN' && !live.draft && live.head === t.head && live.base === t.base &&
     live.baseRef === s.inputs.targetBranch && s.facts.base === t.base && live.mergeable === 'MERGEABLE' &&
-    ['self', 'tests', 'regular', 'fresh', 'accept'].every(k => freshEvidence(t, k as keyof Ticket['evidence'])) &&
+    ['self', 'tests', 'accept'].every(k => freshEvidence(t, k as keyof Ticket['evidence'])) && matchingReviews(s, t) &&
     (!boundAuthorReview(s) || !!t.authorReview && t.authorReview.head === t.head && t.authorReview.base === t.base &&
       t.authorReview.bindingFingerprint === s.v3!.skillBindings!.find(b=>b.capability==='authorReview')?.fingerprint) &&
     (!t.visual || freshEvidence(t, 'visual')) && ciAllowed(live, jobsAt(s, t, 'accept').find(j => j.status === 'done')?.result);
@@ -473,6 +491,11 @@ function candidates(s: State): Candidate[] {
       continue;
     }
     if (t.phase === 'review' || t.phase === 'fresh') {
+      if (s.protocol === currentProtocol) {
+        const review = jobsAt(s, t, 'pr-review').find(j => j.status === 'done');
+        out.push({ t, action: review ? 'review-report' : 'pr-review' });
+        continue;
+      }
       const rs = jobsAt(s, t, 'review-lens');
       if (rs.filter(j => j.status === 'done').length !== lenses.length) {
         lenses.forEach((_, n) => out.push({ t, action: 'review-lens', part: String(n) })); continue;
@@ -543,7 +566,8 @@ export function reserve(s: State): Job[] {
     if (attempts.some(j => j.status !== 'cancelled')) continue;
     const id = `${s.id}:${key}:${epoch}:${c.action}:${part}:try-${attempts.length + 1}`;
     const active = s.jobs.filter(busy);
-    const command = ['verify', 'cleanup', 'close', 'spec-close'].includes(c.action);
+    const command = ['verify', 'cleanup', 'close', 'spec-close'].includes(c.action) ||
+      s.protocol === currentProtocol && c.action === 'review-report';
     const executor = command ? 'command' : c.action === 'claim' ? 'main' : 'agent';
     if (active.filter(j => j.executor === 'agent').length + 1 + (executor === 'agent' ? 1 : 0) > s.policy.agents) continue;
     if (active.reduce((n, j) => n + j.tests, 0) + hasTests(c.action) > s.policy.tests) continue;
@@ -576,6 +600,7 @@ export function reserve(s: State): Job[] {
 }
 export function contextIntentFor(s:State,ticketKey:string,action:Action,part:string,fresh:boolean):ContextIntent {
   const continuity=['implement','publish','integrate'].includes(action)?'author'
+    : action==='pr-review'?'review-pr'
     : ['review-lens','confirm','review-report'].includes(action)?`review-${action}-${part}`:action;
   const canContinue=!fresh&&(continuity==='author'||continuity.startsWith('review-'));
   const lineage=`${ticketKey}:${continuity}`;
@@ -695,6 +720,13 @@ function validateSkillLinks(s: State, j: Job, r: Result): AuthorReviewEvidence |
     if (linked[0].result?.status==='changes_required' && linked[0].result.blocking) return;
     return reviewEvidence(s,linked[0],j.head,j.base);
   }
+  if (j.action === 'pr-review' && r.complete) {
+    ensure(linked.length === 1 && linked[0].capability === 'prReview',
+      'PR 审查必须引用一次实际完成的 prReview 绑定调用');
+    ensure(['pass', 'changes_required'].includes(linked[0].result!.status) &&
+      !!linked[0].result!.rawOutputPath && !!linked[0].result!.rawOutputSha256,
+      'PR 审查跳过、未完成或缺少原始报告，不能签发完整结论');
+  }
   if (j.action !== 'implement') return;
   const professional = linked.filter(x => x.capability === 'implementation' || x.capability === 'diagnosis');
   if (!r.complete) return;
@@ -769,7 +801,7 @@ export function submit(s: State, id: string, r: Result) {
     claim: ['claimed'], plan: ['planned'], 'plan-check': ['pass', 'changes'], implement: ['implemented', 'replan'],
     'author-review': ['reviewed'],
     'self-standards': ['reviewed'], 'self-spec': ['reviewed'], verify: ['pass', 'fail'], publish: ['published'],
-    'review-lens': ['reviewed'], confirm: ['confirmed'], adjudicate: ['confirmed'], 'review-report': ['posted'],
+    'pr-review': ['reviewed'], 'review-lens': ['reviewed'], confirm: ['confirmed'], adjudicate: ['confirmed'], 'review-report': ['posted'],
     accept: ['ready', 'gap', 'conflict', 'waiting_ci', 'needs_human', 'blocked'], integrate: ['implemented', 'replan'],
     replan: ['planned'], merge: ['merged', 'waiting_merge'], close: ['closed'], cleanup: ['cleaned'],
     'spec-audit': ['complete', 'needs_closeout', 'waiting_human', 'blocked'], 'spec-close': ['closed'],
@@ -788,7 +820,7 @@ export function submit(s: State, id: string, r: Result) {
   }
   const live = t?.pr ? s.facts.prs[String(t.pr)] : undefined;
   if (t && !['claim', 'plan', 'plan-check', 'replan', 'cleanup', 'close', 'merge', 'implement', 'integrate'].includes(j.action) &&
-      (s.facts.base !== j.base || (['review-lens', 'confirm', 'adjudicate', 'review-report', 'accept'].includes(j.action) && live?.state === 'OPEN' && live.head !== j.head))) {
+      (s.facts.base !== j.base || (['pr-review', 'review-lens', 'confirm', 'adjudicate', 'review-report', 'accept'].includes(j.action) && live?.state === 'OPEN' && live.head !== j.head))) {
     t.phase = 'blocked'; t.reason = 'stale'; event(s, `${j.action} 完成时版本已变，不能保留通过结论`); return;
   }
   if (t && !['claim', 'plan', 'plan-check', 'replan', 'cleanup', 'close'].includes(j.action)) {
@@ -854,6 +886,9 @@ export function submit(s: State, id: string, r: Result) {
       ensure(!t.visual || freshEvidence(t, 'visual'), '适用视觉检查缺失');
       ensure(Number(data.pr) > 0 && data.commentUrl, '需要 PR 以及作者完成评论');
       t.pr = Number(data.pr); t.pendingPushHead = undefined; t.phase = 'review'; t.epoch++; break;
+    case 'pr-review':
+      ensure(s.protocol === currentProtocol && t && ['review', 'fresh'].includes(t.phase), 'PR 审查不属于当前轮次');
+      break;
     case 'review-lens': ensure(Array.isArray(r.findings), '每一路审查必须明确返回 findings'); break;
     case 'confirm': case 'adjudicate':
       ensure(Array.isArray(r.findings) && r.findings.length === 1, '逐项独立核实必须返回一个问题');
@@ -865,6 +900,30 @@ export function submit(s: State, id: string, r: Result) {
       ensure(r.findings[0].confidence! < 50 || r.findings[0].confirmed === true, '>=50 的问题必须被独立证据确认'); break;
     case 'review-report': {
       ensure(t && data.commentUrl, '审查必须留下完成评论');
+      if (s.protocol === currentProtocol) {
+        const review = jobsAt(s, t, 'pr-review').find(x => x.status === 'done' && x.result?.complete);
+        const ids = review?.result?.data?.skillInvocationIds;
+        const invocation = Array.isArray(ids) && ids.length === 1 ? s.v3?.skillInvocations.find(i => i.id === ids[0]) : undefined;
+        ensure(review && invocation && invocation.jobId === review.id && invocation.capability === 'prReview' &&
+          invocation.result && ['pass', 'changes_required'].includes(invocation.result.status) &&
+          invocation.bindingFingerprint === s.v3?.skillBindings?.find(b => b.capability === 'prReview')?.fingerprint &&
+          invocation.candidateVersion === candidateVersion(s, t) &&
+          data.reviewInvocationId === invocation.id && r.evidencePath === invocation.result.rawOutputPath,
+          '报告与本轮 prReview 调用、候选或技能版本不一致');
+        if (invocation.result.blocking) {
+          problem(s, t, `prReview 阻断：${invocation.id}`, 'implement', 'semantic', j.id);
+        } else {
+          const completed: Evidence = { ...evidence(), path: invocation.result.rawOutputPath,
+            skillFingerprint: invocation.bindingFingerprint, skillInvocationId: invocation.id,
+            rawReportSha256: invocation.result.rawOutputSha256, commentUrl: String(data.commentUrl) };
+          if (t.phase === 'review') { t.evidence.regular = completed; t.phase = 'fresh'; t.epoch++; }
+          else { ensure(t.phase === 'fresh' && currentReviewEvidence(s, t, 'regular') &&
+            t.evidence.regular!.skillFingerprint === completed.skillFingerprint,
+            'fresh 审查不能与不同候选或技能版本的 regular 组合');
+            t.evidence.fresh = completed; t.phase = 'accept'; }
+        }
+        break;
+      }
       const cs = jobsAt(s, t, 'confirm').flatMap(x =>
         (jobsAt(s, t, 'adjudicate').find(d => d.part === x.part)?.result || x.result)?.findings || []);
       const blockers = cs.filter(f => f.confidence! >= 50);
@@ -874,7 +933,7 @@ export function submit(s: State, id: string, r: Result) {
       break;
     }
     case 'accept':
-      ensure(t && freshEvidence(t, 'regular') && freshEvidence(t, 'fresh'), '验收前必须完成 regular 和 fresh 审查');
+      ensure(t && matchingReviews(s, t), '验收前必须完成同候选、同技能版本的 regular 和 fresh 审查');
       if (r.status === 'ready') {
         ensure(Array.isArray(data.satisfiedCriteria) && t.criteria.every(c => (data.satisfiedCriteria as Json[]).includes(c)), 'issue 验收条件未全部满足');
         t.evidence.accept = evidence();

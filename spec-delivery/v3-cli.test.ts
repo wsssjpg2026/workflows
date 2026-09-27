@@ -37,8 +37,8 @@ fs.appendFileSync(${JSON.stringify(ghLog)},JSON.stringify(a)+'\\n');
 const commentsFile=${JSON.stringify(comments)};
 const issue=n=>({number:n,title:n===100?'Spec':'Task',body:fs.readFileSync(${JSON.stringify(issueSource)},'utf8'),html_url:'https://github.com/example/test/issues/'+n,state:'open',assignees:[]});
 if(a[0]==='repo'&&a[1]==='view') console.log(JSON.stringify({nameWithOwner:'example/test',url:'https://github.com/example/test',defaultBranchRef:{name:'main'}}));
-else if(a.includes('graphql')) console.log(JSON.stringify({data:{repository:{target:{target:{oid:${JSON.stringify(head)}}},i100:{number:100,state:'OPEN'},i101:{number:101,state:'OPEN'}}}}));
-else if(a[0]==='issue'&&a[1]==='comment') {const rows=JSON.parse(fs.readFileSync(commentsFile));rows.push({html_url:'https://github.com/example/test/issues/101#issuecomment-1',body:fs.readFileSync(a[a.indexOf('--body-file')+1],'utf8')});fs.writeFileSync(commentsFile,JSON.stringify(rows));console.log(rows.at(-1).html_url);}
+else if(a.includes('graphql')) console.log(JSON.stringify({data:{repository:{target:{target:{oid:${JSON.stringify(head)}}},i100:{number:100,state:'OPEN'},i101:{number:101,state:'OPEN'},p101:{number:101,url:'https://github.com/example/test/pull/101',state:'OPEN',headRefOid:${JSON.stringify(head)},baseRefOid:${JSON.stringify(head)},baseRefName:'main',headRefName:'test-review',isDraft:false,mergeable:'MERGEABLE',mergeCommit:null}}}}));
+else if(['issue','pr'].includes(a[0])&&a[1]==='comment') {const rows=JSON.parse(fs.readFileSync(commentsFile));rows.push({html_url:'https://github.com/example/test/issues/101#issuecomment-'+(rows.length+1),body:fs.readFileSync(a[a.indexOf('--body-file')+1],'utf8')});fs.writeFileSync(commentsFile,JSON.stringify(rows));console.log(rows.at(-1).html_url);}
 else if(endpoint.endsWith('/git/ref/heads/main')) console.log(JSON.stringify({ref:'refs/heads/main',object:{type:'commit',sha:${JSON.stringify(head)}}}));
 else if(endpoint.endsWith('/issues/100/sub_issues?per_page=100')) console.log(JSON.stringify([[issue(101)]]));
 else if(endpoint.endsWith('/issues/101/sub_issues?per_page=100')) console.log('[[]]');
@@ -1215,5 +1215,97 @@ test('diagnosing-bugs 路径在完成候选后补调一个 authorReview，跳过
     assert.match(rejected.stderr,/作者自检未完整通过/);
     const after=JSON.parse(fs.readFileSync(statePath,'utf8'));
     assert.equal(after.tickets[0].evidence.self,undefined);
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('公开 CLI 以替代 prReview 执行 regular/fresh、归档原文并幂等发布两轮报告', () => {
+  const x=fixture();
+  try {
+    const {statePath,binding}=approvedImplementation(x);
+    const observer=path.join(x.temp,'bin','review-skill-observer');
+    fs.writeFileSync(observer,`#!/usr/bin/env node
+const fs=require('fs');const [op,id,job]=process.argv.slice(2);
+const state=JSON.parse(fs.readFileSync(${JSON.stringify(statePath)},'utf8'));
+if(op==='capabilities') console.log(JSON.stringify({source:'native_host',jobId:job,capability:id,
+  capabilities:{sourceExecution:{allowed:true,acceptsOriginalFiles:true}}}));
+else if(op==='result') {
+  const invocation=state.v3.skillInvocations.find(i=>i.id===id);
+  if(!invocation||invocation.jobId!==job)process.exit(2);
+  const source=JSON.parse(fs.readFileSync(invocation.sourceArchivePath,'utf8'));
+  console.log(JSON.stringify({source:'native_host',invocationId:id,jobId:job,nativeId:invocation.session.nativeId,
+    observationId:invocation.session.observationId,mode:invocation.mode,
+    bindingFingerprint:invocation.bindingFingerprint,terminal:true,
+    loadedFiles:source.files.map(f=>({relativePath:f.relativePath,sha256:f.sha256}))}));
+} else process.exit(2);
+`);
+    fs.chmodSync(observer,0o755);x.env.SPEC_DELIVERY_SKILL_OBSERVER=observer;
+    const invoke=(...args:string[])=>{const r=x.call(...args);assert.equal(r.status,0,r.stderr);return JSON.parse(r.stdout);};
+    let state=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    let t=state.tickets[0];
+    t.phase='self';t.epoch++;t.pr=101;t.head=x.head;t.base=x.head;t.worktree=x.root;t.branch='main';
+    state.validationOwner=t.key;
+    fs.writeFileSync(statePath,JSON.stringify(state));
+    const author=invoke('next',statePath).jobs.find((job:{action:string})=>job.action==='author-review');
+    assert.ok(author);
+    x.observe('pr-author',author.id,'small');
+    fs.writeFileSync(binding,JSON.stringify({nativeId:'pr-author'}));
+    invoke('bind',statePath,author.id,binding);
+    const authorRequest=path.join(x.temp,'author-request.json');
+    fs.writeFileSync(authorRequest,JSON.stringify({capability:'authorReview'}));
+    const authorStarted=invoke('skill-start',statePath,author.id,authorRequest);
+    const authorRaw=path.join(x.temp,'author-report.md');
+    fs.writeFileSync(authorRaw,'Standards: pass\nSpec: pass\n');
+    const authorOutcome=path.join(x.temp,'author-outcome.json');
+    fs.writeFileSync(authorOutcome,JSON.stringify({status:'pass',blocking:false,
+      rawOutputPath:authorRaw,evidencePaths:[authorRaw]}));
+    const authorFinished=invoke('skill-finish',statePath,authorStarted.invocationId,authorOutcome);
+    invoke('stage',statePath,author.id,JSON.stringify({complete:true,status:'reviewed',
+      head:x.head,base:x.head,evidencePath:authorFinished.result.rawOutputPath,
+      data:{skillInvocationIds:[authorStarted.invocationId]}}));
+    state=JSON.parse(fs.readFileSync(statePath,'utf8'));t=state.tickets[0];
+    assert.ok(t.authorReview,'作者自检应有真实绑定调用与来源证明');
+    t.phase='review';t.epoch++;
+    t.evidence.tests={head:x.head,base:x.head,path:x.planEvidence};
+    fs.writeFileSync(statePath,JSON.stringify(state));
+    const replacement=path.join(x.temp,'.agents','skills','code-review-from-claude','SKILL.md');
+    fs.writeFileSync(replacement,'---\nname: alternate-pr-review\n---\n\nReview holistically, use verbal verdicts and original reports.\n');
+    const migration=path.join(x.temp,'review-migration.md');fs.writeFileSync(migration,'Use an alternative pinned review method');
+    const migrationRequest=path.join(x.temp,'review-migration.json');
+    fs.writeFileSync(migrationRequest,JSON.stringify({expectedRevision:state.revision,evidencePath:migration,
+      replacements:{prReview:replacement}}));
+    const migrated=x.call('migrate-skills',statePath,migrationRequest);
+    assert.equal(migrated.status,0,migrated.stderr);
+    for(const phase of ['review','fresh']) {
+      const next=invoke('next',statePath);
+      const j=next.jobs.find((job:{action:string})=>job.action==='pr-review');assert.ok(j);
+      assert.equal(j.fresh,phase==='fresh');
+      if(phase==='fresh')assert.equal(j.contextIntent.kind,'independent');
+      x.observe(`pr-${phase}`,j.id,'middle');
+      fs.writeFileSync(binding,JSON.stringify({nativeId:`pr-${phase}`}));
+      invoke('bind',statePath,j.id,binding);
+      const request=path.join(x.temp,`request-${phase}.json`);fs.writeFileSync(request,JSON.stringify({capability:'prReview'}));
+      const started=invoke('skill-start',statePath,j.id,request);
+      assert.equal(started.mode,'source_execution');
+      const source=JSON.parse(fs.readFileSync(started.sourceArchivePath,'utf8'));
+      assert.equal(source.name,'alternate-pr-review');
+      const raw=path.join(x.temp,`report-${phase}.md`);fs.writeFileSync(raw,`${phase} holistic report: no issues, no numeric score.\n`);
+      const outcome=path.join(x.temp,`outcome-${phase}.json`);
+      fs.writeFileSync(outcome,JSON.stringify({status:'pass',blocking:false,rawOutputPath:raw,evidencePaths:[raw]}));
+      const finished=invoke('skill-finish',statePath,started.invocationId,outcome);
+      assert.equal(finished.result.originalOutputPath,raw);
+      invoke('stage',statePath,j.id,JSON.stringify({complete:true,status:'reviewed',
+        evidencePath:finished.result.rawOutputPath,data:{skillInvocationIds:[started.invocationId]}}));
+      const report=invoke('next',statePath).jobs.find((job:{action:string})=>job.action==='review-report');
+      assert.ok(report);assert.equal(report.executor,'command');
+      invoke('execute',statePath,report.id);
+      const saved=JSON.parse(fs.readFileSync(statePath,'utf8'));
+      assert.equal(saved.tickets[0].phase,phase==='review'?'fresh':'accept');
+      assert.equal(saved.tickets[0].evidence[phase==='review'?'regular':'fresh'].skillInvocationId,started.invocationId);
+    }
+    const comments=JSON.parse(fs.readFileSync(path.join(x.temp,'comments.json'),'utf8')) as {body:string}[];
+    assert.equal(comments.filter(c=>c.body.includes(':review:')).length,1);
+    assert.equal(comments.filter(c=>c.body.includes(':fresh:')).length,1);
+    assert.ok(comments.some(c=>c.body.includes('review holistic report: no issues')));
+    assert.ok(comments.some(c=>c.body.includes('fresh holistic report: no issues')));
   } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
 });

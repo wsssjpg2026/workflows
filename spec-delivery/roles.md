@@ -95,25 +95,13 @@ TDD在已约定seam上进行。测试范围以目标仓库有效规范和任务�
 
 按主控分配的稳定动作ID发布进度评论；已有PR或评论优先核对并更新，避免重试重复创建。完成后交接当前head与待审范围，不合并PR。
 
-## 独立 review — L2 显式审查 jobs
+## PR 独立审查 — L2 绑定技能
 
-按 `code-review-from-claude` 的判断与置信度规则工作。五个视角分别是：仓库规范、明显bug、Git历史/blame、相关旧PR讨论、代码注释约束。每个视角由同级L2 job独立执行，随后由显式L2确认jobs逐条复核候选问题。
+`pr-review` job 显式调用当前固定版本的 `prReview` 技能。读取绑定包中的 `SKILL.md`、自动化上下文与契约；通过 `skill-delegate` 登记技能要求的子任务，等待必需子任务完成，再以 `skill-finish` 归档宿主终态、原始报告和专业依据。审查方法、子任务拓扑、筛选规则和报告形式由绑定包决定。
 
-派发前显式加载宿主安装的 `code-review-from-claude/SKILL.md`。把该版本第5步的完整 **0/25/50/75/100评分量表逐字**传给每个 `confirm` job，并提供PR、待确认问题及规范文件列表；只说明“≥50要修”不能代替量表。记录技能来源；规则与当前核心阈值不一致时交主控核对，不自行换阈值。
+完整审查以 `status:"reviewed"` 和 `data.skillInvocationIds` 引用一次当前候选、当前技能版本的 `prReview` 调用。技能返回 `pass` 且无阻断时，本轮报告发布后进入下一门禁；返回 `changes_required` 时发布原始报告并交回实现修复。`skipped`、`incomplete`、空报告和缺失宿主回执均不能完成一轮审查。`review-report` 是命令 job：核对原始技能产物后，按稳定标记幂等发布原文；actor 不自行改写报告。
 
-置信度 **≥50** 的问题进入保留列表；50也要处理。这是问题成立的评分，不是严重程度阈值。每条保留问题提供具体触发、影响、当前候选代码位置和证据；历史问题或误报必须给出排除依据。
-
-finding 提供稳定 `identity:{path,rule,trigger}`：仓库相对路径、违反的具体规则/行为、触发条件。仅同一事实使用相同身份；不确定时分开保留。核心合并同身份的多视角发现，保留全部 `sources`，随后独立确认一次。确认记录事实成立性、是否属于本次改动的责任、影响严重程度和评分理由，三者分开判断。
-
-复用regular审查侧上下文以跟踪修复；同PR的新head必须可重新审查。“已经审过”、简单PR、自动生成PR、技能跳过或没有评论均不等于通过。
-
-**review-report — L2** 汇总各视角和确认结果，记录当前head/base、审查范围、保留问题、未完成项和明确结论。即使无问题，也必须有完成报告。按稳定动作ID提交有证据的评论。
-
-review发现保留问题时进入L3修复→作者自检→验证→发布→regular复审的main loop。所有角色、包括五路、确认与汇总，在fresh轮次均使用新上下文，对完整当前PR重新审查；不能只看上次问题的修复。
-
-regular收敛后必须fresh通过。fresh发现问题则返回修复，候选变化后重新取得fresh完整审查。通过结论绑定候选，不永久绑定PR编号。
-
-同一 head/base、同一问题在 regular/fresh 的评分跨过 50 门槛时，核心签发 **adjudicate — L1 fresh**。裁决者读取 packet.dispute 中两份结论和原始代码/证据，输出同问题 ID、评分及 `assessment:{factual,responsibility,severity,rationale}`。明确解释分歧；不能靠重抽一次评分或把低严重度当低置信度来消除问题。最终报告采用裁决，≥50 仍返回修复。
+regular 可以用真实宿主续接审查侧上下文跟踪修复；fresh 必须使用独立新上下文，从当前 PR diff、工单、规范和测试重新开始，不接收 regular 的结论或作者辩解。两轮证据绑定同一 head/base 和同一技能指纹；候选或技能版本改变就重新取证。审查通过后仍由独立 L2 `accept` 核对工单、CI 和关闭条件。
 
 ## PR独立验收 — L2
 
@@ -196,7 +184,7 @@ CI按下列规则处理，无需逐次请求用户批准：
 }
 ```
 
-`Finding`为`{id,description,evidence,identity?,sources?,assessment?,confidence?,confirmed?,advisory?}`，identity/assessment 见上文独立 review 规则；sources 由核心保留。置信度为0–100数值；`advisory:true`仅用于作者自检的非阻断建议。独立评分必须按技能量表，不能借`advisory`排除≥50问题。
+`Finding`为`{id,description,evidence,identity?,sources?,assessment?,confidence?,confirmed?,advisory?}`。作者自检可用`advisory:true`表示非阻断建议。PR审查的发现、评分与判断保存在绑定技能的原始报告和子任务证据中。
 
 | action | `complete:true`时的`status` | 顶层补充字段及`data` |
 | --- | --- | --- |
@@ -208,10 +196,8 @@ CI按下列规则处理，无需逐次请求用户批准：
 | `author-review` | `reviewed` | 诊断或来源变化后的单个补审 job；`data.skillInvocationIds` 引用一次真实通过的 `authorReview` 调用 |
 | `verify` | `pass`、`fail` | 由`execute`生成；失败时`data.failureSignature`及原始日志 |
 | `publish` | `published` | `data:{pr,commentUrl}`，pr为正整数；远端必须是当前候选的开放非draft PR |
-| `review-lens` | `reviewed` | 顶层`findings`必填；遵循packet指定的单个lens |
-| `confirm` | `confirmed` | 顶层`findings`恰好一项，保留被派发的问题ID，给出`confidence`和复核证据；≥50须`confirmed:true` |
-| `adjudicate` | `confirmed` | L1 裁决同一候选判定分歧；字段同 confirm，另须完整 assessment，rationale 解释差异 |
-| `review-report` | `posted` | `data.commentUrl`必填；若提供顶层`handoffPath`，它必须来自原 actor 已完成的 handoff 技能调用。后继新会话在不能续接时再经 L1 核验交接或重建；由核心根据全部确认结果决定进入修复或下一阶段 |
+| `pr-review` | `reviewed` | `data.skillInvocationIds` 恰好引用一次当前绑定的 `prReview`；原始报告由技能调用归档，结论来自其 `pass`/`changes_required` 及阻断值 |
+| `review-report` | `posted` | v3 由命令发布技能原文并记录 `data.commentUrl`、`data.reviewInvocationId`；不由 actor 填写报告模板 |
 | `accept` | `ready` | `data.satisfiedCriteria`逐字包含packet全部criteria；附适用CI事实及下述豁免结构 |
 | `accept` | `gap`、`conflict`、`waiting_ci`、`needs_human`、`blocked` | `gap`必须`data.planPath`，并附`reason`；其它状态附具体原因和证据；补充计划先过L1 `plan-check` |
 | `merge` | `merged`、`waiting_merge` | 真实远端合并证据或等待原因；`merged`仍须核心live观察到MERGED |
@@ -221,7 +207,7 @@ CI按下列规则处理，无需逐次请求用户批准：
 | `spec-audit` | `needs_closeout` | `data:{planPath,remainingCriteria,visual?}`；只生成内部工作项，PR关联原父spec |
 | `spec-audit` | `waiting_human`、`blocked` | 前者必须`data.humanHandoffUrl`指向现有工单/spec人工交接；后者附明确原因和证据 |
 
-`confirm.status="confirmed"`只表示复核动作完成；问题可被排除，低于50时记录实际评分与理由。`reviewed/posted`也不等于无问题。
+`reviewed/posted`只表示专业审查与报告发布完成；阻断结论以绑定技能的终态为准。
 
 合法CI豁免放在`accept.data.ciWaiver`：`{reason:"no_ci"|"billing",evidence:"<原始依据>",notStartedIds?:["<检查ID>"]}`。`no_ci`同时要求`data.ciConfigured:false`且远端无检查；`billing`列明因计费/额度未启动的检查ID。状态与理由必须符合本文件的CI边界，不能仅填写该对象就宣称豁免成立。
 

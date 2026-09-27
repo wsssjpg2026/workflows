@@ -18,9 +18,12 @@ export function defaultSkillPaths(root?: string): Record<SkillCapability, string
   const sourceRoot=root || path.join(os.homedir(), '.agents', 'skills');
   const paths=Object.fromEntries(capabilities.map(capability =>
     [capability, path.join(sourceRoot, defaultNames[capability], 'SKILL.md')])) as Record<SkillCapability, string>;
-  if (root === undefined)
+  if (root === undefined) {
     paths.authorReview=path.join(path.dirname(fileURLToPath(import.meta.url)),
       'review-skills','code-review','SKILL.md');
+    paths.prReview=path.join(path.dirname(fileURLToPath(import.meta.url)),
+      'review-skills','code-review-from-claude','SKILL.md');
+  }
   return paths;
 }
 
@@ -184,6 +187,26 @@ export function requireSkillChildrenComplete(s: State, invocationId: string) {
   const invocation=s.v3?.skillInvocations.find(i=>i.id===invocationId);
   const parent=invocation && s.jobs.find(j=>j.id===invocation.jobId);
   ensure(invocation && parent, '技能子任务缺少父调用');
+  // A skill package may declare its own automation topology. This generic
+  // contract is part of the pinned source bundle; alternative skills need
+  // neither these keys nor any particular review method.
+  const source=JSON.parse(fs.readFileSync(invocation.sourceArchivePath,'utf8')) as SkillSourceBundle;
+  const contractFile=source.files.find(file=>file.relativePath==='automation-contract.json');
+  if(contractFile) {
+    const contract=JSON.parse(Buffer.from(contractFile.dataBase64,'base64').toString('utf8')) as
+      {schema?:number;requiredChildren?:{key?:string;tier?:Tier;independent?:boolean}[]};
+    ensure(contract.schema===1 && Array.isArray(contract.requiredChildren) &&
+      contract.requiredChildren.every(item=>typeof item.key==='string' &&
+        /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(item.key) && ['L1','L2','L3'].includes(item.tier || '') &&
+        typeof item.independent==='boolean') &&
+      new Set(contract.requiredChildren.map(item=>item.key)).size===contract.requiredChildren.length,
+      '技能包自动化契约无效');
+    for(const required of contract.requiredChildren) {
+      const child=rows.find(row=>row.key===required.key);
+      ensure(child?.required && child.tier===required.tier && child.independent===required.independent,
+        `技能包要求的子任务 ${required.key} 未按绑定契约登记`);
+    }
+  }
   const authored=rows.filter(x=>x.required && x.head!==parent.head);
   if(authored.length) {
     const t=s.tickets.find(t=>t.key===parent.ticket);

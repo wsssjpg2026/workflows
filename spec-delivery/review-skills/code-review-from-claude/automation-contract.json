@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "requiredChildren": [
+    { "key": "eligibility-start", "tier": "L3", "independent": true },
+    { "key": "guideline-paths", "tier": "L3", "independent": true },
+    { "key": "change-summary", "tier": "L3", "independent": true },
+    { "key": "lens-guidelines", "tier": "L2", "independent": true },
+    { "key": "lens-bugs", "tier": "L2", "independent": true },
+    { "key": "lens-git-history", "tier": "L2", "independent": true },
+    { "key": "lens-pr-history", "tier": "L2", "independent": true },
+    { "key": "lens-code-comments", "tier": "L2", "independent": true },
+    { "key": "eligibility-final", "tier": "L3", "independent": true }
+  ]
+}

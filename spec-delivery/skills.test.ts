@@ -431,8 +431,9 @@ test('独立动作和 fresh 不复用作者或 regular 结论，fresh packet 只
   const x=contextFixture('new');
   try {
     x.s.jobs=x.s.jobs.filter(j=>j.id!==x.successor.id);
+    x.j.action='pr-review';x.j.part='';x.j.contextIntent={kind:'independent',fresh:false,lineage:'101:review-pr'};
     const reserved=core.reserve(x.s);
-    assert.equal(reserved.find(j=>j.action==='review-lens'&&j.part==='0')?.contextIntent?.predecessorJobId,x.j.id);
+    assert.equal(reserved.find(j=>j.action==='pr-review')?.contextIntent?.predecessorJobId,x.j.id);
     x.s.jobs=x.s.jobs.filter(j=>!reserved.includes(j));
     x.s.jobs.push({...structuredClone(x.j),id:'author-prior',action:'implement',part:'',
       contextIntent:{kind:'independent',fresh:false,lineage:'101:author'}});
@@ -440,16 +441,19 @@ test('独立动作和 fresh 不复用作者或 regular 结论，fresh packet 只
       assert.equal(core.contextIntentFor(x.s,x.t.key,action,'',false).predecessorJobId,'author-prior');
     for(const action of ['plan-check','accept','replan','adjudicate','spec-audit'] as core.Action[])
       assert.equal(core.contextIntentFor(x.s,x.t.key,action,'',false).kind,'independent');
-    assert.equal(core.contextIntentFor(x.s,x.t.key,'review-lens','0',false).kind,'continue');
+    assert.equal(core.contextIntentFor(x.s,x.t.key,'review-lens','0',false).kind,'independent');
     assert.equal(core.contextIntentFor(x.s,x.t.key,'review-lens','0',true).kind,'independent');
+    assert.equal(core.contextIntentFor(x.s,x.t.key,'pr-review','',false).predecessorJobId,x.j.id);
+    assert.equal(core.contextIntentFor(x.s,x.t.key,'pr-review','',true).kind,'independent');
     x.t.evidence.regular={head:x.t.head,base:x.t.base,path:x.j.session!.evidencePath};
     x.t.reviewHandoff=x.j.session!.evidencePath;x.t.reason='author argued this finding away';
     const fresh={...x.successor,id:'fresh-job',fresh:true,contextIntent:{kind:'independent' as const,fresh:true},
-      action:'review-lens' as const,contextKey:'fresh-context'};
+      action:'pr-review' as const,contextKey:'fresh-context'};
     const p=packet(x.s,fresh,x.statePath);
     assert.deepEqual(p.prior,[]);assert.equal(p.handoffPath,'');assert.equal(p.historyIndexPath,'');
     assert.equal(p.blockingReason,'');assert.equal(p.finding,null);assert.equal(p.dispute,null);
     assert.equal(p.rawSources?.candidate.head,x.t.head);
+    assert.deepEqual(p.skillCall?.capabilities,['prReview']);
     assert.equal(fs.existsSync(path.join(path.dirname(x.statePath),'jobs',sha(fresh.id).slice(0,20),'prior-index.json')),false);
   } finally {x.cleanup();}
 });

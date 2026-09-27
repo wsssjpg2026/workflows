@@ -253,6 +253,13 @@ export function issue(repo: Repo, number: number): IssueFact {
   };
 }
 
+/** PR conversation comments use the issue-comments endpoint, but a PR is not an issue fact. */
+export function prComments(repo: Repo, number: number) {
+  integer(number, 'PR number');
+  return list(repo, `${pathFor(repo)}/issues/${number}/comments?per_page=100`)
+    .map(c => ({ url: string(c.html_url, 'comment.html_url'), body: nullableText(c.body, 'comment.body') }));
+}
+
 /** 返回全部后代，不含父 spec；每层都完整分页，跨仓库或循环明确报错。 */
 export function subIssues(repo: Repo, number: number): IssueFact[] {
   integer(number, "parent issue number");

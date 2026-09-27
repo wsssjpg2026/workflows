@@ -660,18 +660,18 @@ export function packet(s: engine.State, j: engine.Job, statePath: string) {
       note:'只纠正回执格式；读取原始字节及上下文后返回完整 JSON 结果。禁止实现、推送、评论、合并或修改工作区。'};
   }
   const authored = ['implement', 'publish', 'integrate', 'replan'].includes(j.action);
-  const freshInitial = j.fresh && j.action === 'review-lens';
+  const freshInitial = j.fresh && ['review-lens', 'pr-review'].includes(j.action);
   const freshChild = !!child && j.fresh;
   const prior = (child || freshInitial ? [] : s.jobs.filter(x => x.ticket === j.ticket && x.status === 'done' && x.result &&
     (j.action === 'review-report' ? x.epoch === j.epoch && ['review-lens', 'confirm', 'adjudicate'].includes(x.action)
-      : !j.fresh && (authored || ['review-lens', 'confirm', 'review-report'].includes(x.action)))))
+      : !j.fresh && (authored || ['pr-review', 'review-lens', 'confirm', 'review-report'].includes(x.action)))))
     .map(x => { archiveResult(statePath,x); return { action: x.action, epoch: x.epoch, head: x.head, base: x.base, status: x.result!.status,
       resultPath: resultPaths(statePath,x.id).result }; });
   // 旧结果保持完整归档；每次派发只带当前轮的索引，完整历史按需读取。
   const relevant = prior.filter(x => x.epoch === j.epoch || x.head === j.head);
   const priorPath = path.join(out, 'prior-index.json');
   if (!freshInitial && !freshChild) write(priorPath, prior);
-  const objective = j.fresh && (child || ['review-lens', 'confirm'].includes(j.action))
+  const objective = j.fresh && (child || ['pr-review', 'review-lens', 'confirm'].includes(j.action))
     ? { tests: t?.evidence.tests, visual: t?.evidence.visual } : t?.evidence || {};
   return { jobId: j.id, action: j.action, tier: j.tier, model: j.model, executor: j.executor, fresh: j.fresh, contextKey: j.contextKey,
     contextIntent:j.contextIntent || null, contextObservation:j.contextObservation || null,
@@ -690,7 +690,7 @@ export function packet(s: engine.State, j: engine.Job, statePath: string) {
     repo: s.repo, spec: s.spec, issue: t?.number || s.spec, targetBranch: s.inputs.targetBranch,
     branch: t?.branch || '', worktree: t?.worktree || '', pr: t?.pr || 0, expectedHead: j.head, expectedBase: j.base,
     criteria: t?.criteria || s.specCriteria, visualRequired: t?.visual || false, closeout: t?.closeout || false,
-    blockingReason: j.fresh && (child || ['review-lens','confirm'].includes(j.action)) ? '' : t?.reason || t?.lastProblem || '',
+    blockingReason: j.fresh && (child || ['pr-review','review-lens','confirm'].includes(j.action)) ? '' : t?.reason || t?.lastProblem || '',
     planPath: j.fresh && j.action !== 'plan-check' ? '' : t?.planPath || '',
     checksPath: freshInitial || freshChild ? '' : t?.checksPath || '',
     handoffPath: j.fresh && j.action !== 'replan' ? '' : authored ? t?.handoffPath || '' : t?.reviewHandoff || '',
@@ -720,11 +720,16 @@ export function packet(s: engine.State, j: engine.Job, statePath: string) {
       : j.action === 'author-review'
       ? { capabilities:['authorReview'],command:'skill-start',finishCommand:'skill-finish',
           resultField:'data.skillInvocationIds',note:'对当前候选调用已绑定作者审查技能；技能自行委派专业子任务。' }
+      : j.action === 'pr-review'
+      ? { capabilities: ['prReview'], command: 'skill-start', finishCommand: 'skill-finish',
+          delegateCommand: 'skill-delegate', childrenCommand: 'skill-children', resultField: 'data.skillInvocationIds',
+          note: '按绑定技能包的 SKILL.md 和 automation-context.md 实际执行。技能按需登记子任务；提交完成的原始报告及宿主回执。跳过/未完成必须如实返回，不能签发 reviewed。' }
       : null,
     rolesPath, outputDirectory: out, resultPath: path.join(out, 'result.json'),
     resourceGrant: { agentSlots: j.executor === 'agent' ? 1 : 0, testBatches: j.tests, nestedAgents: false },
     note: child ? '执行技能请求的本子任务；独立上下文要求由宿主证明。不要派隐藏 agent；以 completed、failed 或 incomplete 返回结果。' :
-      '读角色约束与来源；仅执行本 job。main loop 和并行审查由内核调度，agent 不自行派隐藏子 agent。' };
+      j.action === 'pr-review' ? '按已绑定技能的方法执行，并用 skill-delegate 登记所需子任务；不得自行派隐藏 agent。' :
+      '读角色约束与来源；仅执行本 job。main loop 由内核调度，agent 不自行派隐藏子 agent。' };
 }
 function claimLease(s: engine.State, j: engine.Job, statePath: string) {
   if (j.action !== 'claim') return true;
@@ -767,8 +772,19 @@ function validateResult(s: engine.State, j: engine.Job, r: engine.Result) {
     engine.ensure(invocation?.reviewSources?.fingerprint===authorReviewSources(s,t,j.head,j.base).fingerprint,
       '作者自检的 spec/规范、计划或候选来源已过期');
   }
-  if (s.v3?.skillBindings && ['verify','publish','review-lens','confirm','review-report','accept','merge'].includes(j.action))
+  if (s.v3?.skillBindings && ['verify','publish','pr-review','review-lens','confirm','review-report','accept','merge'].includes(j.action))
     requireCurrentAuthorReview(s,t);
+  if (s.protocol === engine.currentProtocol && ['accept','merge'].includes(j.action)) verifyReviewEvidenceFiles(s,t);
+  if (s.protocol === engine.currentProtocol && j.action === 'review-report') {
+    const invocation=s.v3?.skillInvocations.find(i=>i.id===r.data?.reviewInvocationId);
+    engine.ensure(invocation?.result?.rawOutputPath===r.evidencePath &&
+      invocation.result.rawOutputSha256===sha(fs.readFileSync(r.evidencePath)),
+      '已发布报告不是当前归档的技能原文');
+    const marker=`<!-- spec-delivery:${s.id}:${t.key}:${t.phase}:${invocation.id} -->`;
+    const expected=`${marker}\n\n${fs.readFileSync(r.evidencePath,'utf8').trimEnd()}\n`;
+    engine.ensure(gh.prComments(s.repo,t.pr).some(c=>c.url===r.data?.commentUrl && c.body===expected),
+      'PR 上未找到与技能原文一致的审查完成评论');
+  }
   engine.ensure(t.phase !== 'recovery', '工作区尚在恢复，原任务回执不能签发新候选证据');
   if (j.action === 'plan-check' && s.planEvidence) {
     const planned = s.v3?.decisionRecords.findLast(d => ['ticket-plan', 'replan'].includes(d.kind) &&
@@ -813,6 +829,22 @@ function validateResult(s: engine.State, j: engine.Job, r: engine.Result) {
     const pr = gh.pr(s.repo, Number(r.data?.pr));
     engine.ensure(pr.state === 'OPEN' && !pr.draft && pr.head === r.head && pr.baseRef === s.inputs.targetBranch && pr.base === r.base, '远端 PR 不是预期的可审查候选');
     s.facts.prs[String(pr.number)] = pr;
+  }
+}
+function verifyReviewEvidenceFiles(s:engine.State,t:engine.Ticket) {
+  for(const round of ['regular','fresh'] as const) {
+    const evidence=t.evidence[round];
+    engine.ensure(evidence?.skillInvocationId && evidence.skillFingerprint && evidence.rawReportSha256,
+      `${round} 审查缺少原始技能报告及版本记录`);
+    const invocation=s.v3?.skillInvocations.find(i=>i.id===evidence.skillInvocationId);
+    const job=invocation && s.jobs.find(j=>j.id===invocation.jobId);
+    engine.ensure(invocation && job && invocation.capability==='prReview' &&
+      invocation.bindingFingerprint===evidence.skillFingerprint && invocation.result?.status==='pass' &&
+      !invocation.result.blocking && invocation.result.rawOutputPath===evidence.path &&
+      invocation.result.rawOutputSha256===evidence.rawReportSha256 &&
+      invocation.head===t.head && invocation.base===t.base,
+      `${round} 审查的技能、候选或原始报告已失效`);
+    skills.verifySkillResultFiles(s,job,[invocation.id]);
   }
 }
 function verify(s: engine.State, j: engine.Job, statePath: string): engine.Result {
@@ -907,6 +939,46 @@ function claim(s: engine.State, j: engine.Job, statePath: string): engine.Result
   write(evidencePath,{...intent,commentUrl});
   return {model:j.model,complete:true,status:'claimed',evidencePath,data:{branch:intent.branch,worktree:intent.worktree,head:j.base,claimCommentUrl:commentUrl}};
 }
+function publishReviewReport(s:engine.State,j:engine.Job):engine.Result {
+  const t=engine.ticket(s,j.ticket);
+  engine.ensure(s.protocol===engine.currentProtocol && ['review','fresh'].includes(t.phase) &&
+    t.epoch===j.epoch && t.pr>0 && j.head===t.head && j.base===t.base,
+    '只能发布当前候选与轮次的 PR 审查报告');
+  const live=s.facts.prs[String(t.pr)];
+  engine.ensure(live?.state==='OPEN' && !live.draft && live.head===j.head && live.base===j.base,
+    'PR 审查报告对应的远端候选已改变或 PR 不可审查');
+  const review=s.jobs.find(x=>x.ticket===t.key && x.epoch===t.epoch && x.action==='pr-review' &&
+    x.status==='done' && x.result?.complete && x.result.status==='reviewed');
+  const ids=review?.result?.data?.skillInvocationIds;
+  engine.ensure(review && Array.isArray(ids) && ids.length===1,'本轮缺少完整 prReview 技能调用');
+  const invocation=s.v3?.skillInvocations.find(i=>i.id===ids[0]);
+  engine.ensure(invocation && invocation.jobId===review.id && invocation.capability==='prReview' &&
+    invocation.candidateVersion===engine.candidateVersion(s,t) &&
+    invocation.bindingFingerprint===s.v3?.skillBindings?.find(b=>b.capability==='prReview')?.fingerprint &&
+    invocation.result && ['pass','changes_required'].includes(invocation.result.status) &&
+    !!invocation.result.rawOutputPath,'PR 审查技能结果或版本已过期');
+  skills.verifySkillResultFiles(s,review,[invocation.id]);
+  const report=fs.readFileSync(safeFile(invocation.result.rawOutputPath),'utf8');
+  engine.ensure(report.trim(),'技能没有生成原始审查报告');
+  const marker=`<!-- spec-delivery:${s.id}:${t.key}:${t.phase}:${invocation.id} -->`;
+  const body=`${marker}\n\n${report.trimEnd()}\n`;
+  const existing=gh.prComments(s.repo,t.pr).find(c=>c.body.includes(marker));
+  engine.ensure(!existing || existing.body===body,'已有审查评论与归档的技能原文不一致');
+  let commentUrl=existing?.url;
+  if(!commentUrl) {
+    const bodyPath=path.join(path.dirname(invocation.sourceArchivePath),'review-comment.md');
+    fs.writeFileSync(bodyPath,body);
+    command(s.repo.root,'gh',['pr','comment',String(t.pr),'--repo',
+      `${s.repo.host}/${s.repo.slug}`,'--body-file',bodyPath]);
+    const posted=gh.prComments(s.repo,t.pr).find(c=>c.body.includes(marker));
+    engine.ensure(posted?.body===body,'发布后未能核对技能报告原文');
+    commentUrl=posted.url;
+  }
+  engine.ensure(!!commentUrl,'GitHub 未返回审查评论地址');
+  return {model:j.model,complete:true,status:'posted',head:j.head,base:j.base,
+    evidencePath:invocation.result.rawOutputPath,
+    data:{commentUrl,reviewInvocationId:invocation.id}};
+}
 function closeIssue(s:engine.State,j:engine.Job,statePath:string):engine.Result {
   const t=s.tickets.find(t=>t.key===j.ticket), number=t?.number || s.spec;
   if(j.action==='spec-close') engine.ensure(s.specAudit?.status==='complete' && s.specAudit.base===s.facts.base && j.base===s.facts.base,'spec 验收已过期');
@@ -945,12 +1017,14 @@ function executeCommand(statePath: string, id: string) {
   // 测试/清理时只保留资源租约，不持有整个状态文件锁；其他独立工单可以继续。
   const startedAt=new Date().toISOString();
   const recorded=fs.existsSync(receiptPath) ? read<{result?:engine.Result}>(receiptPath).result : undefined;
-  const r = recorded || (j.action === 'verify' ? verify(s, j, statePath) : j.action === 'claim' ? claim(s,j,statePath) : ['close','spec-close'].includes(j.action) ? closeIssue(s,j,statePath) : cleanup(s, j, statePath));
+  const r = recorded || (j.action === 'verify' ? verify(s, j, statePath) : j.action === 'claim' ? claim(s,j,statePath) :
+    j.action === 'review-report' && s.protocol===engine.currentProtocol ? publishReviewReport(s,j) :
+    ['close','spec-close'].includes(j.action) ? closeIssue(s,j,statePath) : cleanup(s, j, statePath));
   if(!recorded) write(receiptPath,{jobId:j.id,startedAt,finishedAt:new Date().toISOString(),result:r});
   release = lock(statePath);
   try {
     const latest = read<engine.State>(statePath); latest.facts = observe(latest,[j]);
-    if(j.action==='claim') validateResult(latest,j,r);
+    if(j.action==='claim' || j.action==='review-report' && latest.protocol===engine.currentProtocol) validateResult(latest,j,r);
     engine.submit(latest, j.id, r); archiveResult(statePath,latest.jobs.find(x=>x.id===j.id)!); save(statePath, latest);
     return { statePath, status: latest.status, revision: latest.revision, result: r };
   } finally { release(); }
@@ -1961,6 +2035,7 @@ export async function main(argv: string[]): Promise<unknown> {
       }
       const t = engine.ticket(s, j.ticket);
       if(s.v3?.skillBindings)requireCurrentAuthorReview(s,t);
+      if(s.protocol===engine.currentProtocol)verifyReviewEvidenceFiles(s,t);
       engine.ensure(j.action === 'merge' && engine.mergeGate(s, t), '最新的合并门禁不满足，禁止合并');
       return { allowed: true, head: t.head, base: t.base, at: s.facts.at, note: '立即使用预期 head 约束合并；远端保护仍生效，目标分支由主控串行调度' };
     }

@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { normalizeResult, resultPaths } from './host.ts';
 
 const entry = fileURLToPath(new URL('../spec-delivery.workflow.ts', import.meta.url));
 const git = (cwd: string, ...argv: string[]) => execFileSync('git', argv, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -61,7 +62,7 @@ else { console.error('unexpected gh '+a.join(' ')); process.exit(2); }
     tickets: [{ number: 101, kind: 'software', dependencies: [], criteria: ['delivered'], visual: false }],
     specCriteria: ['delivered'], evidencePath: planEvidence,
   }));
-  return { temp, root, head, call, inputPath, planPath, planEvidence, ghLog, observe };
+  return { temp, root, head, call, inputPath, planPath, planEvidence, ghLog, observe, sessions, env };
 }
 function planned(x: ReturnType<typeof fixture>) {
   const started = x.call('init', x.inputPath); assert.equal(started.status, 0, started.stderr);
@@ -75,6 +76,53 @@ function planned(x: ReturnType<typeof fixture>) {
   const planning = JSON.parse(driven.stdout).jobs.find((j: {action:string}) => j.action === 'plan');
   assert.ok(planning);
   return { statePath, planning };
+}
+function controlledHost(x: ReturnType<typeof fixture>) {
+  const store = path.join(x.temp, 'host.json');
+  fs.writeFileSync(store, JSON.stringify({ mode: 'normal', attempts: 0, starts: 0, actors: {} }));
+  const adapter = path.join(x.temp, 'bin', 'controlled-host');
+  fs.writeFileSync(adapter, `#!/usr/bin/env node
+const fs=require('fs'),path=require('path');
+const store=${JSON.stringify(store)}, sessions=${JSON.stringify(x.sessions)};
+const [op,requestPath]=process.argv.slice(2), request=JSON.parse(fs.readFileSync(requestPath,'utf8'));
+const state=JSON.parse(fs.readFileSync(path.join(path.dirname(requestPath),'..','state.json'),'utf8'));
+const dispatch=state.v3.dispatchRecords.find(d=>d.token===request.token);
+if(!dispatch||dispatch.requestPath!==requestPath||!['prepared','starting','running','completed','uncertain'].includes(dispatch.status))process.exit(81);
+const db=JSON.parse(fs.readFileSync(store,'utf8'));
+const save=()=>fs.writeFileSync(store,JSON.stringify(db));
+const reply=(data)=>console.log(JSON.stringify({token:request.token,jobId:request.jobId,targetHost:request.targetHost,...data}));
+const actor=db.actors[request.token];
+if(op==='query') {
+  if(db.mode==='unknown')reply({state:'unknown'});
+  else if(db.mode==='wrong-association'&&actor)reply({state:actor.state,nativeId:actor.nativeId,jobId:'different-job'});
+  else if(actor)reply({state:actor.state,nativeId:actor.nativeId,startedAt:actor.startedAt});
+  else reply({state:'not_found',authoritative:true});
+} else if(op==='start') {
+  db.attempts++;
+  if(db.mode==='before-start') {save();process.exit(82);}
+  if(!actor) {
+    const nativeId='host-actor-'+request.token;
+    db.actors[request.token]={state:'running',nativeId,startedAt:'2026-09-27T00:00:00.000Z'};db.starts++;
+    const all=JSON.parse(fs.readFileSync(sessions,'utf8'));
+    all[nativeId]={source:'native_host',observationId:'host-observed-'+request.token,jobId:request.jobId,
+      nativeId,provider:'fixture',model:request.requestedModel,observedAt:'2026-09-27T00:00:00.000Z'};
+    fs.writeFileSync(sessions,JSON.stringify(all));
+  }
+  save();
+  if(db.mode==='lost-response')process.exit(83);
+  reply({state:'running',nativeId:db.actors[request.token].nativeId,startedAt:db.actors[request.token].startedAt});
+} else if(op==='collect') {
+  if(!actor||actor.state!=='completed')process.exit(84);
+  reply({state:'completed',nativeId:actor.nativeId,result:actor.result});
+} else if(op==='cancel') {
+  if(!actor)process.exit(86);
+  actor.state='cancelled';save();reply({state:'cancelled',nativeId:actor.nativeId,cancelledAt:'2026-09-27T00:00:02.000Z'});
+} else process.exit(85);
+`);
+  fs.chmodSync(adapter, 0o755); x.env.SPEC_DELIVERY_HOST_ADAPTER = adapter;
+  const get = () => JSON.parse(fs.readFileSync(store, 'utf8'));
+  const set = (mutate: (value: ReturnType<typeof get>) => void) => { const value = get(); mutate(value); fs.writeFileSync(store, JSON.stringify(value)); };
+  return { store, get, set };
 }
 function approvedImplementation(x: ReturnType<typeof fixture>) {
   const { statePath, planning } = planned(x);
@@ -337,4 +385,206 @@ test('旧协议保持只读，暂停迁移有原账本备份且不会自动恢�
       assert.match(unsupported.stderr, /不支持的运行协议/);
     }
   } finally { fs.rmSync(x.temp, { recursive: true, force: true }); }
+});
+
+test('公开 CLI 在启动前落盘 token；启动前失败及响应丢失后按 token 查询，不重复实际启动', () => {
+  const x = fixture();
+  try {
+    const { statePath, planning } = planned(x);
+    const host = controlledHost(x);
+    const before = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    const dispatch = before.v3.dispatchRecords.find((d: {jobId:string}) => d.jobId === planning.id);
+    assert.equal(dispatch.status, 'prepared');
+    assert.equal(dispatch.jobId, planning.id);
+    assert.equal(dispatch.attempt, 1);
+    assert.equal(dispatch.targetHost, 'test');
+    assert.equal(dispatch.requestedModel, 'large');
+    assert.equal(JSON.parse(fs.readFileSync(dispatch.requestPath, 'utf8')).token, dispatch.token);
+    host.set(db => { db.mode = 'before-start'; });
+    const failed = x.call('dispatch', statePath, planning.id); assert.equal(failed.status, 0, failed.stderr);
+    assert.equal(JSON.parse(failed.stdout).status, 'uncertain');
+    assert.equal(host.get().starts, 0);
+    const uncertain = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    assert.equal(uncertain.jobs.find((j: {id:string})=>j.id===planning.id).nativeId, '');
+    assert.equal(uncertain.v3.dispatchRecords.find((d: {jobId:string})=>d.jobId===planning.id).status, 'uncertain');
+    host.set(db => { db.mode = 'normal'; });
+    const retried = x.call('dispatch', statePath, planning.id); assert.equal(retried.status, 0, retried.stderr);
+    assert.equal(JSON.parse(retried.stdout).status, 'running', retried.stdout);
+    assert.equal(host.get().starts, 1, retried.stdout);
+    const bound = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    const j = bound.jobs.find((j: {id:string})=>j.id===planning.id);
+    assert.equal(j.nativeId, 'host-actor-'+dispatch.token);
+    assert.equal(j.session.observationId, 'host-observed-'+dispatch.token);
+    assert.ok(bound.v3.dispatchRecords[0].events.every((e: {evidencePath:string;digest:string}) =>
+      fs.existsSync(e.evidencePath) && e.digest.length===64));
+    assert.equal(x.call('dispatch', statePath, planning.id).status, 0);
+    assert.equal(host.get().starts, 1);
+  } finally { fs.rmSync(x.temp, { recursive: true, force: true }); }
+});
+
+test('启动响应丢失、绑定前后和结果落盘后恢复；重复 collect 只提交一次', () => {
+  const x = fixture();
+  try {
+    const { statePath, planning } = planned(x), host = controlledHost(x);
+    host.set(db => { db.mode = 'lost-response'; });
+    const lost = x.call('dispatch', statePath, planning.id); assert.equal(lost.status, 0, lost.stderr);
+    assert.equal(JSON.parse(lost.stdout).status, 'uncertain');
+    const token = JSON.parse(fs.readFileSync(statePath, 'utf8')).v3.dispatchRecords[0].token;
+    assert.equal(host.get().starts, 1, lost.stdout);
+    host.set(db => { db.mode = 'normal'; });
+    const recovered = x.call('dispatch', statePath, planning.id); assert.equal(recovered.status, 0, recovered.stderr);
+    assert.equal(JSON.parse(recovered.stdout).status, 'running');
+    assert.equal(host.get().starts, 1);
+    const afterBind = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    assert.equal(afterBind.jobs.find((j: {id:string})=>j.id===planning.id).status, 'running');
+    const checks = path.join(x.temp,'host-checks.md'); fs.writeFileSync(checks,'checked\n');
+    const rawResult={complete:true,status:'planned',evidencePath:x.planEvidence,data:{planPath:x.planPath,checksPath:checks}};
+    host.set(db => { db.actors[token].state='completed'; db.actors[token].result=rawResult; });
+    // Model a process death after result and ready-file persistence but before core submission.
+    const files=resultPaths(statePath,planning.id);
+    const pending=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    fs.writeFileSync(files.result,JSON.stringify(normalizeResult(pending,pending.jobs.find((j:{id:string})=>j.id===planning.id),rawResult)));
+    fs.writeFileSync(files.ready,JSON.stringify({jobId:planning.id,at:'2026-09-27T00:00:01.000Z',resultPath:files.result}));
+    const collected = x.call('collect', statePath, planning.id); assert.equal(collected.status, 0, collected.stderr);
+    const finished = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    assert.equal(finished.jobs.find((j: {id:string})=>j.id===planning.id).status, 'done');
+    assert.equal(finished.tickets[0].phase, 'plan_check');
+    assert.equal(finished.v3.dispatchRecords[0].status, 'completed');
+    assert.ok(finished.v3.dispatchRecords[0].instances.some((i: {nativeId:string;state:string}) =>
+      i.nativeId==='host-actor-'+token && i.state==='completed'));
+    const revision = finished.revision;
+    assert.equal(x.call('collect', statePath, planning.id).status, 0);
+    assert.equal(JSON.parse(fs.readFileSync(statePath,'utf8')).revision, revision);
+    assert.equal(host.get().starts, 1);
+  } finally { fs.rmSync(x.temp, { recursive: true, force: true }); }
+});
+
+test('宿主无法判明启动状态或没有可信原生会话时保留实例证据，拒绝盲目重派', () => {
+  const x = fixture();
+  try {
+    const { statePath, planning } = planned(x), host = controlledHost(x);
+    host.set(db => { db.mode = 'unknown'; });
+    assert.equal(JSON.parse(x.call('dispatch',statePath,planning.id).stdout).status,'uncertain');
+    assert.equal(JSON.parse(x.call('dispatch',statePath,planning.id).stdout).status,'uncertain');
+    assert.equal(host.get().attempts, 0);
+    host.set(db => { db.mode='lost-response'; });
+    assert.equal(JSON.parse(x.call('dispatch',statePath,planning.id).stdout).status,'uncertain');
+    const state = JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const token = state.v3.dispatchRecords[0].token;
+    const native = 'host-actor-'+token;
+    fs.writeFileSync(x.sessions, '{}');
+    host.set(db => { db.mode='normal'; });
+    const query = x.call('collect',statePath,planning.id); assert.equal(query.status,0,query.stderr);
+    const uncertain = JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const record = uncertain.v3.dispatchRecords[0];
+    assert.equal(record.status,'uncertain');
+    assert.equal(record.instances.find((i:{nativeId:string})=>i.nativeId===native).state,'running');
+    assert.equal(host.get().starts,1);
+    assert.equal(x.call('dispatch',statePath,planning.id).status,0);
+    assert.equal(host.get().starts,1);
+  } finally { fs.rmSync(x.temp, { recursive: true, force: true }); }
+});
+
+test('同批快 actor 的完成事件立即收取，慢 actor 的租约与实例保持运行', () => {
+  const x = fixture();
+  try {
+    const { statePath, binding } = approvedImplementation(x);
+    const next = x.call('next',statePath); assert.equal(next.status,0,next.stderr);
+    const implement = JSON.parse(next.stdout).jobs.find((j:{action:string})=>j.action==='implement'); assert.ok(implement);
+    const state = JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const worktree = state.tickets[0].worktree as string;
+    fs.writeFileSync(path.join(worktree,'source.txt'),'implemented\n');
+    git(worktree,'add','source.txt');git(worktree,'commit','-m','implement');
+    const head = git(worktree,'rev-parse','HEAD');
+    x.observe('native-implement',implement.id,'small');
+    fs.writeFileSync(binding,JSON.stringify({nativeId:'native-implement'}));
+    assert.equal(x.call('bind',statePath,implement.id,binding).status,0);
+    const handoff=path.join(x.temp,'handoff.md');fs.writeFileSync(handoff,'implementation handoff\n');
+    const receipt={complete:true,status:'implemented',head,base:x.head,evidencePath:handoff,handoffPath:handoff};
+    const staged=x.call('stage',statePath,implement.id,JSON.stringify(receipt));assert.equal(staged.status,0,staged.stderr);
+    const selfNext=x.call('next',statePath);assert.equal(selfNext.status,0,selfNext.stderr);
+    const jobs=JSON.parse(selfNext.stdout).jobs.filter((j:{action:string})=>['self-standards','self-spec'].includes(j.action));
+    assert.equal(jobs.length,2);
+    const host=controlledHost(x);
+    for(const j of jobs){const launched=x.call('dispatch',statePath,j.id);assert.equal(launched.status,0,launched.stderr);assert.equal(JSON.parse(launched.stdout).status,'running');}
+    const fast=jobs.find((j:{action:string})=>j.action==='self-standards');
+    const slow=jobs.find((j:{action:string})=>j.action==='self-spec');
+    const ledger=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const token=ledger.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===fast.id).token;
+    host.set(db=>{db.actors[token].state='completed';db.actors[token].result={complete:true,status:'reviewed',head,base:x.head,
+      evidencePath:handoff,findings:[]};});
+    const collect=x.call('collect',statePath);assert.equal(collect.status,0,collect.stderr);
+    const after=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(after.jobs.find((j:{id:string})=>j.id===fast.id).status,'done');
+    assert.equal(after.jobs.find((j:{id:string})=>j.id===slow.id).status,'running');
+    assert.equal(after.tickets[0].phase,'self');
+    assert.equal(host.get().starts,2);
+  } finally { fs.rmSync(x.temp, { recursive: true, force: true }); }
+});
+
+test('取消保留原生实例、时间与原始事件；任务写权等待独立停止证明', () => {
+  const x=fixture();
+  try {
+    const {statePath,planning}=planned(x),host=controlledHost(x);
+    assert.equal(JSON.parse(x.call('dispatch',statePath,planning.id).stdout).status,'running');
+    const cancelled=x.call('dispatch-cancel',statePath,planning.id);assert.equal(cancelled.status,0,cancelled.stderr);
+    assert.equal(JSON.parse(cancelled.stdout).status,'cancelled');
+    const state=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const dispatch=state.v3.dispatchRecords[0],native=dispatch.nativeId;
+    assert.equal(dispatch.status,'cancelled');
+    assert.equal(dispatch.instances.find((i:{nativeId:string})=>i.nativeId===native).state,'cancelled');
+    assert.equal(dispatch.instances.find((i:{nativeId:string})=>i.nativeId===native).cancelledAt,'2026-09-27T00:00:02.000Z');
+    assert.equal(state.jobs.find((j:{id:string})=>j.id===planning.id).status,'running');
+    assert.equal(JSON.parse(x.call('dispatch',statePath,planning.id).stdout).status,'cancelled');
+    assert.equal(host.get().starts,1);
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('错误 job 关联的原生实例被保留；宿主随后遗失 token 也不能重启同一任务', () => {
+  const x=fixture();
+  try {
+    const {statePath,planning}=planned(x),host=controlledHost(x);
+    host.set(db=>{db.mode='lost-response';});
+    assert.equal(JSON.parse(x.call('dispatch',statePath,planning.id).stdout).status,'uncertain');
+    const token=JSON.parse(fs.readFileSync(statePath,'utf8')).v3.dispatchRecords[0].token;
+    host.set(db=>{db.mode='wrong-association';});
+    const wrong=x.call('dispatch',statePath,planning.id);assert.equal(wrong.status,0,wrong.stderr);
+    assert.match(JSON.parse(wrong.stdout).error,/token、job/);
+    const observed=JSON.parse(fs.readFileSync(statePath,'utf8')).v3.dispatchRecords[0];
+    assert.ok(observed.instances.some((i:{nativeId:string})=>i.nativeId==='host-actor-'+token));
+    host.set(db=>{db.mode='normal';delete db.actors[token];});
+    assert.equal(JSON.parse(x.call('dispatch',statePath,planning.id).stdout).status,'uncertain');
+    assert.equal(host.get().starts,1);
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('drive 使用同一派发账本启动已预留 actor，重启后保持一个原生实例', () => {
+  const x=fixture();
+  try {
+    const {statePath,planning}=planned(x),host=controlledHost(x);
+    const first=x.call('drive',statePath);assert.equal(first.status,0,first.stderr);
+    assert.ok(JSON.parse(first.stdout).dispatched.some((d:{jobId:string;status:string})=>d.jobId===planning.id&&d.status==='running'));
+    assert.equal(host.get().starts,1);
+    const second=x.call('drive',statePath);assert.equal(second.status,0,second.stderr);
+    assert.equal(host.get().starts,1);
+    assert.equal(JSON.parse(fs.readFileSync(statePath,'utf8')).jobs.find((j:{id:string})=>j.id===planning.id).status,'running');
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('派发请求文件被改写后禁止调用宿主，即使改写者填入期望模型', () => {
+  const x=fixture();
+  try {
+    const {statePath,planning}=planned(x),host=controlledHost(x);
+    const record=JSON.parse(fs.readFileSync(statePath,'utf8')).v3.dispatchRecords[0];
+    const original=fs.readFileSync(record.requestPath);
+    const forged=JSON.parse(original.toString());forged.requestedModel='large';forged.source='native_host';
+    fs.writeFileSync(record.requestPath,JSON.stringify(forged));
+    const denied=x.call('dispatch',statePath,planning.id);assert.equal(denied.status,0,denied.stderr);
+    assert.equal(JSON.parse(denied.stdout).status,'uncertain');
+    assert.equal(host.get().attempts,0);
+    fs.writeFileSync(record.requestPath,original);
+    const recovered=x.call('dispatch',statePath,planning.id);assert.equal(recovered.status,0,recovered.stderr);
+    assert.equal(JSON.parse(recovered.stdout).status,'running');
+    assert.equal(host.get().starts,1);
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
 });

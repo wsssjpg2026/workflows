@@ -32,15 +32,23 @@
 
 1. `init <input.json>`：在目标仓库初始化，取得 `statePath`、原始来源和 `decisionContext`。主会话身份能由宿主观测时记录，否则为 `unknown`。已有运行返回原账本。
 2. `plan <state> <plan.json>`：真实 L1 提交执行图、验收映射、能力检查与资源预算。计划包含 `init` 或 `plan-context <state>` 返回的 `inputVersion/sourceVersion`，以及原生 L1 会话的 `decisionNativeId`。来源或模型配置变化后，旧计划会被拒绝。
-3. `drive <state>`：收取已完成 actor 的结果，在有界步数内推进确定性命令，返回所有尚未派发 jobs 和 packet 路径。命令任务包含认领、验证、关闭与清理；主控不能只关注原生 agent 批次。
-4. 按 job 的 `model/fresh/contextKey` 派发，取得真实宿主身份后立即绑定。完成事件到达即推进下一次 `drive`，独立工单无需等待整个批次结束。
+3. `drive <state>`：收取已完成 actor 的结果，在有界步数内推进确定性命令，返回所有尚未派发 jobs 和 packet 路径。配置派发适配器时，它也启动新 agent 任务；命令任务包含认领、验证、关闭与清理。
+4. 按 job 的 `model/fresh/contextKey` 派发，取得真实宿主身份后立即绑定。完成事件到达即调用 `collect` 或 `drive`；独立工单和同批快 actor 无需等待慢 actor。
 5. 无可运行 job 时，查询在途任务或按退避等待 CI。明确阻断、等待人工、用户暂停或完成时返回相应状态，避免空轮询。
 
-`next <state>` 是只预留、不执行命令的底层接口；它也会返回之前未派发的租约。`execute <state> <jobId>` 执行单个核心签发的确定性 job。主控操作状态的读改写由 CLI 加锁；actor 通过宿主 `stage` 返回内容，不直接编辑账本。
+`next <state>` 是只预留、不执行命令的底层接口；它也会返回之前未派发的租约。每个 agent 租约同时写入不可变的派发请求：job、attempt、随机 token、目标宿主、请求模型和 packet 路径。`execute <state> <jobId>` 执行单个核心签发的确定性 job。主控操作状态的读改写由 CLI 加锁；actor 通过宿主 `stage` 返回内容，不直接编辑账本。
 
 同一运行可并行计划、实现多张工单。候选完成实现后排队，优先让能解除下游依赖的工单进入队首，同时限制插队次数。**从集成基线、作者自检、验证、发布、regular/fresh review、验收到合并，只有队首候选推进。** 其它候选到队首再集成最新目标分支，避免同批合并使其它候选的完整审查反复失效。队列仅约束本运行；真实外部更新仍会撤销旧证据，连续失效进入有限重规划。
 
 ## 宿主适配与逐项回执
+
+### 可恢复的派发接口
+
+可信宿主设置绝对路径 `SPEC_DELIVERY_HOST_ADAPTER`，指向可执行适配器。CLI 以 `<operation> <request.json>` 调用它；`request.json` 是已落盘的 `{token,jobId,attempt,targetHost,requestedModel,packetPath}`。操作包括 `query`、`start`、`collect`、`cancel`。每次调用的原始 stdout、stderr、退出码和时间会以只追加文件保存在 `host-events/`；账本持有摘要和路径。适配器不能直接修改 `state.json`。
+
+`query` 应按 token 查询原生任务，返回 `{token,jobId,targetHost,state,nativeId?,authoritative?}`。`state` 可为 `not_found`、`running`、`completed`、`cancelled`、`unknown`。只有宿主能权威保证 token 不存在时才返回 `not_found,authoritative:true`。`start` 应先向宿主登记 token 与 job，再返回 `running` 或 `completed` 及稳定 `nativeId`；启动后响应丢失时，下次查询必须能找到同一实例。`collect` 返回 `completed`、`nativeId` 和 actor `result`；完成事件也可在 `query` 或 `start` 中携带 `result`。`cancel` 返回原生身份和终止状态；取消请求本身不释放工作区写权，仍需 `reconcile` 的进程树停止证明。运行中的回复可附 `startedAt`，终态可附 `completedAt/cancelledAt` 与原始 `usage`。
+
+`dispatch <state> <jobId>` 总是先查询 token，确认不存在后才启动。`collect <state> [jobId]` 按 actor 独立查询、绑定和收取，重复调用不会覆盖完成结果。原生身份与角色模型由 `SPEC_DELIVERY_HOST_OBSERVER` 再次查询核验；适配器回复中声称的模型或 caller JSON 中的 `source` 不能充当该观测。查询错误、身份不符、无法确认是否已启动或结果尚不可读时，账本记为 `uncertain`，保留实际实例和原始事件。后续按同一 token 查询；不能盲目启动另一个 actor，也不宣称跨宿主事务的 exactly-once。`dispatch-cancel <state> <jobId>` 先查询再发送取消请求。
 
 **ZCode**：先读取本机 `dynamic-workflows` 技能。`zcode <state>` 为已预留的同模型 jobs 生成原生脚本、`CreateWorkflow` 参数和 `binding` 模板。实际调用后，把返回的 `runId` 加入模板并调用 `bind-batch <state> <binding.json>`。身份格式为 `{runId,jobs:[{jobId,actorName}]}`。CLI 以 `{runId}/{actorName}` 查询宿主观测。响应不确定时先查询原生运行，不能重新启动同一批。
 

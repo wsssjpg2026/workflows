@@ -46,5 +46,10 @@ export function metrics(s: State) {
     tasks: s.jobs.map(j => ({ id: j.id, executor: j.executor, requestedModel: j.executor === 'agent' ? j.model : null,
       observedProvider: j.session?.provider || null, observedModel: j.session?.model || null, nativeId: j.nativeId,
       timing: j.timing || null, usage: j.usage || null })),
+    dispatches: (s.v3?.dispatchRecords || []).map(d => ({jobId:d.jobId,attempt:d.attempt,token:d.token,targetHost:d.targetHost,
+      requestedModel:d.requestedModel,status:d.status,uncertainty:d.uncertainty || null,events:d.events.length,
+      instances:d.instances.map(i => ({nativeId:i.nativeId,state:i.state,firstSeenAt:i.firstSeenAt,lastSeenAt:i.lastSeenAt,
+        startedAt:i.startedAt || null,completedAt:i.completedAt || null,cancelledAt:i.cancelledAt || null,
+        events:i.events.length,session:i.session || null,rawUsage:i.rawUsage ?? null,bindingError:i.bindingError || null}))})),
     note: 'null 表示未获取；命令任务不计作模型任务。绑定时间不是模型开始时间。ghInvocations 是 CLI 调用次数，不是 HTTP 分页请求数。' };
 }

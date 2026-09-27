@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { candidateVersion, ensure, event, currentProtocol, verifyNativeSession, type Job, type SkillBinding, type SkillCapability,
   inputVersion, type SkillChildRequest, type Tier, type SkillInvocation, type SkillMode, type SkillResult, type SkillStatus, type State } from './core.ts';
 
@@ -13,9 +14,14 @@ const defaultNames: Record<SkillCapability, string> = {
   prReview: 'code-review-from-claude', handoff: 'handoff',
 };
 export const skillCapabilities = capabilities;
-export function defaultSkillPaths(root = path.join(os.homedir(), '.agents', 'skills')): Record<SkillCapability, string> {
-  return Object.fromEntries(capabilities.map(capability =>
-    [capability, path.join(root, defaultNames[capability], 'SKILL.md')])) as Record<SkillCapability, string>;
+export function defaultSkillPaths(root?: string): Record<SkillCapability, string> {
+  const sourceRoot=root || path.join(os.homedir(), '.agents', 'skills');
+  const paths=Object.fromEntries(capabilities.map(capability =>
+    [capability, path.join(sourceRoot, defaultNames[capability], 'SKILL.md')])) as Record<SkillCapability, string>;
+  if (root === undefined)
+    paths.authorReview=path.join(path.dirname(fileURLToPath(import.meta.url)),
+      'review-skills','code-review','SKILL.md');
+  return paths;
 }
 
 /** Pin the exact bytes of the skill and every file in its package, including referenced resources. */
@@ -473,11 +479,13 @@ export function migrateSkillBindings(s: State, replacements: Partial<Record<Skil
     if (['done', 'human', 'close', 'cleanup', 'recovery'].includes(t.phase)) continue;
     if (changed.includes('implementation') || changed.includes('diagnosis') || changed.includes('handoff')) {
       if (!t.worktree || ['claim', 'plan', 'plan_check'].includes(t.phase)) continue;
-      t.phase = 'replan'; t.epoch++; t.evidence = {}; t.reason = '实现/诊断/交接技能版本迁移；重新批准计划并获取证据';
+      t.phase = 'replan'; t.epoch++; t.evidence = {}; t.authorReview=undefined;
+      t.reason = '实现/诊断/交接技能版本迁移；重新批准计划并获取证据';
     } else if (changed.includes('authorReview')) {
       if (!['self', 'verify', 'publish', 'review', 'fresh', 'accept', 'merge'].includes(t.phase) &&
           !(t.phase === 'blocked' && t.reason === 'waiting_ci')) continue;
-      t.phase = 'self'; t.epoch++; t.evidence = {}; t.reason = '作者自检技能版本迁移；重新审查当前候选';
+      t.phase = 'self'; t.epoch++; t.evidence = {}; t.authorReview=undefined;
+      t.reason = '作者自检技能版本迁移；重新审查当前候选';
     } else if (changed.includes('prReview')) {
       if (!['review', 'fresh', 'accept', 'merge'].includes(t.phase) &&
           !(t.phase === 'blocked' && t.reason === 'waiting_ci')) continue;

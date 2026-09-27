@@ -44,6 +44,48 @@ function sourceVersion(parent: gh.IssueFact, children: gh.IssueFact[]) {
       .map(c => ({ url: c.url, body: c.body })).sort((a, b) => a.url.localeCompare(b.url)) });
   return sha(JSON.stringify({ parent: normalized(parent), children: children.map(normalized).sort((a, b) => a.number - b.number) }));
 }
+function authorReviewSources(s: engine.State, t: engine.Ticket, head: string, base: string): engine.ReviewSources {
+  engine.ensure(t.worktree && t.planPath && t.checksPath, '作者自检需要已批准计划、检查范围及任务 worktree');
+  const tracked=git(t.worktree,'ls-files','-z','--','*.md','*.markdown','*.MD').split('\0').filter(Boolean);
+  const standardsPaths=tracked.filter(relative=>fs.existsSync(path.join(t.worktree,relative)))
+    .map(relative=>path.join(t.worktree,relative)).sort();
+  const standardsDigest=sha(JSON.stringify(standardsPaths.map(file=>[path.relative(t.worktree,file),sha(fs.readFileSync(file))])));
+  const source=sourceVersion(gh.issue(s.repo,s.spec),gh.subIssues(s.repo,s.spec));
+  const issueUrl=`https://${s.repo.host}/${s.repo.slug}/issues/${t.number}`;
+  const planDigest=sha(fs.readFileSync(safeFile(t.planPath)));
+  const checksDigest=sha(fs.readFileSync(safeFile(t.checksPath)));
+  const fingerprint=sha(JSON.stringify({issueUrl,source,standardsDigest,planDigest,checksDigest,head,base}));
+  return {issueUrl,sourceVersion:source,standardsDigest,standardsPaths,planDigest,checksDigest,head,base,fingerprint};
+}
+function requireCurrentAuthorReview(s: engine.State, t: engine.Ticket) {
+  const proof=t.authorReview;
+  engine.ensure(proof && proof.head===t.head && proof.base===t.base &&
+    proof.sources.fingerprint===authorReviewSources(s,t,t.head,t.base).fingerprint,
+    '作者自检候选、spec/规范来源或计划检查范围已改变；重新运行 authorReview');
+  const invocation=s.v3?.skillInvocations.find(i=>i.id===proof.invocationId);
+  engine.ensure(invocation && invocation.result?.status==='pass' && !invocation.result.blocking &&
+    invocation.bindingFingerprint===s.v3?.skillBindings?.find(b=>b.capability==='authorReview')?.fingerprint,
+    '作者自检调用缺失、未通过或技能版本已改变');
+  const actor=s.jobs.find(j=>j.id===proof.jobId);
+  engine.ensure(actor, '作者自检缺少真实执行者');
+  skills.verifySkillResultFiles(s,actor,[invocation.id]);
+}
+function refreshAuthorReviews(s: engine.State) {
+  if (!s.v3?.skillBindings) return;
+  for(const t of s.tickets) {
+    if (!t.authorReview || ['done','human','recovery'].includes(t.phase)) continue;
+    const fresh=t.authorReview.head===t.head && t.authorReview.base===t.base &&
+      t.authorReview.sources.fingerprint===authorReviewSources(s,t,t.head,t.base).fingerprint;
+    if(fresh) continue;
+    if(s.jobs.some(j=>j.ticket===t.key && (j.status==='leased'||j.status==='running'))) {
+      t.phase='blocked';t.reason='作者自检来源已变化；先对账在途任务';
+    } else {
+      t.phase='self';t.epoch++;t.evidence={};t.authorReview=undefined;
+      t.reason='作者自检候选或来源变化；重新审查';
+    }
+    engine.event(s,`#${t.number} 作者自检来源变化，旧结果失效`);
+  }
+}
 function nativeSession(statePath: string, nativeId: string, jobId: string): engine.NativeSession {
   const observer = process.env.SPEC_DELIVERY_HOST_OBSERVER;
   engine.ensure(observer && path.isAbsolute(observer) && fs.statSync(observer).isFile(),
@@ -653,6 +695,10 @@ export function packet(s: engine.State, j: engine.Job, statePath: string) {
     checksPath: freshInitial || freshChild ? '' : t?.checksPath || '',
     handoffPath: j.fresh && j.action !== 'replan' ? '' : authored ? t?.handoffPath || '' : t?.reviewHandoff || '',
     sourceUrl: `https://${s.repo.host}/${s.repo.slug}/issues/${t?.number || s.spec}`,
+    reviewContext: t && (j.action==='author-review' || child?.skillCapability==='authorReview')
+      ? { ...authorReviewSources(s,t,j.head,j.base), fixedPoint:j.base,
+          instruction:'按绑定的 code-review 技能分别委派 Standards 与 Spec 轴，保留两路原始结果；需要的 issue/spec 与规范来源由本 packet 提供。' }
+      : null,
     objectiveEvidence: objective, prior: relevant.slice(-20), historyIndexPath: freshInitial || j.fresh && j.action !== 'review-report' ? '' : priorPath,
     rawSources: freshInitial ? {specUrl:`https://${s.repo.host}/${s.repo.slug}/issues/${s.spec}`,
       issueUrl:`https://${s.repo.host}/${s.repo.slug}/issues/${t?.number || s.spec}`,
@@ -668,9 +714,12 @@ export function packet(s: engine.State, j: engine.Job, statePath: string) {
       ? { capabilities: [child.skillCapability], command: 'skill-start', finishCommand: 'skill-finish',
           resultField: 'data.skillInvocationIds', note: '通过已固定的能力绑定调用引用技能，并提交原始宿主回执。' }
       : j.action === 'implement'
-      ? { capabilities: ['implementation', 'diagnosis', 'handoff'], command: 'skill-start',
+      ? { capabilities: ['implementation', 'diagnosis', 'authorReview', 'handoff'], command: 'skill-start',
           finishCommand: 'skill-finish', resultField: 'data.skillInvocationIds',
-          note: '按计划显式调用已绑定 implement 或 diagnosing-bugs；完成候选后显式调用原始 handoff。宿主执行真实技能后提交外围回执。' }
+          note: '按批准计划选择 implement 或 diagnosing-bugs，测试走 test 预算入口。implement 内请求 /code-review 时，在 implementation 父调用下以 skill-delegate 委派一次当前 authorReview，head 为已提交候选；diagnosis 若没有内嵌审查，完成后由单个 author-review job 补审。完成候选后调用原始 handoff。' }
+      : j.action === 'author-review'
+      ? { capabilities:['authorReview'],command:'skill-start',finishCommand:'skill-finish',
+          resultField:'data.skillInvocationIds',note:'对当前候选调用已绑定作者审查技能；技能自行委派专业子任务。' }
       : null,
     rolesPath, outputDirectory: out, resultPath: path.join(out, 'result.json'),
     resourceGrant: { agentSlots: j.executor === 'agent' ? 1 : 0, testBatches: j.tests, nestedAgents: false },
@@ -696,6 +745,30 @@ function validateResult(s: engine.State, j: engine.Job, r: engine.Result) {
     skills.verifySkillResultFiles(s, j, r.data.skillInvocationIds as string[], r.handoffPath);
   }
   const t = s.tickets.find(t => t.key === j.ticket); if (!t || !r.complete) return;
+  if (s.v3?.skillBindings && j.action==='implement' && r.status==='implemented') {
+    const professional=(r.data?.skillInvocationIds as string[] || []).map(id=>s.v3!.skillInvocations.find(i=>i.id===id))
+      .find(i=>i?.capability==='implementation' || i?.capability==='diagnosis');
+    for(const child of (s.v3.skillChildren || []).filter(c=>c.parentInvocationId===professional?.id && c.skillCapability==='authorReview')) {
+      const actor=s.jobs.find(x=>x.id===child.jobIds.at(-1));
+      engine.ensure(actor && actor.result?.status==='completed', '内嵌作者自检子任务未完成');
+      const ids=actor.result.data?.skillInvocationIds;
+      engine.ensure(Array.isArray(ids), '内嵌作者自检缺少技能调用');
+      skills.verifySkillResultFiles(s,actor,ids as string[]);
+      for(const id of ids as string[]) {
+        const invocation=s.v3.skillInvocations.find(i=>i.id===id);
+        engine.ensure(invocation?.reviewSources?.fingerprint===authorReviewSources(s,t,r.head!,r.base!).fingerprint,
+          '内嵌作者自检的 spec/规范、计划或候选来源已过期');
+      }
+    }
+  }
+  if (s.v3?.skillBindings && j.action==='author-review') {
+    const id=(r.data?.skillInvocationIds as string[] || [])[0];
+    const invocation=s.v3.skillInvocations.find(i=>i.id===id);
+    engine.ensure(invocation?.reviewSources?.fingerprint===authorReviewSources(s,t,j.head,j.base).fingerprint,
+      '作者自检的 spec/规范、计划或候选来源已过期');
+  }
+  if (s.v3?.skillBindings && ['verify','publish','review-lens','confirm','review-report','accept','merge'].includes(j.action))
+    requireCurrentAuthorReview(s,t);
   engine.ensure(t.phase !== 'recovery', '工作区尚在恢复，原任务回执不能签发新候选证据');
   if (j.action === 'plan-check' && s.planEvidence) {
     const planned = s.v3?.decisionRecords.findLast(d => ['ticket-plan', 'replan'].includes(d.kind) &&
@@ -745,6 +818,7 @@ function validateResult(s: engine.State, j: engine.Job, r: engine.Result) {
 function verify(s: engine.State, j: engine.Job, statePath: string): engine.Result {
   const t = engine.ticket(s, j.ticket);
   engine.ensure(j.action === 'verify' && active(j), '该 job 不是验证任务');
+  if(s.v3?.skillBindings)requireCurrentAuthorReview(s,t);
   ensureDecisionArtifacts(s, t, 'plan-check', false);
   engine.ensure(localHead(t) === j.head && clean(t), '验证前候选必须匹配且干净');
   const manifestBytes = fs.readFileSync(t.checksPath, 'utf8');
@@ -1780,6 +1854,16 @@ export async function main(argv: string[]): Promise<unknown> {
         '技能宿主未返回当前能力的实际调用入口');
       const prepared = skills.prepareSkillCall(s, j, request.capability,
         observation.raw.capabilities as skills.SkillHostCapabilities, statePath);
+      if(request.capability==='authorReview' && !prepared.alreadyStarted) {
+        const t=engine.ticket(s,j.ticket);
+        engine.ensure(localHead(t)===j.head && clean(t), '作者自检须对已提交且干净的当前候选执行');
+        const sources=authorReviewSources(s,t,j.head,j.base);
+        const packetPath=path.join(path.dirname(statePath),'packets',sha(j.id).slice(0,20)+'.json');
+        const context=read<{reviewContext?:engine.ReviewSources}>(packetPath).reviewContext;
+        engine.ensure(context?.fingerprint===sources.fingerprint,
+          '作者自检 packet 的候选或来源已过期；重新派发当前来源');
+        prepared.invocation.reviewSources=sources;
+      }
       if (!prepared.alreadyStarted) {
         prepared.invocation.hostCapabilityPath=observation.file;
         prepared.invocation.hostCapabilitySha256=sha(fs.readFileSync(observation.file,'utf8'));
@@ -1838,6 +1922,14 @@ export async function main(argv: string[]): Promise<unknown> {
       engine.ensure(extra && fourth, '需要技能调用 ID 与外围回执文件');
       const invocation=s.v3?.skillInvocations.find(i=>i.id===extra);
       engine.ensure(invocation, '未知技能调用'); verifySessionArtifact(invocation.session);
+      if(invocation.capability==='authorReview') {
+        const job=s.jobs.find(j=>j.id===invocation.jobId);
+        engine.ensure(job, '作者自检缺少真实执行者');
+        const t=engine.ticket(s,job.ticket);
+        engine.ensure(localHead(t)===job.head && clean(t) &&
+          invocation.reviewSources?.fingerprint===authorReviewSources(s,t,job.head,job.base).fingerprint,
+          '作者自检结果的候选或来源已改变');
+      }
       const observation=skillObservation(statePath,'result',extra,invocation.jobId);
       const outcome=read<Omit<skills.SkillOutcome,'hostReceiptPath'>>(fourth);
       const result = skills.finishSkillCall(s, extra, {...outcome,hostReceiptPath:observation.file});
@@ -1868,6 +1960,7 @@ export async function main(argv: string[]): Promise<unknown> {
         return { allowed: true, base: s.facts.base, at: s.facts.at };
       }
       const t = engine.ticket(s, j.ticket);
+      if(s.v3?.skillBindings)requireCurrentAuthorReview(s,t);
       engine.ensure(j.action === 'merge' && engine.mergeGate(s, t), '最新的合并门禁不满足，禁止合并');
       return { allowed: true, head: t.head, base: t.base, at: s.facts.at, note: '立即使用预期 head 约束合并；远端保护仍生效，目标分支由主控串行调度' };
     }
@@ -1890,6 +1983,7 @@ export async function main(argv: string[]): Promise<unknown> {
       const observed = observe(s);
       inspectIdleWorkspaces(s, observed, statePath);
       engine.reconcileFacts(s, observed);
+      refreshAuthorReviews(s);
       if (s.status !== 'running') { save(statePath, s); return { status: s.status, next: 'inspect 中的状态需要 L1 处理；用户暂停时保持暂停' }; }
       if (s.planEvidence) {
         const global = s.v3?.decisionRecords.findLast(d => d.kind === 'execution-plan' && d.scope === '$spec' &&

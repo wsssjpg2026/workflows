@@ -22,9 +22,19 @@ export interface SkillInvocation {
   mode: SkillMode; nativeEntry?: string; session: NativeSession;
   candidateVersion: string; head: string; base: string; startedAt: string;
   sourceArchivePath: string; hostCapabilityPath?: string; hostCapabilitySha256?: string; result?: SkillResult;
+  reviewSources?: ReviewSources;
   resumeHistory?: { previousJobId: string; previousSession: NativeSession; jobId: string;
     session: NativeSession; evidencePath: string; evidenceSha256: string;
     previousHostCapabilityPath?: string; previousHostCapabilitySha256?: string; at: string }[];
+}
+export interface ReviewSources {
+  issueUrl: string; sourceVersion: string; standardsDigest: string;
+  standardsPaths: string[]; planDigest: string; checksDigest: string;
+  head: string; base: string; fingerprint: string;
+}
+export interface AuthorReviewEvidence {
+  invocationId: string; jobId: string; head: string; base: string;
+  bindingFingerprint: string; sources: ReviewSources; evidencePath: string;
 }
 /** A skill owns the topology; the workflow owns every lease, role, and result. */
 export interface SkillChildRequest {
@@ -128,7 +138,7 @@ export interface ExecutionPlan { capabilities: Capabilities; policy: Policy; tic
   inputVersion?: string; sourceVersion?: string; decisionNativeId?: string;
 }
 export type Phase = 'claim' | 'plan' | 'plan_check' | 'implement' | 'queued' | 'self' | 'verify' | 'publish' | 'review' | 'fresh' | 'accept' | 'integrate' | 'replan' | 'recovery' | 'merge' | 'close' | 'cleanup' | 'done' | 'human' | 'blocked';
-export type Action = 'claim' | 'plan' | 'plan-check' | 'implement' | 'self-standards' | 'self-spec' | 'verify' | 'publish' | 'review-lens' | 'confirm' | 'adjudicate' | 'review-report' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'spec-audit' | 'spec-close' | 'skill-child' | 'repair-receipt';
+export type Action = 'claim' | 'plan' | 'plan-check' | 'implement' | 'author-review' | 'self-standards' | 'self-spec' | 'verify' | 'publish' | 'review-lens' | 'confirm' | 'adjudicate' | 'review-report' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'spec-audit' | 'spec-close' | 'skill-child' | 'repair-receipt';
 export interface Evidence {
   head: string; base: string; path: string;
   /** These are separate observations: a remote PR head need not equal an unpushed local head. */
@@ -157,6 +167,7 @@ export interface Ticket extends TicketPlan {
   head: string; base: string; pr: number; branch: string; worktree: string;
   planPath: string; checksPath: string; handoffPath: string; reviewHandoff: string;
   evidence: Partial<Record<'self' | 'tests' | 'regular' | 'fresh' | 'accept' | 'visual', Evidence>>;
+  authorReview?: AuthorReviewEvidence;
   lastProblem: string; reason: string; closeout: boolean;
   cleaned: boolean;
   queueOrder?: number; queueSkips?: number; baseInvalidations?: number;
@@ -263,7 +274,8 @@ export function freshEvidence(t: Ticket, key: keyof Ticket['evidence']) {
 }
 export function ticket(s: State, key: string) { const t = s.tickets.find(t => t.key === key); ensure(t, `未知工单 ${key}`); return t; }
 const busy = (j: Job) => j.status === 'leased' || j.status === 'running';
-const tierFor = (a: Action): Tier => ['claim', 'plan', 'plan-check', 'replan', 'adjudicate', 'spec-audit', 'spec-close', 'verify', 'cleanup'].includes(a) ? 'L1' : ['implement', 'self-standards', 'self-spec', 'publish'].includes(a) ? 'L3' : 'L2';
+const tierFor = (a: Action): Tier => ['claim', 'plan', 'plan-check', 'replan', 'adjudicate', 'spec-audit', 'spec-close', 'verify', 'cleanup'].includes(a) ? 'L1' : ['implement', 'author-review', 'self-standards', 'self-spec', 'publish'].includes(a) ? 'L3' : 'L2';
+const boundAuthorReview = (s: State) => s.protocol === currentProtocol && !!s.v3?.skillBindings;
 // agent 的测试按实际执行申请，不能在整段读代码/推理时间占住测试批次。
 const hasTests = (a: Action) => a === 'verify' ? 1 : 0;
 const validationPhases: Phase[] = ['queued', 'integrate', 'self', 'verify', 'publish', 'review', 'fresh', 'accept', 'merge'];
@@ -296,7 +308,7 @@ function admit(s: State) {
   first.queueSkips = 0;
   if (first.phase === 'queued') {
     if (first.base !== s.facts.base) resetCandidate(first, first.head, s.facts.base, 'integrate');
-    else first.phase = 'self';
+    else first.phase = boundAuthorReview(s) && freshEvidence(first, 'self') && !!first.authorReview ? 'verify' : 'self';
   }
   event(s, `${first.key} 进入最终验证队列的队首`);
 }
@@ -348,7 +360,7 @@ function dependencyReady(s: State, t: Ticket) {
     (t.externalDependencies || []).every(key => s.facts.issueStates[key] === 'CLOSED');
 }
 function resetCandidate(t: Ticket, head: string, base: string, phase: Phase) {
-  t.head = head; t.base = base; t.evidence = {}; t.epoch++; t.phase = phase; t.reason = '';
+  t.head = head; t.base = base; t.evidence = {}; t.authorReview = undefined; t.epoch++; t.phase = phase; t.reason = '';
   if (phase === 'integrate') t.integrationHead = undefined;
 }
 /** Count a failed attempt exactly once, independently of its lease, replacement job and phase epoch. */
@@ -407,10 +419,12 @@ export function mergeGate(s: State, t: Ticket) {
   return s.validationOwner === t.key && !!live && live.state === 'OPEN' && !live.draft && live.head === t.head && live.base === t.base &&
     live.baseRef === s.inputs.targetBranch && s.facts.base === t.base && live.mergeable === 'MERGEABLE' &&
     ['self', 'tests', 'regular', 'fresh', 'accept'].every(k => freshEvidence(t, k as keyof Ticket['evidence'])) &&
+    (!boundAuthorReview(s) || !!t.authorReview && t.authorReview.head === t.head && t.authorReview.base === t.base &&
+      t.authorReview.bindingFingerprint === s.v3!.skillBindings!.find(b=>b.capability==='authorReview')?.fingerprint) &&
     (!t.visual || freshEvidence(t, 'visual')) && ciAllowed(live, jobsAt(s, t, 'accept').find(j => j.status === 'done')?.result);
 }
 function advanceGroups(s: State, t: Ticket) {
-  if (t.phase === 'self') {
+  if (t.phase === 'self' && !boundAuthorReview(s)) {
     const a = jobsAt(s, t, 'self-standards'), b = jobsAt(s, t, 'self-spec');
     if (a[0]?.status === 'done' && b[0]?.status === 'done') {
       const findings = [...(a[0].result?.findings || []), ...(b[0].result?.findings || [])].filter(f => !f.advisory);
@@ -453,7 +467,11 @@ function candidates(s: State): Candidate[] {
     if (s.jobs.some(j => j.ticket === t.key && busy(j) && j.epoch !== t.epoch)) continue;
     if (validationPhases.includes(t.phase) && s.validationOwner !== t.key) continue;
     if (t.phase === 'claim' && !dependencyReady(s, t)) continue;
-    if (t.phase === 'self') { out.push({ t, action: 'self-standards' }, { t, action: 'self-spec' }); continue; }
+    if (t.phase === 'self') {
+      if (boundAuthorReview(s)) out.push({t, action: 'author-review'});
+      else out.push({ t, action: 'self-standards' }, { t, action: 'self-spec' });
+      continue;
+    }
     if (t.phase === 'review' || t.phase === 'fresh') {
       const rs = jobsAt(s, t, 'review-lens');
       if (rs.filter(j => j.status === 'done').length !== lenses.length) {
@@ -625,7 +643,35 @@ export function bind(s: State, id: string, ref: { nativeId: string; model?: stri
   j.timing ??= { leasedAt: '' }; j.timing.boundAt ??= new Date().toISOString();
   event(s, `已绑定 ${j.action} 的原生任务`);
 }
-function validateSkillLinks(s: State, j: Job, r: Result) {
+function reviewEvidence(s: State, invocation: SkillInvocation, head: string, base: string): AuthorReviewEvidence {
+  const sources=invocation.reviewSources;
+  ensure(invocation.capability==='authorReview' && invocation.result?.status==='pass' &&
+    !invocation.result.blocking && !!invocation.result.rawOutputPath && sources &&
+    sources.head===head && sources.base===base && invocation.head===head && invocation.base===base,
+    '作者自检未完整通过或候选 head/base 不符');
+  const binding=s.v3?.skillBindings?.find(b=>b.capability==='authorReview');
+  ensure(binding && binding.fingerprint===invocation.bindingFingerprint, '作者自检技能版本已改变');
+  const t=s.tickets.find(x=>x.key===s.jobs.find(j=>j.id===invocation.jobId)?.ticket);
+  ensure(t && sources.issueUrl===`https://${s.repo.host}/${s.repo.slug}/issues/${t.number}` &&
+    !!sources.sourceVersion && !!sources.standardsDigest && !!sources.planDigest && !!sources.checksDigest &&
+    !!sources.fingerprint, '作者自检缺少关联 issue、spec/规范或批准计划来源');
+  return {invocationId:invocation.id,jobId:invocation.jobId,head,base,
+    bindingFingerprint:invocation.bindingFingerprint,sources,evidencePath:invocation.result.rawOutputPath};
+}
+function embeddedAuthorReview(s: State, professional: SkillInvocation, head: string, base: string) {
+  const children=(s.v3?.skillChildren || []).filter(c=>c.parentInvocationId===professional.id && c.skillCapability==='authorReview');
+  ensure(children.length===1 && children[0].required, 'implement 内嵌 code-review 必须通过当前 authorReview 绑定恰好委派一次');
+  const child=children[0], job=s.jobs.find(j=>j.id===child.jobIds.at(-1));
+  ensure(job?.status==='done' && job.result?.complete && job.result.status==='completed' &&
+    child.head===head && child.base===base && job.head===head && job.base===base,
+    '内嵌作者自检子任务未完成或审查了旧候选');
+  const ids=job.result.data?.skillInvocationIds;
+  ensure(Array.isArray(ids) && ids.length===1 && typeof ids[0]==='string', '作者自检子任务缺少一次真实技能调用');
+  const invocation=s.v3!.skillInvocations.find(x=>x.id===ids[0] && x.jobId===job.id);
+  ensure(invocation, '作者自检引用不属于实际子 actor');
+  return reviewEvidence(s,invocation,head,base);
+}
+function validateSkillLinks(s: State, j: Job, r: Result): AuthorReviewEvidence | undefined {
   if (s.protocol !== currentProtocol || !s.v3?.skillBindings) return;
   const ids = r.data?.skillInvocationIds;
   ensure(ids === undefined || Array.isArray(ids) && ids.every(x => typeof x === 'string'), '技能调用引用必须是 ID 数组');
@@ -643,6 +689,12 @@ function validateSkillLinks(s: State, j: Job, r: Result) {
     ensure(handoff?.result?.status==='pass'&&!handoff.result.blocking,
       'review 交接路径必须来自原 actor 实际完成的 handoff 技能');
   }
+  if (j.action === 'author-review' && r.complete) {
+    ensure(linked.length===1 && linked[0].capability==='authorReview',
+      '单独作者自检须引用一次当前绑定的 authorReview 技能');
+    if (linked[0].result?.status==='changes_required' && linked[0].result.blocking) return;
+    return reviewEvidence(s,linked[0],j.head,j.base);
+  }
   if (j.action !== 'implement') return;
   const professional = linked.filter(x => x.capability === 'implementation' || x.capability === 'diagnosis');
   if (!r.complete) return;
@@ -654,6 +706,9 @@ function validateSkillLinks(s: State, j: Job, r: Result) {
     const handoff = linked.find(x => x.capability === 'handoff');
     ensure(handoff?.result?.status === 'pass' && !handoff.result.blocking && !!r.handoffPath,
       '实现后的交接须实际调用已绑定 handoff 并归档原文');
+    if (professional[0].capability==='implementation') return embeddedAuthorReview(s,professional[0],r.head!,r.base!);
+    const reviewChildren=(s.v3.skillChildren || []).filter(c=>c.parentInvocationId===professional[0].id && c.skillCapability==='authorReview');
+    if (reviewChildren.length) return embeddedAuthorReview(s,professional[0],r.head!,r.base!);
   } else if (r.status === 'replan') {
     const handoff=linked.find(x=>x.capability==='handoff');
     ensure(handoff?.result?.status==='pass'&&!handoff.result.blocking&&!!r.handoffPath,
@@ -674,7 +729,7 @@ export function submit(s: State, id: string, r: Result) {
   if (j.status === 'done') { ensure(JSON.stringify(j.result) === JSON.stringify(r), '重复回执内容不一致'); return; }
   ensure(busy(j) && j.nativeId, '先绑定实际任务，才能提交结果');
   ensure(r.model === j.model && !!r.evidencePath, '回执必须包含实际模型及证据路径');
-  validateSkillLinks(s, j, r);
+  const authorReview=validateSkillLinks(s, j, r);
   if (s.protocol === currentProtocol && j.executor === 'agent') {
     ensure(j.session, '缺少真实原生会话身份，不能采用模型任务结果');
     verifyNativeSession(s, j.session, j.nativeId, j.tier);
@@ -712,6 +767,7 @@ export function submit(s: State, id: string, r: Result) {
   ensure(j.action !== 'repair-receipt', '独立回执修复只能通过原任务的修订链收取');
   const allowed: Record<Action, string[]> = {
     claim: ['claimed'], plan: ['planned'], 'plan-check': ['pass', 'changes'], implement: ['implemented', 'replan'],
+    'author-review': ['reviewed'],
     'self-standards': ['reviewed'], 'self-spec': ['reviewed'], verify: ['pass', 'fail'], publish: ['published'],
     'review-lens': ['reviewed'], confirm: ['confirmed'], adjudicate: ['confirmed'], 'review-report': ['posted'],
     accept: ['ready', 'gap', 'conflict', 'waiting_ci', 'needs_human', 'blocked'], integrate: ['implemented', 'replan'],
@@ -763,10 +819,22 @@ export function submit(s: State, id: string, r: Result) {
         break;
       }
       ensure(r.status === 'implemented' && r.handoffPath, '代码修改后必须交接，再进行作者自检');
-      resetCandidate(t, r.head!, r.base!, s.validationOwner === t.key ? 'self' : 'queued'); enqueue(s, t);
+      resetCandidate(t, r.head!, r.base!, s.validationOwner === t.key ? authorReview ? 'verify' : 'self' : 'queued'); enqueue(s, t);
+      if (authorReview) {
+        t.authorReview=authorReview;
+        t.evidence.self={head:t.head,base:t.base,path:authorReview.evidencePath};
+      }
       t.pendingPushHead = r.head!;
       if (j.action === 'integrate') t.integrationHead = r.head!;
       if (data.visualEvidence) t.evidence.visual = { head: t.head, base: t.base, path: String(data.visualEvidence) }; break;
+    case 'author-review':
+      ensure(t && r.status==='reviewed', '作者自检需要完整结果');
+      if(!authorReview) {
+        problem(s,t,String(data.reason || '作者自检要求修改当前候选'),'implement','semantic',j.id);
+        break;
+      }
+      t.authorReview=authorReview; t.evidence.self={head:t.head,base:t.base,path:authorReview.evidencePath};
+      t.phase='verify'; break;
     case 'self-standards': case 'self-spec':
       ensure(t && Array.isArray(r.findings), '双轴自检必须分别返回完整 findings（允许空数组）'); advanceGroups(s, t); break;
     case 'verify':

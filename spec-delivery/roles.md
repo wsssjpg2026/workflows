@@ -73,17 +73,13 @@ TDD在已约定seam上进行。测试范围以目标仓库有效规范和任务�
 
 涉及界面、图像结果、布局或交互时，运行相应窗口/场景并实际查看截图或结果，记录候选、尺寸、状态与运行方式。自动化或模拟检查不能代替现场实物验收。
 
-实现和每轮修复完成后，调用作者 `code-review` 的双轴自检契约；由核心派发同级L3审查jobs。诊断技能本身没有结束后调用 `code-review` 的规定，本流程统一补上。
+`implement` 内部要求的 `/code-review` 应在已提交候选上通过 `skill-delegate` 调用当前 `authorReview` 绑定，保留该调用及其真实子结果；外层实现回执只引用实现/诊断与 handoff 技能 ID。有效的内嵌作者自检由门禁直接复用。`diagnosing-bugs` 若未内嵌审查，实现完成后由一个 `author-review` job 调用绑定技能。技能的专业方法和独立子任务要求见其固定版本，核心不额外派发固定双轴任务。
 
 根据自检和后续验证结果修复问题，生成连续性的handoff，交给发布阶段。实现者不执行PR合并或提前关闭工单。
 
-## 作者自检 — L3 的两个独立审查者
+## 作者自检 — 已绑定技能
 
-**Standards**：核对完整候选diff、提交列表、适用规范和 `code-review` 的设计启发规则；规范违规与设计判断分开陈述，引用规则和代码。
-
-**Spec**：读取原始工单/spec，检查遗漏、不完整、超范围及实现错误；逐项引用验收要求与代码。缺spec或无法完成该轴时明确阻断，不将另一轴通过当全部通过。
-
-两轴使用独立上下文并分别报告。作者自检不替代L2独立review，也没有自动套用另一技能的置信度门槛。
+作者自检收到当前 issue URL、提交 SHA、固定比较点、已批准的计划/检查范围和仓库规范来源候选。默认版本化 `code-review` 技能负责 Standards、Spec 两个独立轴及报告；替代技能可采用不同方法。外围只校验当前候选、来源与技能版本、完整执行结果及明确的阻断结论。旧来源或未完成结果不能进入验证。
 
 ## 验证 — 纯命令 job
 
@@ -209,7 +205,7 @@ CI按下列规则处理，无需逐次请求用户批准：
 | `plan-check` | `pass`、`changes` | `changes`附`data.reason`；`pass`可用`data.checksPath`提交复核后的清单 |
 | `skill-child` | `completed`、`failed` | 按 `skillChild` 请求执行；任一状态都保留原始证据；未完成执行使用 `complete:false,status:"incomplete"`；引用技能时 `data.skillInvocationIds` 指向真实通过的调用 |
 | `implement`、`integrate` | `implemented`、`replan` | 两种完成状态都必须有真实已提交候选`head/base`与`handoffPath`；`replan`另附`data.reason`，适用时`data.visualEvidence`；WIP/冲突由工作区恢复入口保全，不报作已验证候选 |
-| `self-standards`、`self-spec` | `reviewed` | 顶层`findings`必填，允许空数组；两个轴各自提交 |
+| `author-review` | `reviewed` | 诊断或来源变化后的单个补审 job；`data.skillInvocationIds` 引用一次真实通过的 `authorReview` 调用 |
 | `verify` | `pass`、`fail` | 由`execute`生成；失败时`data.failureSignature`及原始日志 |
 | `publish` | `published` | `data:{pr,commentUrl}`，pr为正整数；远端必须是当前候选的开放非draft PR |
 | `review-lens` | `reviewed` | 顶层`findings`必填；遵循packet指定的单个lens |

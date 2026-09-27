@@ -100,10 +100,28 @@ test('绑定的 implement/handoff 以真实 source/native 路径调用，字节�
     const r: core.Result = { model: 'small', complete: true, status: 'implemented', head: 'new-head', base: 'base',
       evidencePath, handoffPath: archive,
       data: { skillInvocationIds: [implementation.invocation.id, handoff.invocation.id] } };
-    assert.doesNotThrow(() => core.submit(x.s, x.j.id, r));
-    assert.equal(x.t.phase, 'queued');
+    assert.throws(() => core.submit(x.s, x.j.id, r), /内嵌 code-review/);
     assert.deepEqual(Object.fromEntries(Object.entries(x.fixture).map(([name, file]) => [name, sha(fs.readFileSync(file))])), before);
   } finally { x.cleanup(); }
+});
+
+test('作者审查的阻断结论返回实现，不能形成候选通过证据', async () => {
+  const x=setup();
+  try {
+    x.j.action='author-review';x.t.phase='self';
+    const host:skills.SkillHostAdapter={
+      async capabilities(){return {sourceExecution:{allowed:true,acceptsOriginalFiles:true}};},
+      async executeSource(call){return x.output(call,'changes_required',true,'Review found a blocking defect');},
+    };
+    const review=await skills.invokeBoundSkill(x.s,x.j,'authorReview',host,x.statePath,
+      state=>fs.writeFileSync(x.statePath,JSON.stringify(state)));
+    const evidencePath=path.join(x.root,'review.md');fs.writeFileSync(evidencePath,'Review requires changes');
+    core.submit(x.s,x.j.id,{model:x.j.model,complete:true,status:'reviewed',head:x.j.head,base:x.j.base,
+      evidencePath,data:{skillInvocationIds:[review.invocation.id],reason:'Fix defect'}});
+    assert.equal(x.t.phase,'implement');
+    assert.equal(x.t.authorReview,undefined);
+    assert.equal(x.t.evidence.self,undefined);
+  } finally {x.cleanup();}
 });
 
 test('已安装的原始 implement/handoff 保持原文与 frontmatter',

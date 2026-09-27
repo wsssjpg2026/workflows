@@ -29,12 +29,13 @@ function fixture() {
   const bin = path.join(temp, 'bin'); fs.mkdirSync(bin);
   const ghLog = path.join(temp, 'gh.log');
   const comments = path.join(temp, 'comments.json'); fs.writeFileSync(comments, '[]');
+  const issueSource=path.join(temp,'issue-source.txt');fs.writeFileSync(issueSource,'Delivery');
   const gh = path.join(bin, 'gh');
   fs.writeFileSync(gh, `#!/usr/bin/env node
 const fs=require('fs'),a=process.argv.slice(2),endpoint=a.at(-1);
 fs.appendFileSync(${JSON.stringify(ghLog)},JSON.stringify(a)+'\\n');
 const commentsFile=${JSON.stringify(comments)};
-const issue=n=>({number:n,title:n===100?'Spec':'Task',body:'Delivery',html_url:'https://github.com/example/test/issues/'+n,state:'open',assignees:[]});
+const issue=n=>({number:n,title:n===100?'Spec':'Task',body:fs.readFileSync(${JSON.stringify(issueSource)},'utf8'),html_url:'https://github.com/example/test/issues/'+n,state:'open',assignees:[]});
 if(a[0]==='repo'&&a[1]==='view') console.log(JSON.stringify({nameWithOwner:'example/test',url:'https://github.com/example/test',defaultBranchRef:{name:'main'}}));
 else if(a.includes('graphql')) console.log(JSON.stringify({data:{repository:{target:{target:{oid:${JSON.stringify(head)}}},i100:{number:100,state:'OPEN'},i101:{number:101,state:'OPEN'}}}}));
 else if(a[0]==='issue'&&a[1]==='comment') {const rows=JSON.parse(fs.readFileSync(commentsFile));rows.push({html_url:'https://github.com/example/test/issues/101#issuecomment-1',body:fs.readFileSync(a[a.indexOf('--body-file')+1],'utf8')});fs.writeFileSync(commentsFile,JSON.stringify(rows));console.log(rows.at(-1).html_url);}
@@ -69,7 +70,7 @@ else { console.error('unexpected gh '+a.join(' ')); process.exit(2); }
     tickets: [{ number: 101, kind: 'software', dependencies: [], criteria: ['delivered'], visual: false }],
     specCriteria: ['delivered'], evidencePath: planEvidence,
   }));
-  return { temp, root, head, call, inputPath, planPath, planEvidence, ghLog, observe, sessions, env };
+  return { temp, root, head, call, inputPath, planPath, planEvidence, ghLog, issueSource, observe, sessions, env };
 }
 function planned(x: ReturnType<typeof fixture>) {
   const started = x.call('init', x.inputPath); assert.equal(started.status, 0, started.stderr);
@@ -139,7 +140,8 @@ function approvedImplementation(x: ReturnType<typeof fixture>) {
   x.observe('native-ticket-plan', planning.id, 'large');
   fs.writeFileSync(binding, JSON.stringify({ nativeId: 'native-ticket-plan' }));
   assert.equal(x.call('bind', statePath, planning.id, binding).status, 0);
-  const checks = path.join(x.temp, 'checks.md'); fs.writeFileSync(checks, 'actual checks\n');
+  const checks = path.join(x.temp, 'checks.md'); fs.writeFileSync(checks,
+    JSON.stringify({scopeReason:'Fixture ticket acceptance',commands:[{name:'smoke',argv:['true'],timeoutSeconds:5}]}));
   assert.equal(x.call('stage', statePath, planning.id, JSON.stringify({ complete: true, status: 'planned',
     evidencePath: x.planEvidence, data: { planPath: x.planPath, checksPath: checks } })).status, 0);
   const next = x.call('next', statePath); assert.equal(next.status, 0, next.stderr);
@@ -163,8 +165,16 @@ function recoveryFile(x:ReturnType<typeof fixture>,value:unknown) {
   fs.writeFileSync(file,JSON.stringify(value));return file;
 }
 
-function skillChildHarness(x: ReturnType<typeof fixture>) {
+function skillChildHarness(x: ReturnType<typeof fixture>, authorReviewPath?: string,
+  professional: 'implementation'|'diagnosis'='implementation') {
   const { statePath, binding } = approvedImplementation(x), host = controlledHost(x);
+  if(authorReviewPath) {
+    const state=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const migration=path.join(x.temp,'review-migration.json');
+    fs.writeFileSync(migration,JSON.stringify({expectedRevision:state.revision,evidencePath:x.planEvidence,
+      replacements:{authorReview:authorReviewPath}}));
+    const result=x.call('migrate-skills',statePath,migration);assert.equal(result.status,0,result.stderr);
+  }
   const observer = path.join(x.temp, 'bin', 'skill-observer');
   fs.writeFileSync(observer, `#!/usr/bin/env node
 const fs=require('fs');const [op,id,job]=process.argv.slice(2);
@@ -192,7 +202,7 @@ else if(op==='result') {
   fs.writeFileSync(binding,JSON.stringify({nativeId:'parent-skill-actor'}));
   call('bind',statePath,parentJob.id,binding);
   const request=path.join(x.temp,'skill-request.json');
-  fs.writeFileSync(request,JSON.stringify({capability:'implementation'}));
+  fs.writeFileSync(request,JSON.stringify({capability:professional}));
   const parent=call('skill-start',statePath,parentJob.id,request);
   const file=(name:string,value:unknown)=>{const p=path.join(x.temp,name);fs.writeFileSync(p,JSON.stringify(value));return p;};
   const finishSkill=(invocationId:string)=>{
@@ -594,40 +604,6 @@ test('宿主无法判明启动状态或没有可信原生会话时保留实例�
   } finally { fs.rmSync(x.temp, { recursive: true, force: true }); }
 });
 
-test('同批快 actor 的完成事件立即收取，慢 actor 的租约与实例保持运行', () => {
-  const x = fixture();
-  try {
-    const { statePath } = approvedImplementation(x);
-    const state = JSON.parse(fs.readFileSync(statePath,'utf8'));
-    const worktree = state.tickets[0].worktree as string;
-    fs.writeFileSync(path.join(worktree,'source.txt'),'implemented\n');
-    git(worktree,'add','source.txt');git(worktree,'commit','-m','implement');
-    const head = git(worktree,'rev-parse','HEAD');
-    // Enter the self-review phase directly: this test covers per-actor collection, not skill invocation.
-    state.tickets[0].phase='self'; state.tickets[0].head=head; state.tickets[0].base=x.head;
-    state.tickets[0].pendingPushHead=head; state.validationOwner=state.tickets[0].key;
-    fs.writeFileSync(statePath,JSON.stringify(state));
-    const handoff=path.join(x.temp,'handoff.md');fs.writeFileSync(handoff,'implementation handoff\n');
-    const selfNext=x.call('next',statePath);assert.equal(selfNext.status,0,selfNext.stderr);
-    const jobs=JSON.parse(selfNext.stdout).jobs.filter((j:{action:string})=>['self-standards','self-spec'].includes(j.action));
-    assert.equal(jobs.length,2);
-    const host=controlledHost(x);
-    for(const j of jobs){const launched=x.call('dispatch',statePath,j.id);assert.equal(launched.status,0,launched.stderr);assert.equal(JSON.parse(launched.stdout).status,'running');}
-    const fast=jobs.find((j:{action:string})=>j.action==='self-standards');
-    const slow=jobs.find((j:{action:string})=>j.action==='self-spec');
-    const ledger=JSON.parse(fs.readFileSync(statePath,'utf8'));
-    const token=ledger.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===fast.id).token;
-    host.set(db=>{db.actors[token].state='completed';db.actors[token].result={complete:true,status:'reviewed',head,base:x.head,
-      evidencePath:handoff,findings:[]};});
-    const collect=x.call('collect',statePath);assert.equal(collect.status,0,collect.stderr);
-    const after=JSON.parse(fs.readFileSync(statePath,'utf8'));
-    assert.equal(after.jobs.find((j:{id:string})=>j.id===fast.id).status,'done');
-    assert.equal(after.jobs.find((j:{id:string})=>j.id===slow.id).status,'running');
-    assert.equal(after.tickets[0].phase,'self');
-    assert.equal(host.get().starts,2);
-  } finally { fs.rmSync(x.temp, { recursive: true, force: true }); }
-});
-
 test('取消保留原生实例、时间与原始事件；任务写权等待独立停止证明', () => {
   const x=fixture();
   try {
@@ -763,7 +739,7 @@ test('技能可在五项并行结果后追加确认任务；引用替代技能�
   try {
     const alternate=path.join(x.temp,'.agents','skills','code-review','method.md');
     fs.writeFileSync(alternate,'Alternate professional method\n');
-    const h=skillChildHarness(x), invocationId=h.parent.invocationId;
+    const h=skillChildHarness(x,path.join(path.dirname(alternate),'SKILL.md')), invocationId=h.parent.invocationId;
     h.call('skill-delegate',h.statePath,invocationId,h.file('lenses.json',{children:
       Array.from({length:5},(_,n)=>({key:`lens-${n}`,tier:'L2',instruction:`Independent lens ${n}`}))}));
     const seen=new Set<string>();
@@ -1078,5 +1054,166 @@ test('不同失败修订耗尽统一预算后停止同候选重试，旧 ready �
     assert.equal(after.jobs.find((j:{id:string})=>j.id===planning.id).status,'running');
     const next=x.call('next',statePath);assert.equal(next.status,0,next.stderr);
     assert.ok(!JSON.parse(next.stdout).jobs.some((j:{ticket:string})=>j.ticket===planning.ticket));
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('批准计划到 implement 内嵌双轴作者自检只采纳一次，并生成可发布候选', () => {
+  const x=fixture();
+  try {
+    const plan=JSON.parse(fs.readFileSync(x.planPath,'utf8'));plan.policy.agents=5;
+    fs.writeFileSync(x.planPath,JSON.stringify(plan));
+    const h=skillChildHarness(x),statePath=h.statePath;
+    const before=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const t=before.tickets[0], packet=JSON.parse(fs.readFileSync(h.parentJob.packetPath,'utf8'));
+    assert.equal(packet.planPath,t.planPath);assert.equal(packet.checksPath,t.checksPath);
+    assert.equal(packet.sourceUrl,'https://github.com/example/test/issues/101');
+    const worktree=t.worktree as string;
+    fs.writeFileSync(path.join(worktree,'source.txt'),'delivered\n');
+    git(worktree,'add','source.txt');git(worktree,'commit','-m','Implement #101');
+    const head=git(worktree,'rev-parse','HEAD');
+    const tested=h.call('test',statePath,h.parentJob.id,h.file('author-test.json',
+      {argv:['true'],timeoutSeconds:5,reason:'TDD acceptance smoke for #101'}));
+    assert.equal(tested.exitCode,0);
+    h.call('skill-delegate',statePath,h.parent.invocationId,h.file('embedded-review.json',{children:[
+      {key:'author-review',tier:'L3',instruction:'Execute the currently bound two-axis authorReview on committed #101',
+        skillCapability:'authorReview',head},
+    ]}));
+    const reviewer=h.call('next',statePath).jobs.find((j:{action:string})=>j.action==='skill-child');
+    assert.ok(reviewer);h.call('dispatch',statePath,reviewer.id);
+    const review=h.call('skill-start',statePath,reviewer.id,h.file('author-review-call.json',{capability:'authorReview'}));
+    const source=JSON.parse(fs.readFileSync(review.sourceArchivePath,'utf8'));
+    assert.ok(source.files.some((f:{relativePath:string})=>f.relativePath==='automation-context.md'));
+    assert.match(Buffer.from(source.files.find((f:{relativePath:string})=>f.relativePath==='SKILL.md').dataBase64,'base64').toString(),
+      /Standards[\s\S]*Spec/);
+    h.call('skill-delegate',statePath,review.invocationId,h.file('two-axes.json',{children:[
+      {key:'standards',tier:'L3',instruction:'Independent Standards axis for #101',independent:true},
+      {key:'spec',tier:'L3',instruction:'Independent Spec axis for #101',independent:true},
+    ]}));
+    const axes=h.call('next',statePath).jobs.filter((j:{action:string})=>j.action==='skill-child');
+    assert.equal(axes.length,2);
+    for(const axis of axes)h.call('dispatch',statePath,axis.id);
+    for(const axis of axes)h.complete(axis.id);
+    assert.equal(h.call('skill-continue',statePath,review.invocationId).waiting,false);
+    h.finishSkill(review.invocationId);
+    h.complete(reviewer.id,'completed',{skillInvocationIds:[review.invocationId]});
+    h.finishSkill(h.parent.invocationId);
+    const handoff=h.call('skill-start',statePath,h.parentJob.id,h.file('handoff-call.json',{capability:'handoff'}));
+    const handoffResult=h.finishSkill(handoff.invocationId);
+    h.call('stage',statePath,h.parentJob.id,JSON.stringify({complete:true,status:'implemented',head,base:x.head,
+      evidencePath:x.planEvidence,handoffPath:handoffResult.result.rawOutputPath,
+      data:{skillInvocationIds:[h.parent.invocationId,handoff.invocationId]}}));
+    const after=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(after.tickets[0].authorReview.invocationId,review.invocationId);
+    assert.equal(after.tickets[0].evidence.self.head,head);
+    assert.equal(after.v3.skillChildren.filter((c:{skillCapability:string})=>c.skillCapability==='authorReview').length,1);
+    assert.equal(after.jobs.filter((j:{action:string})=>['self-standards','self-spec','author-review'].includes(j.action)).length,0);
+    const verification=h.call('next',statePath).jobs.find((j:{action:string})=>j.action==='verify');
+    assert.ok(verification);h.call('execute',statePath,verification.id);
+    const ready=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(ready.tickets[0].phase,'publish');
+    assert.equal(ready.tickets[0].evidence.tests.testedHead,head);
+    fs.writeFileSync(x.issueSource,'Delivery with clarified acceptance');
+    const changed=h.call('next',statePath).jobs;
+    assert.equal(changed.filter((j:{action:string})=>j.action==='author-review').length,1);
+    assert.equal(changed.filter((j:{action:string})=>['self-standards','self-spec'].includes(j.action)).length,0);
+    const invalid=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(invalid.tickets[0].authorReview,undefined);
+    assert.equal(invalid.tickets[0].evidence.tests,undefined);
+    const renewed=changed.find((j:{action:string})=>j.action==='author-review');
+    h.call('dispatch',statePath,renewed.id);
+    const renewedCall=h.call('skill-start',statePath,renewed.id,h.file('renewed-author-review.json',{capability:'authorReview'}));
+    h.call('skill-delegate',statePath,renewedCall.invocationId,h.file('renewed-axes.json',{children:[
+      {key:'standards',tier:'L3',instruction:'Standards axis after issue change'},
+      {key:'spec',tier:'L3',instruction:'Spec axis after issue change'},
+    ]}));
+    const renewedAxes=h.call('next',statePath).jobs.filter((j:{action:string})=>j.action==='skill-child');
+    assert.equal(renewedAxes.length,2);
+    for(const axis of renewedAxes)h.call('dispatch',statePath,axis.id);
+    for(const axis of renewedAxes)h.complete(axis.id);
+    h.finishSkill(renewedCall.invocationId);
+    const running=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const dispatch=running.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===renewed.id);
+    h.host.set(db=>{db.actors[dispatch.token].state='completed';db.actors[dispatch.token].result={
+      complete:true,status:'reviewed',head,base:x.head,evidencePath:x.planEvidence,
+      data:{skillInvocationIds:[renewedCall.invocationId]}};});
+    h.call('dispatch',statePath,renewed.id);
+    const reviewed=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(reviewed.tickets[0].phase,'verify');
+    assert.equal(reviewed.tickets[0].authorReview.invocationId,renewedCall.invocationId);
+    fs.writeFileSync(path.join(worktree,'source.txt'),'new candidate\n');
+    git(worktree,'add','source.txt');git(worktree,'commit','-m','Revise #101');
+    const stale=h.call('next',statePath);
+    assert.equal(stale.status,'running');
+    const recovery=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(recovery.tickets[0].phase,'recovery');
+    assert.ok(!stale.jobs.some((j:{action:string})=>['verify','publish'].includes(j.action)));
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('替代 authorReview 包无需改变调度算法，仍由 implement 内一次真实调用通过门禁', () => {
+  const x=fixture();
+  try {
+    const alternate=path.join(x.temp,'.agents','skills','code-review');
+    fs.writeFileSync(path.join(alternate,'method.md'),'Alternative author review method\n');
+    const h=skillChildHarness(x,path.join(alternate,'SKILL.md'));
+    const state=JSON.parse(fs.readFileSync(h.statePath,'utf8'));
+    const worktree=state.tickets[0].worktree as string;
+    fs.writeFileSync(path.join(worktree,'source.txt'),'alternative review\n');
+    git(worktree,'add','source.txt');git(worktree,'commit','-m','Implement #101 with alternative review');
+    const head=git(worktree,'rev-parse','HEAD');
+    h.call('skill-delegate',h.statePath,h.parent.invocationId,h.file('alternative-child.json',{children:[
+      {key:'review',tier:'L3',instruction:'Run replacement authorReview',skillCapability:'authorReview',head},
+    ]}));
+    const child=h.call('next',h.statePath).jobs.find((j:{action:string})=>j.action==='skill-child');
+    h.call('dispatch',h.statePath,child.id);
+    const review=h.call('skill-start',h.statePath,child.id,h.file('alternative-call.json',{capability:'authorReview'}));
+    const binding=JSON.parse(fs.readFileSync(h.statePath,'utf8')).v3.skillBindings.find((b:{capability:string})=>b.capability==='authorReview');
+    assert.equal(binding.sourcePath,path.join(alternate,'SKILL.md'));
+    assert.ok(binding.files.some((f:{relativePath:string})=>f.relativePath==='method.md'));
+    h.finishSkill(review.invocationId);
+    h.complete(child.id,'completed',{skillInvocationIds:[review.invocationId]});
+    h.finishSkill(h.parent.invocationId);
+    const handoff=h.call('skill-start',h.statePath,h.parentJob.id,h.file('alternative-handoff.json',{capability:'handoff'}));
+    const handoffResult=h.finishSkill(handoff.invocationId);
+    h.call('stage',h.statePath,h.parentJob.id,JSON.stringify({complete:true,status:'implemented',head,base:x.head,
+      evidencePath:x.planEvidence,handoffPath:handoffResult.result.rawOutputPath,
+      data:{skillInvocationIds:[h.parent.invocationId,handoff.invocationId]}}));
+    const accepted=JSON.parse(fs.readFileSync(h.statePath,'utf8'));
+    assert.equal(accepted.tickets[0].authorReview.bindingFingerprint,binding.fingerprint);
+    assert.equal(accepted.tickets[0].evidence.self.head,head);
+    assert.equal(accepted.jobs.filter((j:{action:string})=>['self-standards','self-spec'].includes(j.action)).length,0);
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('diagnosing-bugs 路径在完成候选后补调一个 authorReview，跳过不能通过', () => {
+  const x=fixture();
+  try {
+    const h=skillChildHarness(x,undefined,'diagnosis'),statePath=h.statePath;
+    const state=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const worktree=state.tickets[0].worktree as string;
+    fs.writeFileSync(path.join(worktree,'source.txt'),'diagnosed and fixed\n');
+    git(worktree,'add','source.txt');git(worktree,'commit','-m','Diagnose #101');
+    const head=git(worktree,'rev-parse','HEAD');
+    h.finishSkill(h.parent.invocationId);
+    const handoff=h.call('skill-start',statePath,h.parentJob.id,h.file('diagnosis-handoff.json',{capability:'handoff'}));
+    const handoffResult=h.finishSkill(handoff.invocationId);
+    h.call('stage',statePath,h.parentJob.id,JSON.stringify({complete:true,status:'implemented',head,base:x.head,
+      evidencePath:x.planEvidence,handoffPath:handoffResult.result.rawOutputPath,
+      data:{skillInvocationIds:[h.parent.invocationId,handoff.invocationId]}}));
+    const offered=h.call('next',statePath).jobs;
+    assert.equal(offered.filter((j:{action:string})=>j.action==='author-review').length,1);
+    const reviewer=offered.find((j:{action:string})=>j.action==='author-review');
+    h.call('dispatch',statePath,reviewer.id);
+    const review=h.call('skill-start',statePath,reviewer.id,h.file('diagnosis-review.json',{capability:'authorReview'}));
+    const skipped=h.call('skill-finish',statePath,review.invocationId,h.file('skipped-review.json',
+      {status:'skipped',blocking:false}));
+    assert.equal(skipped.status,'skipped');
+    const rejected=x.call('submit',statePath,reviewer.id,h.file('skipped-outer-result.json',
+      {model:'small',complete:true,status:'reviewed',head,base:x.head,
+        evidencePath:x.planEvidence,data:{skillInvocationIds:[review.invocationId]}}));
+    assert.notEqual(rejected.status,0);
+    assert.match(rejected.stderr,/作者自检未完整通过/);
+    const after=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(after.tickets[0].evidence.self,undefined);
   } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
 });

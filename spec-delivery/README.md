@@ -44,13 +44,15 @@
 
 ### 已绑定技能的显式调用
 
-新运行在 `init` 时固定 `implementation`、`diagnosis`、`authorReview`、`prReview`、`handoff` 五项默认绑定。状态中的 `v3.skillBindings` 记录每个 `SKILL.md` 的实际路径、原文和包内资源的 SHA-256 指纹；这不是新增用户输入。已绑定阶段获得显式调用授权，`disable-model-invocation` 不会被解释为要求用户再手动触发。原始 implement/handoff 文件只读，交接技能仍按原要求先写 OS 临时目录，再由宿主逐字归档。
+新运行在 `init` 时固定 `implementation`、`diagnosis`、`authorReview`、`prReview`、`handoff` 五项默认绑定。默认 `authorReview` 指向仓库内版本化的 [`code-review` 包](review-skills/code-review/SKILL.md)，其双轴方法和报告格式由技能维护。状态中的 `v3.skillBindings` 记录每个 `SKILL.md` 的实际路径、原文和包内资源的 SHA-256 指纹；这不是新增用户输入。已绑定阶段获得显式调用授权，`disable-model-invocation` 不会被解释为要求用户再手动触发。原始 implement/handoff 文件只读，交接技能仍按原要求先写 OS 临时目录，再由宿主逐字归档。
 
 宿主先为 actor 登记可核验的原生会话，再调用 `skill-start <state> <jobId> <request.json>`。请求只需 `{capability}`；CLI 通过绝对路径环境变量 `SPEC_DELIVERY_SKILL_OBSERVER` 指向宿主可信查询适配器，以 `capabilities <capability> <jobId>` 取得实际注册入口和源码执行能力。响应为 `{source:"native_host",jobId,capability,capabilities:{nativeExplicit?,sourceExecution?}}`，其中原生注册包含 `{entry,sourcePath,fingerprint}`。匹配绑定路径与指纹的原生注册存在时，返回 `native_explicit` 和入口名；否则只有宿主允许读入原技能及资源时返回 `source_execution` 和持久 `sourceArchivePath`。返回 `alreadyStarted:true` 时先查询原调用，不能重启。真正缺少两种入口时命令指出缺口；工作流不更改宿主全局技能策略。
 
 宿主**实际完成调用**后保存原始产物、专业证据，以及 JSON 宿主回执 `{source:"native_host",invocationId,jobId,nativeId,observationId,mode,bindingFingerprint,terminal:true,nativeEntry?}`；适配器以 `result <invocationId> <jobId>` 返回该回执；CLI 归档宿主响应后调用 `skill-finish <state> <invocationId> <outcome.json>`。源码执行回执另列出逐文件 `{relativePath,sha256}` 的 `loadedFiles`。外围 outcome 为 `{status:"pass"|"changes_required"|"incomplete"|"skipped",blocking,rawOutputPath?,evidencePaths?}`。技能无需原生输出 workflow JSON；状态/阻断判断由执行者提供，适配层只核对身份、原始文件、完整性及版本。空白或缺失产物不能形成 pass；实现 job 的外层 Result 用 `data.skillInvocationIds` 关联 implement/diagnosis 与 handoff 的已完成调用，handoff 归档内容必须与原文相同。
 
 TypeScript 宿主也可使用 `spec-delivery/skills.ts` 的 `invokeBoundSkill`：适配器提供 `capabilities` 与 `invokeNative` / `executeSource` 实际入口；函数先持久登记调用，再执行相应入口、校验宿主回执并收取结果。
+
+实现 packet 携带 L1 批准的 `planPath`、`checksPath`、issue URL 和当前技能绑定。`implement` 内请求 `/code-review` 时，其 implementation 父调用使用 `skill-delegate` 登记一个 `skillCapability:"authorReview"` 子任务，并指定当前已提交的候选 head。该子任务调用绑定的审查技能及其专业子任务；`implementation` 父调用通过 `skill-continue` 读取完成结果。外层实现回执只引用 implementation/diagnosis 与 handoff，核心从父子调用账本复用恰好一次有效作者自检。诊断技能若没有内嵌审查，候选进入单个 `author-review` 补审 job。审查必须匹配候选、issue/spec 来源、仓库 Markdown 规范候选、计划/检查文件和技能包指纹；来源变动后旧证据撤销，`next` 重新派发补审。跳过或未完成的调用不能通过门禁。默认包的双轴独立方法留在技能文件；替代包无需改变调度算法。
 
 ### 技能子任务与续接
 
@@ -113,7 +115,7 @@ fresh 首轮 packet 只传原始 spec/issue 链接、候选 head/base/worktree�
 
 普通观测批量读取目标 SHA、issue 状态和 PR 候选；正文、评论、依赖由需要它们的角色读取。验收、合并和最终审计重新获取适用 CI，合并 actor 操作前调用 `guard <state> <jobId>`。只读瞬时网络故障有界重试，权限/不完整响应明确失败；外部写操作先查状态，不盲目重试。
 
-作者双轴、L2 五视角 regular/fresh 和独立验收均保留；问题确认门槛仍为 **≥50**。同一候选的判定跨过门槛时，由新的 L1 依据原始证据裁决。CI 未配置或有证据的计费未启动才可按角色规则豁免；实际执行失败不可豁免，并回到 L3 修复。CI 仍在正常执行时保留队首、等待状态事件；长期环境阻断由 L1 对账、重规划或释放队首，不能改成通过。
+默认作者技能的双轴、L2 五视角 regular/fresh 和独立验收均保留；问题确认门槛仍为 **≥50**。同一候选的判定跨过门槛时，由新的 L1 依据原始证据裁决。CI 未配置或有证据的计费未启动才可按角色规则豁免；实际执行失败不可豁免，并回到 L3 修复。CI 仍在正常执行时保留队首、等待状态事件；长期环境阻断由 L1 对账、重规划或释放队首，不能改成通过。
 
 ## summary：离线只读摘要
 

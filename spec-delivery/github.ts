@@ -19,6 +19,8 @@ export type CheckFact = {
   name: string;
   status: "pass" | "pending" | "failed" | "startup_failure" | "skipped" | "unknown";
   url: string;
+  testedHead?: string;
+  testedTree?: string;
 };
 export type PrFact = {
   number: number;
@@ -33,6 +35,8 @@ export type PrFact = {
   checks: CheckFact[];
   /** 仅 MERGED 时为 merge_commit_sha；squash/rebase 后不等于 head。 */
   mergedHead: string;
+  ciMergeHead?: string;
+  ciMergeTree?: string;
 };
 
 type JsonObject = Record<string, unknown>;
@@ -83,7 +87,7 @@ function parseJSON(raw: string, where: string): unknown {
   try { return JSON.parse(raw); } catch { return fail(`${where}: invalid JSON response`); }
 }
 
-function command(executable: "git" | "gh", argv: string[], cwd: string): string {
+function command(executable: "git" | "gh", argv: string[], cwd: string, retryRead = true, input?: string): string {
   // 环境中的 GH_REPO 不能把当前工作区悄悄指向另一仓库；禁用调试输出来避免打印认证头。
   const env: NodeJS.ProcessEnv = { ...process.env, GH_PROMPT_DISABLED: "1", GH_PAGER: "cat", GH_DEBUG: "" };
   delete env.GH_REPO;
@@ -92,12 +96,12 @@ function command(executable: "git" | "gh", argv: string[], cwd: string): string 
     if (executable === 'gh') observationMetrics.ghInvocations++;
     try { return execFileSync(executable, argv, {
       cwd, env, shell: false, encoding: "utf8", timeout: COMMAND_TIMEOUT,
-      maxBuffer: MAX_OUTPUT, stdio: ["ignore", "pipe", "pipe"],
+      maxBuffer: MAX_OUTPUT, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"], input,
     });
     } catch (error) {
     const e = error as { stderr?: string | Buffer; message?: string; status?: number | null; signal?: string | null };
     const detail = String(e.stderr || e.message || "command failed").trim().slice(0, 2000);
-      if (executable === 'gh' && attempt < 2 && /\bEOF\b|ECONNRESET|ETIMEDOUT|HTTP (429|50[234])|TLS handshake timeout/i.test(detail)) {
+      if (retryRead && executable === 'gh' && attempt < 2 && /\bEOF\b|ECONNRESET|ETIMEDOUT|HTTP (429|50[234])|TLS handshake timeout/i.test(detail)) {
         observationMetrics.retries++; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100 * 2 ** attempt); continue;
       }
       return fail(`${executable} ${argv.join(" ")} failed (status ${e.status ?? "none"}, signal ${e.signal ?? "none"}): ${detail}`);
@@ -129,7 +133,8 @@ export function snapshot(repo: Repo, target: string, issueNumbers: number[], prN
     result[n] = { number: n, url: string(p.url, 'PR url'), head: sha(p.headRefOid, 'head'), base: sha(p.baseRefOid, 'base'),
       baseRef: string(p.baseRefName, 'baseRef'), headRef: string(p.headRefName, 'headRef'), state, draft: boolean(p.isDraft, 'draft'),
       mergeable: p.mergeable === 'MERGEABLE' ? 'MERGEABLE' : p.mergeable === 'CONFLICTING' ? 'CONFLICTING' : 'UNKNOWN', checks: [],
-      mergedHead: state === 'MERGED' ? sha(object(p.mergeCommit, 'mergeCommit').oid, 'mergeCommit.oid') : '' };
+      mergedHead: state === 'MERGED' ? sha(object(p.mergeCommit, 'mergeCommit').oid, 'mergeCommit.oid') : '',
+      ciMergeHead: state === 'OPEN' && p.mergeCommit ? sha(object(p.mergeCommit, 'mergeCommit').oid, 'mergeCommit.oid') : undefined };
   }
   return { base, issueStates, prs: result, at: new Date().toISOString() };
 }
@@ -253,6 +258,57 @@ export function issue(repo: Repo, number: number): IssueFact {
   };
 }
 
+/** Editorial source only. Status, dependencies and comments remain live observations. */
+export function issueSource(repo: Repo, number: number) {
+  integer(number, 'issue number');
+  const endpoint = `${pathFor(repo)}/issues/${number}`;
+  const raw = object(api(repo, endpoint), endpoint);
+  const identity = issueIdentity(raw, repo);
+  sameRepository(identity, repo);
+  if (identity.number !== number) fail('issue source number differs from request');
+  return { number, url: identity.url, title: string(raw.title, 'issue.title'), body: nullableText(raw.body, 'issue.body') };
+}
+
+/** PR conversation comments use the issue-comments endpoint, but a PR is not an issue fact. */
+export function prComments(repo: Repo, number: number) {
+  integer(number, 'PR number');
+  return list(repo, `${pathFor(repo)}/issues/${number}/comments?per_page=100`)
+    .map(c => ({ url: string(c.html_url, 'comment.html_url'), body: nullableText(c.body, 'comment.body') }));
+}
+
+/** The marker is written in the PR body before creation so a lost response can be reconciled. */
+export function pullRequestWithMarker(repo: Repo, headRef: string, baseRef: string, marker: string) {
+  const owner = repo.slug.split('/')[0];
+  const query = `state=all&head=${encodeURIComponent(`${owner}:${headRef}`)}&base=${encodeURIComponent(baseRef)}&per_page=100`;
+  const rows = list(repo, `${pathFor(repo)}/pulls?${query}`);
+  const matches = rows.filter(row => nullableText(row.body, 'pr.body').includes(marker));
+  if (matches.length > 1) fail(`multiple PRs contain operation marker ${marker}`);
+  if (rows.length && !matches.length) fail('a PR already uses this head/base without the current operation marker');
+  return matches.length ? integer(matches[0].number, 'pr.number') : undefined;
+}
+
+/** GitHub writes are never retried without a fresh read of the remote marker or state. */
+export function createPullRequest(repo: Repo, input: {title:string;headRef:string;baseRef:string;body:string}) {
+  const raw = object(parseJSON(command('gh', ['api','--hostname',repo.host,'--method','POST',
+    '--input','-',`${pathFor(repo)}/pulls`],repo.root,false,JSON.stringify({title:input.title,
+      head:input.headRef,base:input.baseRef,body:input.body})), 'create PR'), 'create PR');
+  return integer(raw.number, 'created PR number');
+}
+
+export function postIssueComment(repo: Repo, number: number, body: string) {
+  integer(number, 'comment target');
+  const raw = object(parseJSON(command('gh',['api','--hostname',repo.host,'--method','POST',
+    '--input','-',`${pathFor(repo)}/issues/${number}/comments`],repo.root,false,JSON.stringify({body})),'post comment'),'post comment');
+  return string(raw.html_url,'comment URL');
+}
+
+export function mergePullRequest(repo: Repo, number: number, expectedHead: string, strategy: 'merge'|'squash'|'rebase', body: string) {
+  integer(number, 'merge PR'); sha(expectedHead,'merge expected head');
+  const flag = strategy === 'merge' ? '--merge' : strategy === 'squash' ? '--squash' : '--rebase';
+  return command('gh',['pr','merge',String(number),'--repo',`${repo.host}/${repo.slug}`,
+    '--match-head-commit',expectedHead,flag,'--body',body],repo.root,false);
+}
+
 /** 返回全部后代，不含父 spec；每层都完整分页，跨仓库或循环明确报错。 */
 export function subIssues(repo: Repo, number: number): IssueFact[] {
   integer(number, "parent issue number");
@@ -363,7 +419,17 @@ export function pr(repo: Repo, number: number): PrFact {
   const commits = new Set([fact.head]);
   // pull_request CI 可能附在测试合并提交；仅开放 PR 的该提交属于当前候选。
   if (fact.state === "OPEN" && raw.merge_commit_sha !== null) commits.add(sha(raw.merge_commit_sha, "pr.merge_commit_sha"));
-  const checks = [...commits].flatMap(commit => checksForCommit(repo, commit));
+  const checks: CheckFact[] = [];
+  let ciMergeTree: string | undefined;
+  for (const commit of commits) {
+    const observed = checksForCommit(repo, commit);
+    if (!observed.length) continue;
+    const rawCommit = object(api(repo, `${pathFor(repo)}/git/commits/${commit}`), `commit ${commit}`);
+    const tree = sha(object(rawCommit.tree, 'commit.tree').sha, 'commit.tree.sha');
+    if (commit !== fact.head) ciMergeTree = tree;
+    checks.push(...observed.map(c => ({...c, testedHead: commit,
+      testedTree: c.status === 'pass' || c.status === 'failed' ? tree : undefined})));
+  }
   const currentRaw = object(api(repo, endpoint), endpoint);
   const current = prFields(currentRaw, repo, number);
   const stable = (p: Omit<PrFact, "checks">) => [p.head, p.base, p.baseRef, p.headRef, p.state, p.draft, p.mergedHead];
@@ -371,5 +437,40 @@ export function pr(repo: Repo, number: number): PrFact {
     fail(`PR #${number} changed while checks were being read; re-observe before taking action`);
   }
   // mergeability 的后台计算可从 null 完成；返回第二次观察，UNKNOWN 仍由上层等待。
-  return { ...current, checks: [...new Map(checks.map(c => [c.id, c])).values()] };
+  return { ...current, checks: [...new Map(checks.map(c => [c.id, c])).values()],
+    ciMergeHead: current.state === 'OPEN' && raw.merge_commit_sha ? sha(raw.merge_commit_sha, 'pr.merge_commit_sha') : undefined,
+    ciMergeTree };
+}
+
+/** A no-CI decision needs an observed empty workflow inventory as well as empty candidate checks. */
+export function workflowInventory(repo: Repo) {
+  const rows = list(repo, `${pathFor(repo)}/actions/workflows?per_page=100`, 'workflows');
+  return rows.map(row => ({ id: integer(row.id, 'workflow.id'),
+    path: string(row.path, 'workflow.path'), state: string(row.state, 'workflow.state') }));
+}
+
+export function requiredStatusChecks(repo: Repo, target: string) {
+  if (!target || target.startsWith('refs/')) fail('invalid target branch');
+  const branch = encodeURIComponent(target);
+  let raw: JsonObject;
+  try { raw = object(api(repo, `${pathFor(repo)}/branches/${branch}/protection/required_status_checks`),
+    'required status checks'); }
+  catch(error) {
+    if (/\b404\b|Not Found/i.test((error as Error).message)) return [];
+    throw error;
+  }
+  const contexts = array(raw.contexts, 'required contexts').map(x => string(x, 'required context'));
+  const checks = raw.checks === undefined ? [] : array(raw.checks, 'required checks').map(x =>
+    string(object(x, 'required check').context, 'required check context'));
+  return [...new Set([...contexts,...checks])];
+}
+
+/** Read a check-run's remote output, which can contain GitHub's billing-not-started notice. */
+export function checkRunNotice(repo: Repo, id: string) {
+  if (!/^job:[1-9]\d*$|^check:[1-9]\d*$/.test(id)) fail(`not a check-run ID: ${id}`);
+  const raw = object(api(repo, `${pathFor(repo)}/check-runs/${id.split(':')[1]}`), 'check-run notice');
+  const output = object(raw.output, 'check-run output');
+  return { id, url: string(raw.html_url, 'check-run URL'), status: string(raw.status, 'check-run status'),
+    conclusion: string(raw.conclusion, 'check-run conclusion'),
+    title: nullableText(output.title, 'check-run title'), summary: nullableText(output.summary, 'check-run summary') };
 }

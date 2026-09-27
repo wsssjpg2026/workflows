@@ -3,9 +3,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import {createHash} from 'node:crypto';
 import { stripTypeScriptTypes } from 'node:module';
 import { normalizeResult } from './host.ts';
 import { renderZcode, stageResult, packet } from '../spec-delivery.workflow.ts';
+import {skillCapabilities} from './skill-package.mjs';
 import type { State, Job } from './core.ts';
 function setup() {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'workflow-host-'));
@@ -24,16 +26,42 @@ test('宿主填入实际绑定身份，真实证据缺失不能形成回执',()=
     assert.throws(()=>stageResult(x.file,x.j.id,{...r,status:'different'}));
   } finally {fs.rmSync(x.root,{recursive:true,force:true});}
 });
-test('ZCode 每个 actor 完成后立即登记，快任务不等待整批慢任务',async()=>{
+test('ZCode 每个 job 独立原生 run，快任务报告不等待其它模型的慢任务',async()=>{
   const x=setup();try {
-    x.s.jobs.push({...x.j,id:'run:102:1:plan::try-1',ticket:'102'});
-    const batch=renderZcode(x.s,x.file)[0] as {arguments:{path:string}};
-    const script=fs.readFileSync(batch.arguments.path,'utf8');
-    const compiled=stripTypeScriptTypes(`async function execute(){${script}}`)+'\nreturn execute();';
-    let release!:()=>void;const slow=new Promise<void>(r=>{release=r});const staged:string[]=[];
-    const fn=new Function('agent','world','phase','report','artifact',compiled);
-    const execution=fn((name:string)=>({ask:async()=>{if(name.startsWith('102'))await slow;return{resultJson:'{}',summary:'ok'};}}),{run:async(_cmd:string,args:string[])=>{staged.push(args[3]);return{exitCode:0,stdout:'{}',stderr:''};}},()=>{},()=>{},{markdown:async()=>{}});
-    await new Promise(r=>setImmediate(r));assert.deepEqual(staged,[x.j.id]);release();await execution;assert.equal(staged.length,2);
+    const slowJob={...x.j,id:'run:102:1:plan::try-1',ticket:'102',model:'another/model'};
+    x.s.jobs.push(slowJob);x.s.protocol=3;
+    const sha=(v:string)=>createHash('sha256').update(v).digest('hex');
+    const records=x.s.jobs.map(j=>{
+      const token=`token-${j.id}`;
+      const packetPath=path.join(x.root,'packets',`${sha(j.id).slice(0,20)}.json`);
+      const outputDirectory=path.join(x.root,'jobs',sha(j.id).slice(0,20));
+      fs.mkdirSync(path.dirname(packetPath),{recursive:true});fs.mkdirSync(outputDirectory,{recursive:true});
+      fs.writeFileSync(packetPath,JSON.stringify({jobId:j.id,model:j.model,dispatchToken:token,
+        executor:'agent',rolesPath:path.join(x.root,'roles.md'),outputDirectory}));
+      const requestPath=path.join(x.root,'dispatch',`${sha(j.id).slice(0,20)}.json`);
+      fs.mkdirSync(path.dirname(requestPath),{recursive:true});
+      fs.writeFileSync(requestPath,JSON.stringify({token,jobId:j.id,attempt:1,targetHost:'zcode',
+        requestedModel:j.model,packetPath}));
+      return {token,jobId:j.id,targetHost:'zcode',requestedModel:j.model,packetPath,requestPath,
+        requestDigest:sha(fs.readFileSync(requestPath,'utf8')),status:'prepared'};
+    });
+    x.s.v3={executionPath:'unified-v03',decisionRecords:[],skillInvocations:[],dispatchRecords:records,
+      skillBindings:skillCapabilities.map(capability=>({capability,sourcePath:'/fixture/SKILL.md',
+        fingerprint:'fixture',files:[{path:'/fixture/SKILL.md',relativePath:'SKILL.md',sha256:'fixture'}]}))} as any;
+    const runs=renderZcode(x.s,x.file) as {arguments:{path:string;subagent_model:string}}[];
+    assert.equal(runs.length,2);assert.notEqual(runs[0].arguments.path,runs[1].arguments.path);
+    assert.deepEqual(runs.map(r=>r.arguments.subagent_model),[x.j.model,slowJob.model]);
+    let release!:()=>void;const slowWait=new Promise<void>(r=>{release=r});const staged:string[]=[];
+    const execute=(script:string)=>{
+      const compiled=stripTypeScriptTypes(`async function run(){${script}}`)+'\nreturn run();';
+      const fn=new Function('agent','phase','report',compiled);
+      return fn((name:string)=>({ask:async()=>{if(name.includes(sha('token-'+slowJob.id).slice(0,16)))await slowWait;
+        return{resultFile:'result.json',summary:'ok'};}}),()=>{},(item:{jobId:string})=>staged.push(item.jobId));
+    };
+    const fastRun=execute(fs.readFileSync(runs[0].arguments.path,'utf8'));
+    const slowRun=execute(fs.readFileSync(runs[1].arguments.path,'utf8'));
+    await new Promise(r=>setImmediate(r));assert.deepEqual(staged,[x.j.id]);release();
+    await Promise.all([fastRun,slowRun]);assert.equal(staged.length,2);
   } finally {fs.rmSync(x.root,{recursive:true,force:true});}
 });
 test('派发只携带有界证据索引，fresh 不接收旧结论',()=>{

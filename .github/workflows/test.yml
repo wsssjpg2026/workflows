@@ -2,8 +2,6 @@ name: CI
 
 on:
   pull_request:
-    branches:
-      - codex/test-deepseek-harness
   push:
     branches:
       - codex/test-deepseek-harness

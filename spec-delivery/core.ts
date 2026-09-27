@@ -1,10 +1,135 @@
 /** 可移植的调度内核。语义判断由 L1/2/3 提供；转换、预算和证据版本由代码约束。 */
 import { createHash } from 'node:crypto';
+import {historicalReviewLenses,historicalBlocking,validateHistoricalConfirmation} from './legacy-review.ts';
+import {skillCapabilities as packageCapabilities, type SkillPackageCapability} from './skill-package.mjs';
 export type Tier = 'L1' | 'L2' | 'L3';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export interface Inputs { spec: number | string; targetBranch: string; models: Record<Tier, string> }
+export const currentProtocol = 3;
+export type SkillCapability = SkillPackageCapability;
+export type SkillMode = 'native_explicit' | 'source_execution';
+export type SkillStatus = 'pass' | 'changes_required' | 'incomplete' | 'skipped';
+export interface SkillFile { path: string; relativePath: string; sha256: string }
+export interface SkillBinding {
+  capability: SkillCapability; name: string; sourcePath: string; files: SkillFile[];
+  fingerprint: string; pinnedAt: string;
+}
+export interface SkillResult {
+  status: SkillStatus; blocking: boolean; rawOutputPath: string; rawOutputSha256: string;
+  originalOutputPath?: string; evidencePaths: string[]; evidenceSha256: string[]; originalEvidencePaths: string[];
+  hostReceiptPath: string; hostReceiptSha256: string; originalHostReceiptPath: string; completedAt: string;
+}
+export interface SkillInvocation {
+  id: string; jobId: string; capability: SkillCapability; bindingFingerprint: string;
+  mode: SkillMode; nativeEntry?: string; session: NativeSession;
+  candidateVersion: string; head: string; base: string; startedAt: string;
+  sourceArchivePath: string; hostCapabilityPath?: string; hostCapabilitySha256?: string; result?: SkillResult;
+  reviewSources?: ReviewSources;
+  resumeHistory?: { previousJobId: string; previousSession: NativeSession; jobId: string;
+    session: NativeSession; evidencePath: string; evidenceSha256: string;
+    previousHostCapabilityPath?: string; previousHostCapabilitySha256?: string; at: string }[];
+}
+export interface ReviewSources {
+  issueUrl: string; sourceVersion: string; standardsDigest: string;
+  standardsPaths: string[]; planDigest: string; checksDigest: string;
+  head: string; base: string; fingerprint: string;
+}
+export interface AuthorReviewEvidence {
+  invocationId: string; jobId: string; head: string; base: string;
+  bindingFingerprint: string; sources: ReviewSources; evidencePath: string;
+}
+/** A skill owns the topology; the workflow owns every lease, role, and result. */
+export interface SkillChildRequest {
+  id: string; parentInvocationId: string; key: string; instruction: string;
+  tier: Tier; model: string; required: boolean; independent: boolean; fresh: boolean;
+  candidateVersion: string; inputVersion: string; head: string; base: string;
+  skillCapability?: SkillCapability; dependencyFingerprint?: string;
+  jobIds: string[]; pending: boolean; requestedAt: string;
+}
+/** v3 持久账本；旧 marker 只为历史读取和显式迁移保留。 */
+export interface ProtocolV3 {
+  executionPath: 'legacy-v02' | 'unified-v03';
+  decisionRecords: L1DecisionRecord[];
+  skillBindings?: SkillBinding[];
+  skillInvocations: SkillInvocation[];
+  skillChildren?: SkillChildRequest[];
+  reviewDisagreements?: ReviewDisagreement[];
+  skillMigrations?: { at: string; evidencePath: string;
+    changes: { capability: SkillCapability; previousFingerprint: string; nextFingerprint: string }[] }[];
+  dispatchRecords: DispatchRecord[];
+  detachedInstances?: DetachedHostInstance[];
+  receiptRecords?: ReceiptRecord[];
+  recoveryRecords?: RecoveryRecord[];
+}
+export function initialProtocolV3(): ProtocolV3 {
+  return { executionPath: 'unified-v03', decisionRecords: [], skillInvocations: [], skillChildren: [], dispatchRecords: [] };
+}
 export interface Policy { agents: number; issues: number; tests: number; noProgress: number; rounds: number }
-export interface Capabilities { framework: string; mainModel: string; modelRouting: 'per_agent' | 'per_run'; models: string[] }
+export interface Capabilities { framework: string; mainModel?: string; modelRouting: 'per_agent' | 'per_run'; models: string[] }
+/** The host adapter's observation of a native session, never a model's self-description. */
+export interface NativeSession {
+  source: 'native_host'; observationId: string; jobId: string; nativeId: string; provider: string; model: string;
+  observedAt: string; evidencePath: string; evidenceDigest: string;
+  /** Supplied by the trusted native observer, never by a binding request or actor result. */
+  context?: { contextId: string; mode: 'new' | 'resumed'; resumedFromContextId?: string; proofId: string };
+}
+export interface ContextIntent {
+  kind: 'independent' | 'continue'; parentJobId?: string; fresh: boolean;
+  lineage?: string; predecessorJobId?: string;
+}
+export interface ContextObservation {
+  source: 'native_host'; contextId: string; mode: 'new' | 'resumed'; resumedFromContextId?: string;
+  proofId: string; nativeId: string; evidencePath: string; evidenceDigest: string;
+}
+export interface HandoffReference {
+  kind: 'original' | 'reconstructed'; sourceJobId: string; sourceCandidateVersion: string;
+  appliedCandidateVersion: string; path: string; sha256: string; verificationPath: string;
+  verificationDigest: string; verifiedBy: NativeSession; at: string;
+  invocationId?: string; unavailableEvidencePath?: string; unknowns?: string[];
+}
+export interface HostEventRef { kind: 'start' | 'query' | 'collect' | 'cancel' | 'capabilities' | 'error'; evidencePath: string; digest: string; at: string; invokedAt?: string }
+export interface HostUsageObservation {
+  id: string; at: string; sourcePath: string; sourceSha256: string; raw: Json;
+  scope: 'session' | 'model_call' | 'unknown'; modelCallId?: string; sourceIndex?: number;
+  supportingEvidencePath?: string;
+}
+export interface HostInstanceRecord {
+  key: string; nativeId: string | null; state: 'requested' | 'running' | 'completed' | 'cancelled' | 'unknown';
+  session?: NativeSession; firstSeenAt: string; lastSeenAt: string; events: HostEventRef[];
+  startedAt?: string; completedAt?: string; cancelledAt?: string; rawUsage?: Json; bindingError?: string;
+  usageObservations?: HostUsageObservation[]; observedProvider?: string;
+  continuationSupported?: boolean;
+}
+export interface DetachedHostInstance extends HostInstanceRecord { targetHost: string }
+export type ReceiptSource = 'stage' | 'host_structured' | 'host_file' | 'repair';
+export interface ReceiptRevision {
+  id: string; previousId?: string; source: ReceiptSource; rawPath: string; rawSha256: string;
+  sourceHostEvent?: string; sourceNativeId?: string; repairJobId?: string;
+  candidateVersion: string; at: string; status: 'raw' | 'schema_valid' | 'rejected' | 'accepted';
+  error?: string;
+}
+export interface ReceiptRecord { jobId: string; revisions: ReceiptRevision[]; currentId?: string; acceptedId?: string }
+export interface RecoveryRecord {
+  id: string; kind: 'cancel' | 'confirm-stop' | 'correct-binding' | 'revise-receipt' | 'prepare-repair' | 'abandon';
+  jobId: string; expectedRevision: number; dispatchToken: string; attempt: number;
+  evidencePath: string; reason: string; beforeNativeId?: string; afterNativeId?: string;
+  receiptRevisionId?: string; repairJobId?: string; priorBindingError?: string; at: string;
+}
+export interface DispatchRecord {
+  jobId: string; attempt: number; token: string; targetHost: string; requestedModel: string;
+  packetPath: string; requestPath: string; requestDigest: string;
+  status: 'prepared' | 'starting' | 'running' | 'completed' | 'uncertain' | 'cancelled';
+  createdAt: string; updatedAt: string; nativeId?: string; uncertainty?: string;
+  /** A live CLI process owns the host round trip; a dead PID is recovered by querying the token. */
+  operationPid?: number; managed?: boolean;
+  events: HostEventRef[]; instances: HostInstanceRecord[];
+}
+export interface L1DecisionRecord {
+  id: string; kind: 'execution-plan' | 'ticket-plan' | 'plan-check' | 'replan' | 'adjudication' | 'spec-audit' | 'resolve' | 'handoff-verification';
+  scope: string; inputVersion: string; sourceVersion?: string; candidateVersion: string; appliesToCandidateVersion?: string;
+  artifactPath: string; artifactFiles: string[]; artifactDigest: string;
+  session: NativeSession; at: string;
+}
 export interface Finding {
   id: string; description: string; evidence: string; confidence?: number; confirmed?: boolean; advisory?: boolean;
   identity?: { path: string; rule: string; trigger: string };
@@ -19,20 +144,68 @@ export interface TicketPlan {
   /** 仅验收归属转移；两端记录都必须存在，技术前置不能移。 */
   deferredDependencies?: { issue: number; target: number; kind: 'acceptance_only'; records: string[] }[];
 }
-export interface ExecutionPlan { capabilities: Capabilities; policy: Policy; tickets: TicketPlan[]; specCriteria: string[]; evidencePath: string }
-export type Phase = 'claim' | 'plan' | 'plan_check' | 'implement' | 'queued' | 'self' | 'verify' | 'publish' | 'review' | 'fresh' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'done' | 'human' | 'blocked';
-export type Action = 'claim' | 'plan' | 'plan-check' | 'implement' | 'self-standards' | 'self-spec' | 'verify' | 'publish' | 'review-lens' | 'confirm' | 'adjudicate' | 'review-report' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'spec-audit' | 'spec-close';
-export interface Evidence { head: string; base: string; path: string }
+export interface ExecutionPlan { capabilities: Capabilities; policy: Policy; tickets: TicketPlan[]; specCriteria: string[]; evidencePath: string;
+  /** Versions are supplied by init/plan-context and rejected if sources or inputs changed. */
+  inputVersion?: string; sourceVersion?: string; decisionNativeId?: string;
+}
+export type Phase = 'claim' | 'plan' | 'plan_check' | 'implement' | 'queued' | 'self' | 'verify' | 'publish' | 'review' | 'fresh' | 'accept' | 'integrate' | 'replan' | 'recovery' | 'merge' | 'close' | 'cleanup' | 'done' | 'human' | 'blocked';
+export type Action = 'claim' | 'plan' | 'plan-check' | 'implement' | 'author-review' | 'self-standards' | 'self-spec' | 'verify' | 'publish' | 'pr-review' | 'review-lens' | 'confirm' | 'adjudicate' | 'review-report' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'spec-audit' | 'spec-close' | 'skill-child' | 'repair-receipt';
+export interface Evidence {
+  head: string; base: string; path: string;
+  /** The outer PR gate pins the professional result, not its review method. */
+  skillFingerprint?: string; skillInvocationId?: string; rawReportSha256?: string; commentUrl?: string;
+  adjudicationId?: string;
+  /** These are separate observations: a remote PR head need not equal an unpushed local head. */
+  prHead?: string | null; targetBase?: string; testedHead?: string; testedTree?: string;
+  integrationHead?: string | null;
+}
+export interface ReviewDisagreement {
+  id: string; ticket: string; head: string; base: string; candidateVersion: string; skillFingerprint: string;
+  regularInvocationId: string; freshInvocationId: string;
+  regularBlocking: boolean; freshBlocking: boolean; freshEvidence: Evidence; at: string;
+  adjudicationJobId?: string; outcomeBlocking?: boolean;
+}
+export interface WorkspaceRecovery {
+  kind: 'wip' | 'conflict' | 'unknown_candidate';
+  reason: string; sourceJobId?: string; activeJobIds: string[];
+  expectedHead: string; observedHead: string | null; base: string;
+  recoveryRef: string | null; snapshotPath: string; at: string;
+}
+export type FailureCategory = 'receipt_validation' | 'host' | 'model' | 'test' | 'semantic' | 'ci';
+export interface FailureEvent {
+  id: string; category: FailureCategory; reason: string; signature: string;
+  jobId?: string; at: string;
+}
+export interface FailureBudget {
+  totalRetries: number; consecutiveNoProgress: number; lastSignature: string;
+  byCategory?: Partial<Record<FailureCategory, number>>;
+  /** A dispatched L1 replan is the sole automatic escalation; it never replenishes the retry budget. */
+  replans: number;
+}
 export interface Ticket extends TicketPlan {
   key: string; phase: Phase; epoch: number; round: number; stalls: number; escalations: number;
   head: string; base: string; pr: number; branch: string; worktree: string;
   planPath: string; checksPath: string; handoffPath: string; reviewHandoff: string;
   evidence: Partial<Record<'self' | 'tests' | 'regular' | 'fresh' | 'accept' | 'visual', Evidence>>;
+  authorReview?: AuthorReviewEvidence;
   lastProblem: string; reason: string; closeout: boolean;
   cleaned: boolean;
   queueOrder?: number; queueSkips?: number; baseInvalidations?: number;
+  recovery?: WorkspaceRecovery;
+  recoveryHistory?: (WorkspaceRecovery & { resolvedAt: string; resolvedHead: string; resolutionPath: string; sourceEvidencePath?: string })[];
+  recoveryRef?: string;
+  pendingPushHead?: string;
+  integrationHead?: string;
+  reviewDisagreementId?: string;
+  failures?: FailureEvent[];
+  failureBudget?: FailureBudget;
+  acceptanceGap?: { head: string; base: string; evidencePath: string; planPath: string;
+    reason: string; missingCriteria: string[] };
 }
-export interface LivePR { number: number; head: string; base: string; baseRef: string; state: string; draft: boolean; mergeable: string; checks: {id: string; status: string}[] }
+export interface LivePR { number: number; head: string; base: string; baseRef: string; state: string; draft: boolean; mergeable: string;
+  checks: {id: string; status: string; url?: string; testedHead?: string; testedTree?: string}[];
+  /** Current synthetic merge ref, when GitHub supplied one. */
+  ciMergeHead?: string; ciMergeTree?: string; mergedHead?: string }
 export interface LiveFacts { base: string; issueStates: Record<string, string>; prs: Record<string, LivePR>; at: string }
 export interface Result {
   /** 宿主实际选择的模型；command/main 工作用已绑定的主控模型。 */
@@ -50,33 +223,178 @@ export interface Job {
   tier: Tier; model: string; executor: 'agent' | 'main' | 'command'; fresh: boolean; contextKey: string;
   head: string; base: string; tests: number; status: 'leased' | 'running' | 'done' | 'cancelled';
   nativeId: string; result?: Result; finding?: Finding;
+  repairOfJobId?: string;
+  repairTargetRevisionId?: string;
+  dispatchToken?: string;
+  /** Only historical manual leases may retain the pre-dispatch completion path. Never set on a new unified reservation. */
+  legacyManualLease?: boolean;
+  contextIntent?: ContextIntent; contextObservation?: ContextObservation; handoffRef?: HandoffReference;
+  inputVersion?: string; candidateVersion?: string; session?: NativeSession; decisionArtifactDigest?: string; decisionArtifactFiles?: string[];
   timing?: { leasedAt: string; boundAt?: string; startedAt?: string; resultAt?: string; completedAt?: string; cancelledAt?: string };
   usage?: { inputTokens?: number; outputTokens?: number; cost?: number; currency?: string; modelMs?: number };
   dispute?: { previous: string; current: string };
   testExecution?: { pid: number; granted: boolean; startedAt: string; worktree?: string; evidenceDirectory?: string };
+  testProcessHistory?: {pid:number;kind:'completed'|'reconciled';evidencePath:string;evidenceSha256:string;at:string}[];
   commandRecovery?: { nativeId: string; evidencePath: string; at: string };
+  stopConfirmation?: { state: 'stopped' | 'lost'; evidencePath: string; processTreeStopped: boolean; at: string };
+  parentInvocationId?: string; childRequestId?: string;
 }
 export interface State {
   schema: 1; id: string; revision: number; inputs: Inputs; spec: number;
-  protocol?: 2;
+  protocol?: 2 | 3;
+  v3?: ProtocolV3;
   repo: { root: string; slug: string; host: string; defaultBranch: string };
   status: 'planning' | 'running' | 'waiting_human' | 'blocked' | 'complete' | 'paused' | 'retired';
   policy?: Policy; capabilities?: Capabilities; specCriteria: string[]; planEvidence: string;
+  planSourceVersion?: string; planArtifactPath?: string;
+  mainSession?: NativeSession | { source: 'unknown'; at: string };
   tickets: Ticket[]; jobs: Job[]; facts: LiveFacts; auditEpoch: number; specAudit?: Result;
   validationOwner?: string; queueSequence?: number;
+  ciAttestations?: { jobId: string; reason: 'no_ci' | 'billing'; path: string; sha256: string;
+    head: string; base: string; at: string }[];
   telemetry?: { ghInvocations: number; retries: number; observationMs: number };
+  waitIntervals?: { id: string; kind: 'recovery' | 'external'; scope: string; startedAt: string;
+    endedAt?: string; evidencePath: string; evidenceDigest: string;
+    closedEvidencePath?: string; closedEvidenceDigest?: string; reason: string }[];
   retired?: { at: string; evidencePath: string; reason: string };
+  migrations?: { at: string; fromProtocol: number | null; toProtocol: 3;
+    expectedRevision: number; backupPath: string; backupSha256: string;
+    decisionPath: string; decisionSha256: string; quiescencePath: string; quiescenceSha256: string;
+    hostObservationPath: string; hostObservationSha256: string;
+    previousStatus: State['status']; invalidatedTickets: string[] }[];
+  continuations?: {at:string; fromStatus:State['status']; kind:'user_resume'|'human_condition_resolved'|'blocked_resume';
+    decisionPath:string; decisionSha256:string; evidencePath:string; evidenceSha256:string;
+    humanEvidencePath?:string; humanEvidenceSha256?:string; session:NativeSession}[];
   events: { revision: number; message: string; at?: string }[];
 }
-export const lenses = ['规范', '明显缺陷', 'Git 历史', '历史 PR 评论', '代码注释'];
+/** Historical protocol 2 review labels; protocol 3 delegates topology to its bound skill. */
+export const lenses = historicalReviewLenses;
+export function unifiedSkillsReady(s: State) {
+  const bindings=s.v3?.skillBindings;
+  return s.protocol===currentProtocol && s.v3?.executionPath==='unified-v03' &&
+    Array.isArray(bindings) && bindings.length===packageCapabilities.length &&
+    packageCapabilities.every(capability=>bindings.filter(b=>b?.capability===capability &&
+      !!b.fingerprint && !!b.sourcePath && Array.isArray(b.files) && b.files.length>0).length===1);
+}
 export function ensure(condition: unknown, message: string): asserts condition { if (!condition) throw new Error(message); }
 export function event(s: State, message: string) { s.revision++; s.events.push({ revision: s.revision, message, at: new Date().toISOString() }); }
+export function inputVersion(s: State) {
+  return createHash('sha256').update(JSON.stringify({ spec: s.spec, targetBranch: s.inputs.targetBranch,
+    models: { L1: s.inputs.models.L1, L2: s.inputs.models.L2, L3: s.inputs.models.L3 },
+    repo: s.repo.slug, protocol: s.protocol })).digest('hex');
+}
+export function candidateVersion(s: State, t?: Ticket) {
+  return createHash('sha256').update(JSON.stringify(t
+    ? { ticket: t.key, epoch: t.epoch, head: t.head, base: t.base }
+    : { spec: s.spec, auditEpoch: s.auditEpoch, base: s.facts.base })).digest('hex');
+}
+export function globalDecisionVersion(s: State) {
+  return createHash('sha256').update(JSON.stringify({ spec: s.spec, targetBranch: s.inputs.targetBranch,
+    repo: s.repo.slug })).digest('hex');
+}
+export function verifyNativeSession(s: State, session: NativeSession, nativeId: string, tier: Tier) {
+  ensure(session?.source === 'native_host' && !!session.observationId && !!session.jobId && !!session.evidencePath && !!session.evidenceDigest &&
+    !!session.nativeId && !!session.provider && !!session.model && Number.isFinite(Date.parse(session.observedAt)),
+    '缺少宿主原生会话观测；配置模型或 persona 不能证明实际角色');
+  ensure(session.nativeId === nativeId, '宿主原生会话身份与任务不符');
+  if(session.context)ensure(!!session.context.contextId&&!!session.context.proofId&&
+    ['new','resumed'].includes(session.context.mode)&&
+    (session.context.mode!=='resumed'||!!session.context.resumedFromContextId),
+    '宿主上下文身份或续接证明不完整');
+  const configured = s.inputs.models[tier];
+  ensure((configured.includes('/') ? `${session.provider}/${session.model}` : session.model) === configured,
+    `实际 ${tier} provider/model 与配置不符`);
+}
+function currentDecision(s: State, kind: L1DecisionRecord['kind'], scope: string, version: string) {
+  return s.v3?.decisionRecords.findLast(d => d.kind === kind && d.scope === scope &&
+    d.inputVersion === inputVersion(s) && d.sourceVersion === s.planSourceVersion &&
+    (d.appliesToCandidateVersion || d.candidateVersion) === version);
+}
+export function recordL1Decision(s: State, record: L1DecisionRecord) {
+  ensure(s.protocol === currentProtocol && s.v3, '只在协议 3 登记 L1 决策');
+  verifyNativeSession(s, record.session, record.session.nativeId, 'L1');
+  ensure(record.inputVersion === inputVersion(s) && record.sourceVersion === s.planSourceVersion &&
+    !!record.artifactPath && record.artifactFiles.length > 0 && !!record.artifactDigest,
+    'L1 决策的输入版本或产物不完整');
+  ensure(!s.v3.decisionRecords.some(d => d.id === record.id), 'L1 决策 ID 重复');
+  s.v3.decisionRecords.push(record);
+}
 export function freshEvidence(t: Ticket, key: keyof Ticket['evidence']) {
   const e = t.evidence[key]; return !!e && e.head === t.head && e.base === t.base && !!e.path;
 }
+function currentReviewEvidence(s: State, t: Ticket, key: 'regular' | 'fresh') {
+  if (!freshEvidence(t, key)) return false;
+  if (s.protocol !== currentProtocol) return true;
+  const e = t.evidence[key]!, binding = s.v3?.skillBindings?.find(b => b.capability === 'prReview');
+  const invocation = s.v3?.skillInvocations.find(i => i.id === e.skillInvocationId);
+  const disagreement = e.adjudicationId && s.v3?.reviewDisagreements?.find(d=>
+    d.adjudicationJobId===e.adjudicationId && d.freshInvocationId===invocation?.id &&
+    d.head===t.head && d.base===t.base && d.skillFingerprint===e.skillFingerprint && d.outcomeBlocking===false);
+  const decision = disagreement && s.v3?.decisionRecords.find(d=>d.id===e.adjudicationId &&
+    d.kind==='adjudication' && d.candidateVersion===disagreement.candidateVersion && d.scope===t.key &&
+    d.inputVersion===inputVersion(s) && d.sourceVersion===s.planSourceVersion);
+  const effectiveClear = !!(invocation?.result?.status==='pass' && !invocation.result.blocking ||
+    key==='fresh' && invocation?.result?.status==='changes_required' && invocation.result.blocking && decision);
+  return !!binding && !!invocation && invocation.capability === 'prReview' &&
+    invocation.bindingFingerprint === binding.fingerprint && e.skillFingerprint === binding.fingerprint &&
+    invocation.head === t.head && invocation.base === t.base && effectiveClear &&
+    e.path === invocation.result?.rawOutputPath &&
+    e.rawReportSha256 === invocation.result?.rawOutputSha256 && !!e.commentUrl;
+}
+export function activeReviewDisagreement(s:State,t:Ticket) {
+  if(!t.reviewDisagreementId)return undefined;
+  const record=s.v3?.reviewDisagreements?.find(d=>d.id===t.reviewDisagreementId);
+  ensure(record && record.ticket===t.key && record.head===t.head && record.base===t.base &&
+    record.candidateVersion===candidateVersion(s,t) && !record.adjudicationJobId,
+    '审查分歧记录不属于当前候选或已完成裁决');
+  return record;
+}
+function matchingReviews(s: State, t: Ticket) {
+  return currentReviewEvidence(s, t, 'regular') && currentReviewEvidence(s, t, 'fresh') &&
+    (s.protocol !== currentProtocol || t.evidence.regular!.skillFingerprint === t.evidence.fresh!.skillFingerprint);
+}
 export function ticket(s: State, key: string) { const t = s.tickets.find(t => t.key === key); ensure(t, `未知工单 ${key}`); return t; }
 const busy = (j: Job) => j.status === 'leased' || j.status === 'running';
-const tierFor = (a: Action): Tier => ['claim', 'plan', 'plan-check', 'replan', 'adjudicate', 'spec-audit', 'spec-close', 'verify', 'cleanup'].includes(a) ? 'L1' : ['implement', 'self-standards', 'self-spec', 'publish'].includes(a) ? 'L3' : 'L2';
+interface ActionMetadata {
+  tier: Tier; fresh: boolean; authored: boolean; skills: readonly SkillCapability[]; rawSource: boolean;
+}
+/** Every action declares its routing and packet sources in one exhaustive table. */
+export const actionMetadata = {
+  claim:           {tier:'L1',fresh:false,authored:false,skills:[],rawSource:false},
+  plan:            {tier:'L1',fresh:true, authored:false,skills:[],rawSource:false},
+  'plan-check':    {tier:'L1',fresh:true, authored:false,skills:[],rawSource:false},
+  implement:       {tier:'L3',fresh:false,authored:true, skills:['implementation','diagnosis','authorReview','handoff'],rawSource:true},
+  'author-review': {tier:'L3',fresh:false,authored:false,skills:['authorReview'],rawSource:true},
+  'self-standards':{tier:'L3',fresh:false,authored:false,skills:[],rawSource:false},
+  'self-spec':     {tier:'L3',fresh:false,authored:false,skills:[],rawSource:false},
+  verify:          {tier:'L1',fresh:false,authored:false,skills:[],rawSource:false},
+  publish:         {tier:'L3',fresh:false,authored:true, skills:[],rawSource:false},
+  'pr-review':     {tier:'L2',fresh:false,authored:false,skills:['prReview'],rawSource:true},
+  'review-lens':   {tier:'L2',fresh:false,authored:false,skills:[],rawSource:true},
+  confirm:         {tier:'L2',fresh:false,authored:false,skills:[],rawSource:false},
+  adjudicate:      {tier:'L1',fresh:true, authored:false,skills:[],rawSource:false},
+  'review-report': {tier:'L2',fresh:false,authored:false,skills:[],rawSource:false},
+  accept:          {tier:'L2',fresh:true, authored:false,skills:[],rawSource:true},
+  integrate:       {tier:'L2',fresh:false,authored:true, skills:[],rawSource:true},
+  replan:          {tier:'L1',fresh:true, authored:true, skills:[],rawSource:true},
+  merge:           {tier:'L2',fresh:false,authored:false,skills:[],rawSource:false},
+  close:           {tier:'L2',fresh:false,authored:false,skills:[],rawSource:false},
+  cleanup:         {tier:'L1',fresh:false,authored:false,skills:[],rawSource:false},
+  'spec-audit':    {tier:'L1',fresh:true, authored:false,skills:[],rawSource:false},
+  'spec-close':    {tier:'L1',fresh:false,authored:false,skills:[],rawSource:false},
+  'skill-child':   {tier:'L2',fresh:false,authored:false,skills:[],rawSource:true},
+  'repair-receipt':{tier:'L2',fresh:false,authored:false,skills:[],rawSource:false},
+} as const satisfies Record<Action,ActionMetadata>;
+export const coordinatorAgentSlots = 1;
+/** Minimum actor capacity held for a root while its bound skill may delegate. */
+export function rootSkillActorSlots(action:Action) {
+  return action === 'implement' ? 3 : actionMetadata[action].skills.length ? 2 : 1;
+}
+/** One new child, optional child-of-child, plus the coordinator. */
+export function skillChildAgentSlots(parentActorDepth:number,childCanDelegate:boolean) {
+  return coordinatorAgentSlots + parentActorDepth + 1 + (childCanDelegate ? 1 : 0);
+}
+const boundAuthorReview = (s: State) => unifiedSkillsReady(s);
 // agent 的测试按实际执行申请，不能在整段读代码/推理时间占住测试批次。
 const hasTests = (a: Action) => a === 'verify' ? 1 : 0;
 const validationPhases: Phase[] = ['queued', 'integrate', 'self', 'verify', 'publish', 'review', 'fresh', 'accept', 'merge'];
@@ -88,8 +406,10 @@ function enqueue(s: State, t: Ticket) {
 function admit(s: State) {
   const owner = s.tickets.find(t => t.key === s.validationOwner);
   if (owner?.reason === 'waiting_ci' && s.facts.prs[owner.pr]?.checks.some(c=>c.status==='pending')) return;
-  if (owner && !['done', 'close', 'cleanup', 'human', 'blocked'].includes(owner.phase)) return;
+  if (owner && !['done', 'close', 'cleanup', 'human', 'blocked', 'recovery'].includes(owner.phase)) return;
   if (owner && s.jobs.some(j => j.ticket === owner.key && busy(j))) return;
+  if (owner?.phase === 'recovery' && s.jobs.some(j => j.ticket === owner.key &&
+    (j.testExecution || (owner.recovery?.activeJobIds.includes(j.id) && j.status === 'cancelled' && !j.stopConfirmation?.processTreeStopped)))) return;
   s.validationOwner = undefined;
   // 升级旧账本时先排空已有验证 actors，不能在它们运行时启动另一票的合并。
   const occupied = new Set(s.jobs.filter(j => busy(j) && validationPhases.includes(s.tickets.find(t => t.key === j.ticket)?.phase as Phase)).map(j => j.ticket));
@@ -107,7 +427,7 @@ function admit(s: State) {
   first.queueSkips = 0;
   if (first.phase === 'queued') {
     if (first.base !== s.facts.base) resetCandidate(first, first.head, s.facts.base, 'integrate');
-    else first.phase = 'self';
+    else first.phase = boundAuthorReview(s) && freshEvidence(first, 'self') && !!first.authorReview ? 'verify' : 'self';
   }
   event(s, `${first.key} 进入最终验证队列的队首`);
 }
@@ -118,11 +438,12 @@ export function buildTicket(p: TicketPlan, base: string, closeout = false): Tick
 }
 export function applyPlan(s: State, p: ExecutionPlan, discovered: { number: number; state: string; blockedBy: { repo: string; number: number; state: string }[] }[]) {
   ensure(s.status === 'planning', '本轮执行计划已经确认；修改计划需先停止受影响任务');
-  ensure(p.capabilities.mainModel === s.inputs.models.L1, '主 agent 实际模型必须与 L1 相同，不能用角色名称代替');
   ensure(['per_agent', 'per_run'].includes(p.capabilities.modelRouting), '宿主缺少明确的模型路由能力');
   for (const m of Object.values(s.inputs.models)) ensure(p.capabilities.models.includes(m), `宿主未确认模型可用：${m}`);
   for (const k of ['agents', 'issues', 'tests', 'noProgress', 'rounds'] as const) ensure(Number.isSafeInteger(p.policy[k]) && p.policy[k] > 0, `L1 的资源策略 ${k} 必须是正整数`);
   ensure(p.policy.agents >= 2, '至少留出主 agent 和一个子 agent 的额度');
+  if (s.protocol === currentProtocol) ensure(p.policy.agents >= coordinatorAgentSlots + rootSkillActorSlots('implement'),
+    '统一技能执行的 L1 policy.agents 至少为 4：主控、实现、作者审查和专业审查各需一个槽位；请修订执行计划');
   ensure(p.specCriteria.length && p.evidencePath, '需要 L1 的 spec 执行计划和验收条件');
   ensure(new Set(p.tickets.map(t => t.number)).size === p.tickets.length, '工单编号重复');
   for (const i of discovered) ensure(p.tickets.some(t => t.number === i.number), `执行计划遗漏既有子工单 #${i.number}`);
@@ -131,7 +452,11 @@ export function applyPlan(s: State, p: ExecutionPlan, discovered: { number: numb
     t.externalDependencies = source.blockedBy.filter(b => b.repo !== s.repo.slug && b.state !== 'CLOSED').map(b => `${b.repo}#${b.number}`);
     ensure(t.criteria.length > 0, `#${t.number} 缺少验收条件`);
     for (const d of t.deferredDependencies || []) {
-      ensure(d.kind === 'acceptance_only' && d.records.length >= 2, '延期人工验收必须保留两端已发布的追溯记录');
+      ensure(d.kind === 'acceptance_only' && d.records.length >= 2 && d.records[0] !== d.records[1],
+        '延期人工验收必须保留两端已发布的追溯记录');
+      ensure(source.blockedBy.some(b => b.repo === s.repo.slug && b.number === d.issue && b.state !== 'CLOSED') &&
+        p.tickets.find(i => i.number === d.issue)?.kind === 'human',
+        '只有真实原生依赖中的人工验收工单可延期；技术前置仍须阻塞');
       ensure(d.target === s.spec || p.tickets.some(i => i.number === d.target && i.kind === 'human'), '人工验收只能移交现有人工工单或父 spec');
     }
     for (const b of source.blockedBy) {
@@ -160,36 +485,83 @@ function dependencyReady(s: State, t: Ticket) {
     (t.externalDependencies || []).every(key => s.facts.issueStates[key] === 'CLOSED');
 }
 function resetCandidate(t: Ticket, head: string, base: string, phase: Phase) {
-  t.head = head; t.base = base; t.evidence = {}; t.epoch++; t.phase = phase; t.reason = '';
+  t.head = head; t.base = base; t.evidence = {}; t.authorReview = undefined;
+  t.reviewDisagreementId = undefined; t.acceptanceGap = undefined;
+  t.epoch++; t.phase = phase; t.reason = '';
+  if (phase === 'integrate') t.integrationHead = undefined;
 }
-function problem(s: State, t: Ticket, signature: string, next: Phase) {
-  t.round++; t.stalls = signature === t.lastProblem ? t.stalls + 1 : 0; t.lastProblem = signature; t.reason = signature;
+/** Count a failed attempt exactly once, independently of its lease, replacement job and phase epoch. */
+export function recordFailure(s: State, t: Ticket, failure: {
+  id: string; category: FailureCategory; reason: string; signature?: string; jobId?: string; next: Phase; invariant?: boolean; preservePhase?: boolean;
+}) {
+  t.failures ??= [];
+  if (t.failures.some(e => e.id === failure.id)) return false;
   ensure(s.policy, '缺少策略');
-  if (t.round >= s.policy.rounds || t.stalls >= s.policy.noProgress) {
-    t.phase = t.escalations ? 'blocked' : 'replan'; t.reason = signature;
-  } else t.phase = next;
-  t.epoch++; t.evidence = {};
+  const signature = `${failure.category}:${(failure.signature || failure.reason).trim().replace(/\s+/g, ' ')}`;
+  const budget = t.failureBudget ??= { totalRetries: 0, consecutiveNoProgress: 0, lastSignature: '', replans: t.escalations };
+  budget.consecutiveNoProgress = signature === budget.lastSignature ? budget.consecutiveNoProgress + 1 : 1;
+  budget.totalRetries++; budget.lastSignature = signature;
+  budget.byCategory ??= {}; budget.byCategory[failure.category] = (budget.byCategory[failure.category] || 0) + 1;
+  t.failures.push({ id: failure.id, category: failure.category, reason: failure.reason, signature,
+    jobId: failure.jobId, at: new Date().toISOString() });
+  t.round = budget.totalRetries; t.stalls = budget.consecutiveNoProgress; t.lastProblem = signature;
+  if (!failure.preservePhase && t.phase !== 'recovery') t.reason = failure.reason;
+  const exhausted = budget.totalRetries >= s.policy.rounds || budget.consecutiveNoProgress >= s.policy.noProgress;
+  if (!failure.preservePhase && t.phase !== 'recovery') {
+    const retrySameCandidate = failure.category === 'host' && failure.next === t.phase && !exhausted && !failure.invariant;
+    if (exhausted || failure.invariant) t.phase = budget.replans ? 'blocked' : 'replan';
+    else t.phase = failure.next;
+    if (!retrySameCandidate) { t.epoch++; t.evidence = {}; t.reviewDisagreementId = undefined; }
+  }
+  event(s, `${t.key} 失败 ${failure.category} (${budget.totalRetries}/${s.policy.rounds}, 连续 ${budget.consecutiveNoProgress}/${s.policy.noProgress})：${failure.reason}`);
+  return true;
+}
+/** A correctable receipt keeps its lease; once that lease is stopped, its failure must not be retried unchanged. */
+export function finalizeRejectedReceipt(s: State, t: Ticket, j: Job) {
+  if (t.phase === 'recovery' || t.epoch !== j.epoch) return;
+  const failure = t.failures?.findLast(f => f.jobId === j.id && f.category === 'receipt_validation');
+  if (!failure) return;
+  t.phase = t.failureBudget?.replans ? 'blocked' : 'replan';
+  t.reason = `回执校验失败：${failure.reason}`;
+  t.epoch++; t.evidence = {}; t.reviewDisagreementId = undefined;
+  event(s, `${t.key} 回执无法纠正且原执行者已停止；${t.phase === 'blocked' ? '局部阻塞' : '交给 L1 重规划'}`);
+}
+function problem(s: State, t: Ticket, signature: string, next: Phase, category: FailureCategory = 'semantic', jobId?: string) {
+  const id = jobId ? `${jobId}:${category}` : `${t.key}:${t.epoch}:${category}:${createHash('sha256').update(signature).digest('hex').slice(0, 16)}`;
+  recordFailure(s, t, { id, category, reason: signature, jobId, next });
 }
 export function ciAllowed(pr: LivePR, r?: Result) {
   const checks = pr.checks;
   if (checks.some(c => c.status === 'failed')) return false;
+  if (checks.some(c => c.testedHead && c.testedHead !== pr.head && c.testedHead !== pr.ciMergeHead)) return false;
   if (checks.length && checks.every(c => c.status === 'pass')) return true;
-  const waiver = r?.data?.ciWaiver as { reason?: string; evidence?: string; notStartedIds?: string[] } | undefined;
-  if (!waiver?.evidence) return false;
+  const waiver = r?.data?.ciWaiver as { reason?: string; evidence?: string; notStartedIds?: string[];
+    observedHead?: string; observedBase?: string; verification?: string } | undefined;
+  if (!waiver?.evidence || waiver.observedHead !== pr.head || waiver.observedBase !== pr.base ||
+      waiver.verification !== 'remote') return false;
   if (waiver.reason === 'no_ci') return checks.length === 0 && r?.data?.ciConfigured === false;
-  if (waiver.reason === 'billing') return checks.every(c => c.status === 'pass' ||
+  if (waiver.reason === 'billing') return checks.length > 0 && checks.every(c => c.status === 'pass' ||
     (c.status === 'startup_failure' && waiver.notStartedIds?.includes(c.id)));
   return false;
 }
 export function mergeGate(s: State, t: Ticket) {
   const live = s.facts.prs[String(t.pr)];
+  const tests = t.evidence.tests;
+  const testedCandidate = s.protocol !== currentProtocol || !!tests?.testedTree && tests.testedHead === t.head &&
+    tests.targetBase === t.base && (tests.integrationHead || null) === (t.integrationHead || null);
+  const ciTreeMatched = s.protocol !== currentProtocol || !live || live.checks.every(c => c.status !== 'pass' ||
+    !!c.testedHead && !!c.testedTree &&
+    (c.testedHead === live.head ? c.testedTree === tests?.testedTree :
+      c.testedHead === live.ciMergeHead && c.testedTree === live.ciMergeTree));
   return s.validationOwner === t.key && !!live && live.state === 'OPEN' && !live.draft && live.head === t.head && live.base === t.base &&
     live.baseRef === s.inputs.targetBranch && s.facts.base === t.base && live.mergeable === 'MERGEABLE' &&
-    ['self', 'tests', 'regular', 'fresh', 'accept'].every(k => freshEvidence(t, k as keyof Ticket['evidence'])) &&
+    testedCandidate && ciTreeMatched && ['self', 'tests', 'accept'].every(k => freshEvidence(t, k as keyof Ticket['evidence'])) && matchingReviews(s, t) &&
+    (!boundAuthorReview(s) || !!t.authorReview && t.authorReview.head === t.head && t.authorReview.base === t.base &&
+      t.authorReview.bindingFingerprint === s.v3!.skillBindings!.find(b=>b.capability==='authorReview')?.fingerprint) &&
     (!t.visual || freshEvidence(t, 'visual')) && ciAllowed(live, jobsAt(s, t, 'accept').find(j => j.status === 'done')?.result);
 }
 function advanceGroups(s: State, t: Ticket) {
-  if (t.phase === 'self') {
+  if (t.phase === 'self' && !boundAuthorReview(s)) {
     const a = jobsAt(s, t, 'self-standards'), b = jobsAt(s, t, 'self-spec');
     if (a[0]?.status === 'done' && b[0]?.status === 'done') {
       const findings = [...(a[0].result?.findings || []), ...(b[0].result?.findings || [])].filter(f => !f.advisory);
@@ -217,7 +589,7 @@ function disputes(s: State, t: Ticket, current: Job[]) {
     const previous = s.jobs.findLast(p => p.ticket === t.key && p.epoch !== t.epoch && p.status === 'done' &&
       p.result?.complete && p.result.status === 'confirmed' && p.result.findings?.length === 1 && Number.isFinite(p.result.findings[0].confidence) &&
       ['confirm', 'adjudicate'].includes(p.action) && p.head === j.head && p.base === j.base && p.part === j.part);
-    return previous && (previous.result!.findings![0].confidence! >= 50) !== (j.result!.findings![0].confidence! >= 50)
+    return previous && historicalBlocking(previous.result!.findings![0]) !== historicalBlocking(j.result!.findings![0])
       ? [{ t, action: 'adjudicate' as Action, part: j.part, finding: j.finding, dispute: { previous: previous.id, current: j.id } }] : [];
   });
 }
@@ -227,11 +599,27 @@ function candidates(s: State): Candidate[] {
   admit(s);
   for (const t of s.tickets) {
     advanceGroups(s, t);
-    if (['done', 'human', 'blocked'].includes(t.phase)) continue;
+    if (['done', 'human', 'blocked', 'recovery'].includes(t.phase)) continue;
+    // An invalid receipt can change phase while its original writer is still active.
+    if (s.jobs.some(j => j.ticket === t.key && busy(j) && j.epoch !== t.epoch)) continue;
     if (validationPhases.includes(t.phase) && s.validationOwner !== t.key) continue;
     if (t.phase === 'claim' && !dependencyReady(s, t)) continue;
-    if (t.phase === 'self') { out.push({ t, action: 'self-standards' }, { t, action: 'self-spec' }); continue; }
+    if (t.phase === 'self') {
+      if (boundAuthorReview(s)) out.push({t, action: 'author-review'});
+      else out.push({ t, action: 'self-standards' }, { t, action: 'self-spec' });
+      continue;
+    }
     if (t.phase === 'review' || t.phase === 'fresh') {
+      if (s.protocol === currentProtocol) {
+        const disagreement=activeReviewDisagreement(s,t);
+        if(disagreement) {
+          out.push({t,action:'adjudicate',part:'pr-review'});
+          continue;
+        }
+        const review = jobsAt(s, t, 'pr-review').find(j => j.status === 'done');
+        out.push({ t, action: review ? 'review-report' : 'pr-review' });
+        continue;
+      }
       const rs = jobsAt(s, t, 'review-lens');
       if (rs.filter(j => j.status === 'done').length !== lenses.length) {
         lenses.forEach((_, n) => out.push({ t, action: 'review-lens', part: String(n) })); continue;
@@ -254,15 +642,100 @@ function candidates(s: State): Candidate[] {
   // 中途人工技术前置或外部依赖也可能使整张图暂无可运行节点。
   // 交给独立 L1 给出明确人工交接/阻断结论，不能空轮询或假定软件都完成。
   if (out.length === 0 && !s.jobs.some(busy)) {
+    if (s.tickets.some(t => t.phase === 'recovery')) return out;
     if (s.tickets.some(t=>t.reason==='waiting_ci' && s.facts.prs[t.pr]?.checks.some(c=>c.status==='pending'))) return out;
     if (!s.specAudit) out.push({ action: 'spec-audit' });
     else if (s.specAudit.status === 'complete' && s.facts.issueStates[String(s.spec)] !== 'CLOSED') out.push({ action: 'spec-close' });
   }
   return out;
 }
+type AgentSlotCandidate = Pick<Job, 'id' | 'action' | 'parentInvocationId' | 'childRequestId'> &
+  Partial<Pick<Job, 'ticket' | 'epoch' | 'candidateVersion'>>;
+/** Keep room for the required implement → authorReview → professional review chain. */
+function agentSlotsRequired(s: State, next?: AgentSlotCandidate) {
+  const active: AgentSlotCandidate[] = s.jobs.filter(j => busy(j) && j.executor === 'agent');
+  if (next) active.push(next);
+  const jobs = new Map<string, AgentSlotCandidate>(s.jobs.map(j => [j.id, j]));
+  if (next) jobs.set(next.id, next);
+  const invocationOwner = new Map((s.v3?.skillInvocations || []).map(i => [i.id, i.jobId]));
+  const rootOf = (job: AgentSlotCandidate) => {
+    let current = job;
+    const seen = new Set([job.id]);
+    while (current.parentInvocationId) {
+      const parentId = invocationOwner.get(current.parentInvocationId);
+      const parent = parentId && jobs.get(parentId);
+      if (!parent || seen.has(parent.id)) break;
+      seen.add(parent.id); current = parent;
+    }
+    // A stopped parent may have a live child while a new actor is leased to
+    // resume that same skill invocation. Both actors belong to one tree.
+    if (current.id === job.id && current.ticket && current.candidateVersion) {
+      const prior = s.jobs.findLast(old => old.id !== current.id && old.status === 'cancelled' &&
+        old.stopConfirmation?.processTreeStopped && old.ticket === current.ticket &&
+        old.epoch === current.epoch && old.action === current.action &&
+        old.candidateVersion === current.candidateVersion &&
+        s.v3?.skillInvocations.some(i => i.jobId === old.id && !i.result));
+      if (prior) current = prior;
+    }
+    return current;
+  };
+  const groups = new Map<string, AgentSlotCandidate[]>();
+  for (const job of active) {
+    const root = rootOf(job);
+    const group = groups.get(root.id) || [];
+    group.push(job); groups.set(root.id, group);
+  }
+  // One slot belongs to the coordinator. Implementation reserves its mandatory
+  // author-review and professional-review descendants. Other bound roots
+  // reserve one child; an active child with a bound skill reserves its own child.
+  let slots = coordinatorAgentSlots;
+  for (const [rootId, group] of groups) {
+    const root = jobs.get(rootId)!;
+    const nestedWaiting = group.filter(job => job.action === 'skill-child' &&
+      s.v3?.skillChildren.find(child => child.id === job.childRequestId)?.skillCapability &&
+      !group.some(child => invocationOwner.get(child.parentInvocationId || '') === job.id)).length;
+    slots += Math.max(rootSkillActorSlots(root.action), group.length + nestedWaiting);
+  }
+  return slots;
+}
 export function reserve(s: State): Job[] {
   ensure(s.status === 'running' && s.policy, '只有运行中的已规划 workflow 可以派发');
+  if(s.protocol===currentProtocol) ensure(unifiedSkillsReady(s),
+    '统一执行路径缺少完整技能绑定；先显式 migrate-skills，不能回退固定审查调度');
+  if (s.protocol === currentProtocol && s.planEvidence)
+    ensure(currentDecision(s, 'execution-plan', '$spec', globalDecisionVersion(s)), 'L1 执行图或资源决策缺失或已过期');
   const created: Job[] = [];
+  // Child requests are durable before leasing. They use exactly the same agent and test
+  // counters as top-level jobs; a live parent remains in the active count.
+  for (const child of s.v3?.skillChildren || []) {
+    if (!child.pending) continue;
+    const parent = s.v3?.skillInvocations.find(i => i.id === child.parentInvocationId);
+    const owner = parent && s.jobs.find(j => j.id === parent.jobId);
+    if (!parent || parent.result || !owner || !busy(owner)) continue;
+    const t = owner.ticket === '$spec' ? undefined : s.tickets.find(x => x.key === owner.ticket);
+    if (child.inputVersion !== inputVersion(s) || child.candidateVersion !== candidateVersion(s, t) ||
+        child.base !== owner.base ||
+        (child.head !== owner.head && !['implement', 'integrate'].includes(owner.action))) continue;
+    const active = s.jobs.filter(busy);
+    if ((s.protocol === currentProtocol
+      ? agentSlotsRequired(s, {id:`${child.id}:try-${child.jobIds.length + 1}`,action:'skill-child',
+          parentInvocationId:parent.id,childRequestId:child.id})
+      : active.filter(j => j.executor === 'agent').length + 2) > s.policy.agents ||
+        active.reduce((n, j) => n + j.tests, 0) > s.policy.tests) continue;
+    const attempt = child.jobIds.length + 1;
+    const id = `${child.id}:try-${attempt}`;
+    ensure(!s.jobs.some(j => j.id === id), '技能子任务租约 ID 重复');
+    const j: Job = { id, ticket: owner.ticket, epoch: owner.epoch, action: 'skill-child', part: child.key,
+      tier: child.tier, model: child.model, executor: 'agent', fresh: child.fresh,
+      contextKey: child.independent ? `${child.id}:context:try-${attempt}` : owner.contextKey,
+      contextIntent: { kind: child.independent ? 'independent' : 'continue', parentJobId: owner.id,
+        fresh: child.fresh },
+      head: child.head, base: child.base, tests: 0, status: 'leased', nativeId: '',
+      inputVersion: child.inputVersion, candidateVersion: child.candidateVersion,
+      parentInvocationId: parent.id, childRequestId: child.id,
+      timing: { leasedAt: new Date().toISOString() } };
+    child.pending = false; child.jobIds.push(id); s.jobs.push(j); created.push(j);
+  }
   const list = candidates(s);
   for (const c of list) {
     const key = c.t?.key || '$spec', epoch = c.t?.epoch || s.auditEpoch;
@@ -271,49 +744,249 @@ export function reserve(s: State): Job[] {
     if (attempts.some(j => j.status !== 'cancelled')) continue;
     const id = `${s.id}:${key}:${epoch}:${c.action}:${part}:try-${attempts.length + 1}`;
     const active = s.jobs.filter(busy);
-    const command = ['verify', 'cleanup', 'close', 'spec-close'].includes(c.action);
+    const command = ['verify', 'cleanup', 'close', 'spec-close'].includes(c.action) ||
+      s.protocol === currentProtocol && c.action === 'review-report';
     const executor = command ? 'command' : c.action === 'claim' ? 'main' : 'agent';
-    if (active.filter(j => j.executor === 'agent').length + 1 + (executor === 'agent' ? 1 : 0) > s.policy.agents) continue;
+    if ((s.protocol === currentProtocol && executor === 'agent'
+      ? agentSlotsRequired(s, {id,action:c.action,ticket:key,epoch,
+          candidateVersion:candidateVersion(s,c.t)})
+      : active.filter(j => j.executor === 'agent').length + 1 + (executor === 'agent' ? 1 : 0)) > s.policy.agents) continue;
     if (active.reduce((n, j) => n + j.tests, 0) + hasTests(c.action) > s.policy.tests) continue;
     const inFlightIssues = new Set(s.tickets.filter(t => !['claim', 'done', 'human', 'blocked'].includes(t.phase)).map(t => t.key));
     for (const j of active) if (j.action === 'claim') inFlightIssues.add(j.ticket);
     if (c.action === 'claim' && inFlightIssues.size >= s.policy.issues) continue;
     // 所有合并、关闭以及 spec 终结共用一个提交通道。
     if (['merge', 'close', 'spec-close'].includes(c.action) && active.some(j => ['merge', 'close', 'spec-close'].includes(j.action))) continue;
-    const tier = tierFor(c.action);
-    const fresh = c.t?.phase === 'fresh' || ['plan', 'plan-check', 'accept', 'replan', 'spec-audit', 'adjudicate'].includes(c.action);
-    const continuity = ['implement', 'publish'].includes(c.action) ? 'author' : ['review-lens', 'confirm', 'review-report'].includes(c.action) ? `review-${part}` : c.action;
+    const tier = actionMetadata[c.action].tier;
+    if (s.protocol === currentProtocol && c.action === 'implement')
+      ensure(c.t && currentDecision(s, 'plan-check', c.t.key, candidateVersion(s, c.t)),
+        `#${c.t?.number} 缺少当前输入与候选的独立 L1 计划复核`);
+    const fresh = c.t?.phase === 'fresh' || actionMetadata[c.action].fresh;
+    const contextIntent=contextIntentFor(s,key,c.action,part,fresh);
+    const predecessor=s.jobs.find(x=>x.id===contextIntent.predecessorJobId);
+    const lineage=contextIntent.lineage!;
     const j: Job = { id, ticket: key, epoch, action: c.action, part, tier, model: s.inputs.models[tier], executor, fresh,
-      contextKey: `${s.id}:${key}:${continuity}${fresh ? `:fresh-${epoch}` : ''}`, head: c.t?.head || '', base: c.t?.base || s.facts.base,
-      tests: hasTests(c.action), status: 'leased', nativeId: '', finding: c.finding, dispute: c.dispute, timing: { leasedAt: new Date().toISOString() } };
+      contextKey: predecessor ? `${s.id}:${lineage}` : `${id}:new`, contextIntent,
+      head: c.t?.head || '', base: c.t?.base || s.facts.base,
+      tests: hasTests(c.action), status: 'leased', nativeId: '', finding: c.finding, dispute: c.dispute,
+      inputVersion: inputVersion(s), candidateVersion: candidateVersion(s, c.t), timing: { leasedAt: new Date().toISOString() } };
+    if (c.action === 'replan' && c.t) {
+      const budget = c.t.failureBudget ??= { totalRetries: 0, consecutiveNoProgress: 0, lastSignature: '', replans: 0 };
+      budget.replans++;
+    }
     s.jobs.push(j); created.push(j);
   }
   if (created.length) event(s, `已预留 ${created.length} 个任务，含所有显式审查 actors`);
   return created;
 }
-export function bind(s: State, id: string, ref: { nativeId: string; model: string }) {
+export function contextIntentFor(s:State,ticketKey:string,action:Action,part:string,fresh:boolean):ContextIntent {
+  const continuity=['implement','publish','integrate'].includes(action)?'author'
+    : action==='pr-review'?'review-pr'
+    : ['review-lens','confirm','review-report'].includes(action)?`review-${action}-${part}`:action;
+  const canContinue=!fresh&&(continuity==='author'||continuity.startsWith('review-'));
+  const lineage=`${ticketKey}:${continuity}`;
+  const predecessor=canContinue?s.jobs.findLast(x=>x.ticket===ticketKey&&x.status==='done'&&
+    x.executor==='agent'&&!x.fresh&&x.contextIntent?.lineage===lineage&&!!x.session):undefined;
+  return {kind:predecessor?'continue':'independent',fresh,lineage,predecessorJobId:predecessor?.id};
+}
+export function bind(s: State, id: string, ref: { nativeId: string; model?: string; session?: NativeSession }) {
   ensure(s.status === 'running', '当前 workflow 未运行，不能派发新任务');
   const j = s.jobs.find(j => j.id === id); ensure(j && busy(j), '任务不是待执行状态');
-  ensure(ref.model === j.model && !!ref.nativeId, '实际派发模型或宿主任务身份不匹配');
+  ensure(!!ref.nativeId, '缺少宿主原生任务身份');
+  let contextObservation:ContextObservation|undefined;
+  if (s.protocol === currentProtocol && j.executor === 'agent') {
+    ensure(ref.session, '模型任务需要宿主原生会话观测，不能使用配置模型或 persona 冒充');
+    verifyNativeSession(s, ref.session, ref.nativeId, j.tier);
+    ensure(ref.session.jobId === j.id, '宿主观测不是当前任务的原生会话');
+    ensure(j.model === s.inputs.models[j.tier], '已派发任务的模型请求与当前配置不符');
+    if (j.repairOfJobId) {
+      const original = s.jobs.find(x => x.id === j.repairOfJobId);
+      ensure(original?.session && ref.nativeId !== original.nativeId &&
+        ref.session.observationId !== original.session.observationId,
+        '独立回执修复者不能复用原业务执行者');
+    }
+    if (j.parentInvocationId && j.contextIntent?.kind === 'independent') {
+      const invocation = s.v3?.skillInvocations.find(i => i.id === j.parentInvocationId);
+      ensure(invocation, '技能子任务缺少父调用');
+      const parentSessions=[invocation.session,...(invocation.resumeHistory || []).map(x=>x.previousSession)];
+      ensure(parentSessions.every(session=>ref.nativeId !== session.nativeId &&
+        ref.session.observationId !== session.observationId),
+        '独立技能子任务不能复用父会话');
+      for (const sibling of s.jobs.filter(x => x.id !== j.id && x.parentInvocationId === j.parentInvocationId &&
+        x.contextIntent?.kind === 'independent' && x.session))
+        ensure(ref.nativeId !== sibling.nativeId && ref.session.observationId !== sibling.session!.observationId,
+          '独立技能子任务不能复用兄弟会话');
+    }
+    if (j.contextIntent) {
+      const observed = ref.session.context;
+      ensure(observed && observed.contextId && observed.proofId && ['new','resumed'].includes(observed.mode),
+        '宿主未证明实际上下文身份与新建/续接状态');
+      if (j.contextIntent.kind === 'independent') {
+        ensure(observed.mode === 'new' && !s.jobs.some(x => x.id !== j.id &&
+          x.contextObservation?.contextId === observed.contextId), '独立任务不能复用已有上下文');
+      } else {
+        const previousId = j.contextIntent.predecessorJobId || j.contextIntent.parentJobId;
+        const previous = s.jobs.find(x => x.id === previousId);
+        ensure(previous && (previous.status === 'done' ||
+          (j.contextIntent.parentJobId === previousId && previous.status === 'running')),
+          '续接任务缺少可核对的前序 actor');
+        if (observed.mode === 'resumed') ensure(previous.model===j.model && previous.contextObservation &&
+          observed.resumedFromContextId === previous.contextObservation.contextId &&
+          observed.contextId === previous.contextObservation.contextId,
+          '宿主续接证明与前序上下文不符');
+        else ensure(!s.jobs.some(x => x.id !== j.id && x.contextObservation?.contextId === observed.contextId),
+          '新会话不能冒用前序上下文身份');
+      }
+      contextObservation = { source: 'native_host', ...observed, nativeId: ref.nativeId,
+        evidencePath: ref.session.evidencePath, evidenceDigest: ref.session.evidenceDigest };
+    }
+    if (j.session) ensure(JSON.stringify(j.session) === JSON.stringify(ref.session), '同一租约的会话观测不能被替换');
+  } else ensure(ref.model === j.model, '实际派发模型与任务不符');
   ensure(!j.nativeId || j.nativeId === ref.nativeId, '同一租约不能重复绑定另一任务');
+  if(ref.session)j.session=ref.session;
+  if(contextObservation)j.contextObservation=contextObservation;
   j.nativeId = ref.nativeId; j.status = 'running';
   j.timing ??= { leasedAt: '' }; j.timing.boundAt ??= new Date().toISOString();
   event(s, `已绑定 ${j.action} 的原生任务`);
+}
+function reviewEvidence(s: State, invocation: SkillInvocation, head: string, base: string): AuthorReviewEvidence {
+  const sources=invocation.reviewSources;
+  ensure(invocation.capability==='authorReview' && invocation.result?.status==='pass' &&
+    !invocation.result.blocking && !!invocation.result.rawOutputPath && sources &&
+    sources.head===head && sources.base===base && invocation.head===head && invocation.base===base,
+    '作者自检未完整通过或候选 head/base 不符');
+  const binding=s.v3?.skillBindings?.find(b=>b.capability==='authorReview');
+  ensure(binding && binding.fingerprint===invocation.bindingFingerprint, '作者自检技能版本已改变');
+  const t=s.tickets.find(x=>x.key===s.jobs.find(j=>j.id===invocation.jobId)?.ticket);
+  ensure(t && sources.issueUrl===`https://${s.repo.host}/${s.repo.slug}/issues/${t.number}` &&
+    !!sources.sourceVersion && !!sources.standardsDigest && !!sources.planDigest && !!sources.checksDigest &&
+    !!sources.fingerprint, '作者自检缺少关联 issue、spec/规范或批准计划来源');
+  return {invocationId:invocation.id,jobId:invocation.jobId,head,base,
+    bindingFingerprint:invocation.bindingFingerprint,sources,evidencePath:invocation.result.rawOutputPath};
+}
+function embeddedAuthorReview(s: State, professional: SkillInvocation, head: string, base: string) {
+  const children=(s.v3?.skillChildren || []).filter(c=>c.parentInvocationId===professional.id && c.skillCapability==='authorReview');
+  ensure(children.length===1 && children[0].required, 'implement 内嵌 code-review 必须通过当前 authorReview 绑定恰好委派一次');
+  const child=children[0], job=s.jobs.find(j=>j.id===child.jobIds.at(-1));
+  ensure(job?.status==='done' && job.result?.complete && job.result.status==='completed' &&
+    child.head===head && child.base===base && job.head===head && job.base===base,
+    '内嵌作者自检子任务未完成或审查了旧候选');
+  const ids=job.result.data?.skillInvocationIds;
+  ensure(Array.isArray(ids) && ids.length===1 && typeof ids[0]==='string', '作者自检子任务缺少一次真实技能调用');
+  const invocation=s.v3!.skillInvocations.find(x=>x.id===ids[0] && x.jobId===job.id);
+  ensure(invocation, '作者自检引用不属于实际子 actor');
+  return reviewEvidence(s,invocation,head,base);
+}
+function validateSkillLinks(s: State, j: Job, r: Result): AuthorReviewEvidence | undefined {
+  if (s.protocol !== currentProtocol || !s.v3?.skillBindings) return;
+  const ids = r.data?.skillInvocationIds;
+  ensure(ids === undefined || Array.isArray(ids) && ids.every(x => typeof x === 'string'), '技能调用引用必须是 ID 数组');
+  const linked = (ids || []).map(id => {
+    const invocation = s.v3!.skillInvocations.find(x => x.id === id);
+    ensure(invocation && invocation.jobId === j.id && invocation.session.nativeId === j.nativeId &&
+      invocation.candidateVersion === j.candidateVersion, '技能调用不是当前 actor 或候选');
+    ensure(invocation.result, '技能调用缺少真实完成回执');
+    ensure(s.v3!.skillBindings!.some(b => b.capability === invocation.capability && b.fingerprint === invocation.bindingFingerprint),
+      '技能调用版本与当前绑定不符');
+    return invocation;
+  });
+  if (j.action === 'review-report' && r.handoffPath) {
+    const handoff=linked.find(x=>x.capability==='handoff');
+    ensure(handoff?.result?.status==='pass'&&!handoff.result.blocking,
+      'review 交接路径必须来自原 actor 实际完成的 handoff 技能');
+  }
+  if (j.action === 'author-review' && r.complete) {
+    ensure(linked.length===1 && linked[0].capability==='authorReview',
+      '单独作者自检须引用一次当前绑定的 authorReview 技能');
+    if (linked[0].result?.status==='changes_required' && linked[0].result.blocking) return;
+    return reviewEvidence(s,linked[0],j.head,j.base);
+  }
+  if (j.action === 'pr-review' && r.complete) {
+    ensure(linked.length === 1 && linked[0].capability === 'prReview',
+      'PR 审查必须引用一次实际完成的 prReview 绑定调用');
+    ensure(['pass', 'changes_required'].includes(linked[0].result!.status) &&
+      !!linked[0].result!.rawOutputPath && !!linked[0].result!.rawOutputSha256,
+      'PR 审查跳过、未完成或缺少原始报告，不能签发完整结论');
+  }
+  if (j.action !== 'implement') return;
+  const professional = linked.filter(x => x.capability === 'implementation' || x.capability === 'diagnosis');
+  if (!r.complete) return;
+  ensure(professional.length === 1, '实现阶段必须引用一次实际 implement 或 diagnosing-bugs 技能调用');
+  ensure(['pass', 'changes_required'].includes(professional[0].result!.status), '实现技能未完成或跳过，不能签发完整结果');
+  if (r.status === 'implemented') {
+    ensure(professional[0].result!.status === 'pass' && !professional[0].result!.blocking,
+      '实现技能未明确通过，不能签发已实现候选');
+    const handoff = linked.find(x => x.capability === 'handoff');
+    ensure(handoff?.result?.status === 'pass' && !handoff.result.blocking && !!r.handoffPath,
+      '实现后的交接须实际调用已绑定 handoff 并归档原文');
+    if (professional[0].capability==='implementation') return embeddedAuthorReview(s,professional[0],r.head!,r.base!);
+    const reviewChildren=(s.v3.skillChildren || []).filter(c=>c.parentInvocationId===professional[0].id && c.skillCapability==='authorReview');
+    if (reviewChildren.length) return embeddedAuthorReview(s,professional[0],r.head!,r.base!);
+  } else if (r.status === 'replan') {
+    const handoff=linked.find(x=>x.capability==='handoff');
+    ensure(handoff?.result?.status==='pass'&&!handoff.result.blocking&&!!r.handoffPath,
+      '实现阶段重规划须由原 actor 调用 handoff 并归档原文');
+  }
+}
+export function contextReady(j: Job) {
+  return !j.contextIntent || j.contextIntent.kind === 'independent' || j.contextObservation?.mode === 'resumed' ||
+    !!(j.handoffRef && j.handoffRef.appliedCandidateVersion === j.candidateVersion &&
+      j.handoffRef.sourceJobId === (j.contextIntent.predecessorJobId || j.contextIntent.parentJobId));
 }
 export function submit(s: State, id: string, r: Result) {
   ensure(s.status !== 'retired', '已退役运行不能接收执行结果');
   const paused = s.status === 'paused';
   const j = s.jobs.find(j => j.id === id); ensure(j, '未知任务');
+  if (j.executor === 'agent' && s.protocol === currentProtocol) ensure(contextReady(j),
+    '新上下文尚无 L1 核验的原始交接或标明未知项的重建交接');
   if (j.status === 'done') { ensure(JSON.stringify(j.result) === JSON.stringify(r), '重复回执内容不一致'); return; }
   ensure(busy(j) && j.nativeId, '先绑定实际任务，才能提交结果');
   ensure(r.model === j.model && !!r.evidencePath, '回执必须包含实际模型及证据路径');
+  const authorReview=validateSkillLinks(s, j, r);
+  if (s.protocol === currentProtocol && j.executor === 'agent') {
+    ensure(j.session, '缺少真实原生会话身份，不能采用模型任务结果');
+    verifyNativeSession(s, j.session, j.nativeId, j.tier);
+    ensure(j.inputVersion === inputVersion(s), '输入模型或目标已改变，旧角色结果过期');
+    ensure(j.candidateVersion === candidateVersion(s, j.ticket === '$spec' ? undefined : ticket(s, j.ticket)),
+      '决策或结果所绑定的候选版本已改变');
+    if (j.action === 'plan-check') {
+      const t = ticket(s, j.ticket), version = candidateVersion(s, t);
+      const planned = currentDecision(s, 'ticket-plan', t.key, version) || currentDecision(s, 'replan', t.key, version);
+      ensure(planned, '当前工单计划缺少已验证的 L1 决策');
+      ensure(planned.session.nativeId !== j.session.nativeId && planned.session.observationId !== j.session.observationId,
+        '工单计划复核必须由独立 L1 原生会话完成');
+    }
+  }
+  if (j.action === 'skill-child') {
+    ensure(j.parentInvocationId && j.childRequestId, '技能子任务缺少父调用与请求');
+    const child = s.v3?.skillChildren?.find(x => x.id === j.childRequestId && x.parentInvocationId === j.parentInvocationId);
+    const parent = s.v3?.skillInvocations.find(x => x.id === j.parentInvocationId);
+    ensure(child && parent && !parent.result && child.jobIds.at(-1) === j.id, '技能子任务不是当前父调用的有效租约');
+    ensure((r.complete && ['completed', 'failed'].includes(r.status)) || (!r.complete && r.status === 'incomplete'),
+      '技能子任务必须明确 completed、failed 或 incomplete');
+    if (child.skillCapability && r.complete && r.status === 'completed') {
+      const ids = r.data?.skillInvocationIds;
+      ensure(Array.isArray(ids) && ids.length === 1, '引用其他技能的子任务必须登记一次实际技能调用');
+      const nested = s.v3!.skillInvocations.find(x => x.id === ids[0]);
+      ensure(nested && nested.jobId === j.id && nested.capability === child.skillCapability &&
+        nested.bindingFingerprint === child.dependencyFingerprint && nested.result?.status === 'pass' &&
+        !nested.result.blocking, '子任务引用技能未按固定能力版本真实完成');
+    }
+    j.result = r; j.status = 'done';
+    j.timing ??= { leasedAt: '' }; j.timing.completedAt = new Date().toISOString();
+    event(s, `${child.key} 技能子任务 ${r.status}；结果返回 ${parent.id}`);
+    return;
+  }
+  ensure(j.action !== 'repair-receipt', '独立回执修复只能通过原任务的修订链收取');
   const allowed: Record<Action, string[]> = {
     claim: ['claimed'], plan: ['planned'], 'plan-check': ['pass', 'changes'], implement: ['implemented', 'replan'],
+    'author-review': ['reviewed'],
     'self-standards': ['reviewed'], 'self-spec': ['reviewed'], verify: ['pass', 'fail'], publish: ['published'],
-    'review-lens': ['reviewed'], confirm: ['confirmed'], adjudicate: ['confirmed'], 'review-report': ['posted'],
+    'pr-review': ['reviewed'], 'review-lens': ['reviewed'], confirm: ['confirmed'], adjudicate: ['confirmed','resolved'], 'review-report': ['posted'],
     accept: ['ready', 'gap', 'conflict', 'waiting_ci', 'needs_human', 'blocked'], integrate: ['implemented', 'replan'],
     replan: ['planned'], merge: ['merged', 'waiting_merge'], close: ['closed'], cleanup: ['cleaned'],
     'spec-audit': ['complete', 'needs_closeout', 'waiting_human', 'blocked'], 'spec-close': ['closed'],
+    'skill-child': ['completed', 'failed'], 'repair-receipt': [],
   };
   if (r.complete) ensure(allowed[j.action].includes(r.status), `${j.action} 不接受完成状态 ${r.status}；跳过不能算通过`);
   const t = j.ticket === '$spec' ? undefined : ticket(s, j.ticket);
@@ -321,17 +994,18 @@ export function submit(s: State, id: string, r: Result) {
   j.result = r; j.status = 'done';
   j.timing ??= { leasedAt: '' }; j.timing.completedAt = new Date().toISOString();
   if (!r.complete) {
-    if (t) { t.phase = 'blocked'; t.reason = `${j.action}: ${r.status}`; }
+    if (t) recordFailure(s, t, { id: `${j.id}:model`, category: 'model', reason: `${j.action}: ${r.status}`,
+      jobId: j.id, next: 'replan', invariant: true });
     else if (!paused) s.status = 'blocked';
     event(s, `${j.action} 未完整执行，不能视为通过`); return;
   }
   const live = t?.pr ? s.facts.prs[String(t.pr)] : undefined;
   if (t && !['claim', 'plan', 'plan-check', 'replan', 'cleanup', 'close', 'merge', 'implement', 'integrate'].includes(j.action) &&
-      (s.facts.base !== j.base || (['review-lens', 'confirm', 'adjudicate', 'review-report', 'accept'].includes(j.action) && live?.state === 'OPEN' && live.head !== j.head))) {
+      (s.facts.base !== j.base || (['pr-review', 'review-lens', 'confirm', 'adjudicate', 'review-report', 'accept'].includes(j.action) && live?.state === 'OPEN' && live.head !== j.head))) {
     t.phase = 'blocked'; t.reason = 'stale'; event(s, `${j.action} 完成时版本已变，不能保留通过结论`); return;
   }
   if (t && !['claim', 'plan', 'plan-check', 'replan', 'cleanup', 'close'].includes(j.action)) {
-    ensure(r.base === j.base && !!r.head, '结果必须绑定派发时的 head/base');
+    ensure(!!r.base && !!r.head && (j.action === 'integrate' ? [j.base, s.facts.base].includes(r.base) : r.base === j.base), '结果必须绑定派发时或已观测的集成 head/base');
     if (!['implement', 'integrate'].includes(j.action)) ensure(r.head === j.head, '只读阶段不能更换候选 SHA');
   }
   const data = r.data || {};
@@ -346,65 +1020,174 @@ export function submit(s: State, id: string, r: Result) {
       t.planPath = String(data.planPath); t.checksPath = String(data.checksPath); t.phase = 'plan_check'; break;
     case 'plan-check':
       ensure(t, '缺少工单');
-      if (r.status === 'pass') { if (data.checksPath) t.checksPath = String(data.checksPath); t.phase = 'implement'; }
-      else problem(s, t, String(data.reason || '计划尚未满足验收'), 'plan'); break;
+      if (r.status === 'pass') { if (data.checksPath) t.checksPath = String(data.checksPath); t.acceptanceGap = undefined; t.phase = 'implement'; }
+      else problem(s, t, String(data.reason || '计划尚未满足验收'), 'plan', 'semantic', j.id); break;
     case 'implement': case 'integrate':
       ensure(t, '缺少工单');
-      if (r.status === 'replan') { problem(s, t, String(data.reason || '实现边界改变'), 'replan'); break; }
+      if (r.status === 'replan') {
+        ensure(r.handoffPath && typeof data.reason === 'string' && data.reason.trim(), '重规划必须交接真实候选和原因');
+        problem(s, t, data.reason, 'replan', 'semantic', j.id);
+        t.head = r.head!; t.base = r.base!; t.pendingPushHead = r.head!;
+        if (j.action === 'integrate') t.integrationHead = r.head!;
+        break;
+      }
       ensure(r.status === 'implemented' && r.handoffPath, '代码修改后必须交接，再进行作者自检');
-      resetCandidate(t, r.head!, r.base!, s.validationOwner === t.key ? 'self' : 'queued'); enqueue(s, t);
+      resetCandidate(t, r.head!, r.base!, s.validationOwner === t.key ? authorReview ? 'verify' : 'self' : 'queued'); enqueue(s, t);
+      if (authorReview) {
+        t.authorReview=authorReview;
+        t.evidence.self={head:t.head,base:t.base,path:authorReview.evidencePath};
+      }
+      t.pendingPushHead = r.head!;
+      if (j.action === 'integrate') t.integrationHead = r.head!;
       if (data.visualEvidence) t.evidence.visual = { head: t.head, base: t.base, path: String(data.visualEvidence) }; break;
+    case 'author-review':
+      ensure(t && r.status==='reviewed', '作者自检需要完整结果');
+      if(!authorReview) {
+        problem(s,t,String(data.reason || '作者自检要求修改当前候选'),'implement','semantic',j.id);
+        break;
+      }
+      t.authorReview=authorReview; t.evidence.self={head:t.head,base:t.base,path:authorReview.evidencePath};
+      t.phase='verify'; break;
     case 'self-standards': case 'self-spec':
       ensure(t && Array.isArray(r.findings), '双轴自检必须分别返回完整 findings（允许空数组）'); advanceGroups(s, t); break;
     case 'verify':
       ensure(t, '缺少工单');
-      if (r.status === 'pass') { t.evidence.tests = evidence(); t.phase = 'publish'; }
-      else problem(s, t, String(data.failureSignature || r.status), 'implement'); break;
+      if (r.status === 'pass') {
+        t.evidence.tests = { ...evidence(),
+          prHead: typeof data.prHead === 'string' ? data.prHead : null,
+          targetBase: typeof data.targetBase === 'string' ? data.targetBase : t.base,
+          testedHead: typeof data.testedHead === 'string' ? data.testedHead : t.head,
+          testedTree: typeof data.testedTree === 'string' ? data.testedTree : undefined,
+          integrationHead: t.integrationHead || null };
+        t.phase = 'publish';
+      }
+      else problem(s, t, String(data.failureSignature || r.status), 'implement', 'test', j.id); break;
     case 'publish':
       ensure(t && freshEvidence(t, 'tests') && freshEvidence(t, 'self'), '发布前需要同候选的自检与测试');
       ensure(!t.visual || freshEvidence(t, 'visual'), '适用视觉检查缺失');
       ensure(Number(data.pr) > 0 && data.commentUrl, '需要 PR 以及作者完成评论');
-      t.pr = Number(data.pr); t.phase = 'review'; t.epoch++; break;
+      t.pr = Number(data.pr); t.pendingPushHead = undefined; t.phase = 'review'; t.epoch++; break;
+    case 'pr-review':
+      ensure(s.protocol === currentProtocol && t && ['review', 'fresh'].includes(t.phase), 'PR 审查不属于当前轮次');
+      break;
     case 'review-lens': ensure(Array.isArray(r.findings), '每一路审查必须明确返回 findings'); break;
     case 'confirm': case 'adjudicate':
+      if(j.action==='adjudicate' && s.protocol===currentProtocol) {
+        const disagreement=t && activeReviewDisagreement(s,t);
+        ensure(t && disagreement && t.phase==='fresh' && j.fresh && j.contextObservation?.mode==='new' &&
+          r.status==='resolved' && typeof data.blocking==='boolean' &&
+          typeof data.rationale==='string' && data.rationale.trim() &&
+          Array.isArray(data.skillRuleRefs) && data.skillRuleRefs.length>0 &&
+          data.skillRuleRefs.every(x=>typeof x==='string' && x.trim()) &&
+          data.disagreementId===disagreement.id &&
+          data.regularInvocationId===disagreement.regularInvocationId &&
+          data.freshInvocationId===disagreement.freshInvocationId &&
+          data.skillFingerprint===disagreement.skillFingerprint,
+          'L1 裁决必须绑定原始两轮、当前候选、技能规则并说明阻断依据');
+        disagreement.adjudicationJobId=j.id;disagreement.outcomeBlocking=data.blocking;
+        t.reviewDisagreementId=undefined;
+        if(data.blocking)problem(s,t,`L1 裁决要求修复：${String(data.rationale)}`,'implement','semantic',j.id);
+        else {t.evidence.fresh={...disagreement.freshEvidence,adjudicationId:j.id};t.phase='accept';}
+        break;
+      }
       ensure(Array.isArray(r.findings) && r.findings.length === 1, '逐项独立核实必须返回一个问题');
       ensure(r.findings[0].id === j.part, '复核必须保留原问题身份');
       r.findings[0].identity = j.finding?.identity;
       r.findings[0].sources = j.finding?.sources;
-      ensure(Number.isFinite(r.findings[0].confidence) && r.findings[0].confidence! >= 0 && r.findings[0].confidence! <= 100, '缺少 0–100 置信评分');
+      validateHistoricalConfirmation(r.findings[0]);
       if (j.action === 'adjudicate') ensure(r.findings[0].assessment?.rationale, '裁决必须解释同候选判定分歧，不能用重复抽样代替证据');
-      ensure(r.findings[0].confidence! < 50 || r.findings[0].confirmed === true, '>=50 的问题必须被独立证据确认'); break;
+      break;
     case 'review-report': {
-      ensure(t && data.commentUrl && r.handoffPath, '审查必须留下完成评论和持久交接');
+      ensure(t && data.commentUrl, '审查必须留下完成评论');
+      if (s.protocol === currentProtocol) {
+        const review = jobsAt(s, t, 'pr-review').find(x => x.status === 'done' && x.result?.complete);
+        const ids = review?.result?.data?.skillInvocationIds;
+        const invocation = Array.isArray(ids) && ids.length === 1 ? s.v3?.skillInvocations.find(i => i.id === ids[0]) : undefined;
+        ensure(review && invocation && invocation.jobId === review.id && invocation.capability === 'prReview' &&
+          invocation.result && ['pass', 'changes_required'].includes(invocation.result.status) &&
+          invocation.bindingFingerprint === s.v3?.skillBindings?.find(b => b.capability === 'prReview')?.fingerprint &&
+          invocation.candidateVersion === candidateVersion(s, t) &&
+          data.reviewInvocationId === invocation.id && r.evidencePath === invocation.result.rawOutputPath,
+          '报告与本轮 prReview 调用、候选或技能版本不一致');
+        const completed: Evidence = { ...evidence(), path: invocation.result.rawOutputPath,
+          skillFingerprint: invocation.bindingFingerprint, skillInvocationId: invocation.id,
+          rawReportSha256: invocation.result.rawOutputSha256, commentUrl: String(data.commentUrl) };
+        if(t.phase==='review') {
+          if(invocation.result.blocking)problem(s,t,`prReview 阻断：${invocation.id}`,'implement','semantic',j.id);
+          else {t.evidence.regular=completed;t.phase='fresh';t.epoch++;}
+        } else {
+          ensure(t.phase==='fresh' && currentReviewEvidence(s,t,'regular') &&
+            t.evidence.regular!.skillFingerprint===completed.skillFingerprint &&
+            review?.fresh && review.contextObservation?.mode==='new',
+            'fresh 必须独立完成且与 regular 使用同一候选及技能版本');
+          const regular=s.v3?.skillInvocations.find(i=>i.id===t.evidence.regular!.skillInvocationId);
+          ensure(regular?.result,'regular 审查缺少技能原始结论');
+          if(regular.result.blocking!==invocation.result.blocking) {
+            const id=`review-disagreement:${invocation.id}`;
+            ensure(!s.v3?.reviewDisagreements?.some(d=>d.id===id),'审查分歧事件重复');
+            const disagreement:ReviewDisagreement={id,ticket:t.key,head:t.head,base:t.base,
+              candidateVersion:candidateVersion(s,t),skillFingerprint:invocation.bindingFingerprint,
+              regularInvocationId:regular.id,freshInvocationId:invocation.id,
+              regularBlocking:regular.result.blocking,freshBlocking:invocation.result.blocking,
+              freshEvidence:completed,at:new Date().toISOString()};
+            s.v3!.reviewDisagreements??=[];s.v3!.reviewDisagreements.push(disagreement);
+            t.reviewDisagreementId=id;
+            event(s,`${t.key} 同候选同技能版本 regular/fresh 阻断结论分歧；交独立 L1 裁决`);
+          } else if(invocation.result.blocking)problem(s,t,`prReview 阻断：${invocation.id}`,'implement','semantic',j.id);
+          else {t.evidence.fresh=completed;t.phase='accept';}
+        }
+        break;
+      }
       const cs = jobsAt(s, t, 'confirm').flatMap(x =>
         (jobsAt(s, t, 'adjudicate').find(d => d.part === x.part)?.result || x.result)?.findings || []);
-      const blockers = cs.filter(f => f.confidence! >= 50);
-      if (blockers.length) problem(s, t, blockers.map(f => f.description).sort().join('|'), 'implement');
+      const blockers = cs.filter(historicalBlocking);
+      if (blockers.length) problem(s, t, blockers.map(f => f.description).sort().join('|'), 'implement', 'semantic', j.id);
       else if (t.phase === 'review') { t.evidence.regular = evidence(); t.phase = 'fresh'; t.epoch++; }
       else { ensure(t.phase === 'fresh', '非审查阶段'); t.evidence.fresh = evidence(); t.phase = 'accept'; }
       break;
     }
     case 'accept':
-      ensure(t && freshEvidence(t, 'regular') && freshEvidence(t, 'fresh'), '验收前必须完成 regular 和 fresh 审查');
+      ensure(t && matchingReviews(s, t), '验收前必须完成同候选、同技能版本的 regular 和 fresh 审查');
+      ensure(live?.state === 'OPEN' && !live.draft && live.head === t.head && live.base === t.base &&
+        live.baseRef === s.inputs.targetBranch && s.facts.base === t.base,
+        '验收必须核对远端当前 PR head/base 与指定目标分支');
       if (r.status === 'ready') {
         ensure(Array.isArray(data.satisfiedCriteria) && t.criteria.every(c => (data.satisfiedCriteria as Json[]).includes(c)), 'issue 验收条件未全部满足');
+        ensure(s.protocol !== currentProtocol || !!t.evidence.tests?.testedTree &&
+          t.evidence.tests.testedHead === t.head && t.evidence.tests.targetBase === t.base,
+          '验收需要当前候选和目标基线的实际测试树');
         t.evidence.accept = evidence();
-        if (live?.mergeable === 'CONFLICTING') problem(s, t, '目标分支存在冲突', 'integrate');
+        if (live?.mergeable === 'CONFLICTING') problem(s, t, '目标分支存在冲突', 'integrate', 'semantic', j.id);
         else if (!live || !ciAllowed(live, r)) { t.phase = 'blocked'; t.reason = 'waiting_ci'; }
         else t.phase = 'merge';
       } else if (r.status === 'gap') {
-        ensure(data.planPath, '验收缺口必须附 L2 补充计划'); t.planPath = String(data.planPath); problem(s, t, String(data.reason || '验收缺口'), 'plan_check');
-      } else if (r.status === 'conflict') { problem(s, t, '需要集成目标分支', 'integrate'); }
+        const missing = data.missingCriteria;
+        ensure(data.planPath && Array.isArray(missing) && missing.length > 0 &&
+          missing.every(c => typeof c === 'string' && t.criteria.includes(c)),
+          '验收缺口必须指明 issue 条件与 L2 补充计划');
+        t.acceptanceGap = { head: t.head, base: t.base, evidencePath: r.evidencePath,
+          planPath: String(data.planPath), reason: String(data.reason || '验收缺口'), missingCriteria: missing.map(String) };
+        problem(s, t, t.acceptanceGap.reason, 'replan', 'semantic', j.id);
+      } else if (r.status === 'conflict') { problem(s, t, '需要集成目标分支', 'integrate', 'semantic', j.id); }
       else if (r.status === 'waiting_ci') { t.phase = 'blocked'; t.reason = 'waiting_ci'; }
       else { t.phase = 'blocked'; t.reason = String(data.reason || r.status); }
       break;
     case 'replan':
       ensure(t && data.planPath && data.checksPath, '独立 L1 重规划需要计划与验证清单');
-      t.planPath = String(data.planPath); t.checksPath = String(data.checksPath); t.escalations++; t.stalls = 0; t.round = 0; t.baseInvalidations = 0;
+      if (t.acceptanceGap) ensure(data.gapEvidencePath === t.acceptanceGap.evidencePath &&
+        typeof data.scopeDecision === 'string' && data.scopeDecision.trim() &&
+        typeof data.testBoundary === 'string' && data.testBoundary.trim(),
+        'L2 验收缺口须经独立 L1 确认补充范围和测试边界');
+      t.planPath = String(data.planPath); t.checksPath = String(data.checksPath); t.escalations++;
+      t.baseInvalidations = 0;
       t.phase = 'plan_check'; t.epoch++; break;
     case 'merge':
       if (r.status === 'waiting_merge') { ensure(t, '缺少工单'); t.phase = 'blocked'; t.reason = 'waiting_merge'; break; }
-      ensure(t && s.facts.prs[String(t.pr)]?.state === 'MERGED', '尚未观察到远端 PR MERGED');
+      ensure(t && s.facts.prs[String(t.pr)]?.state === 'MERGED' &&
+        s.facts.prs[String(t.pr)].head === t.head &&
+        s.facts.prs[String(t.pr)].baseRef === s.inputs.targetBranch &&
+        (s.protocol !== currentProtocol || !!s.facts.prs[String(t.pr)].mergedHead),
+        '尚未观察到预期候选合入指定目标分支');
       t.phase = t.closeout ? 'done' : 'close'; break;
     case 'close': ensure(t && s.facts.issueStates[String(t.number)] === 'CLOSED', '远端 issue 尚未关闭'); t.phase = 'cleanup'; break;
     case 'cleanup': ensure(t && s.facts.issueStates[String(t.number)] === 'CLOSED' && s.facts.prs[String(t.pr)]?.state === 'MERGED', '清理必须同时满足 MERGED + CLOSED'); t.cleaned = true; t.phase = 'done'; break;
@@ -413,14 +1196,35 @@ export function submit(s: State, id: string, r: Result) {
       if (r.status === 'needs_closeout') {
         ensure(s.tickets.every(t => t.phase === 'done' || t.phase === 'human'), '仍有未完成的自动工单，不能用收尾 PR 绕过依赖');
         if (s.tickets.filter(t => t.closeout).length >= s.policy!.rounds) { s.status = 'blocked'; event(s, 'Spec 收尾达到 L1 设定的轮次上限，需要重新判断未收敛原因'); break; }
-        ensure(data.planPath && Array.isArray(data.remainingCriteria), '收尾需要现有 spec 内的明确缺口');
+        ensure(data.planPath && Array.isArray(data.remainingCriteria) && data.remainingCriteria.length > 0 &&
+          data.remainingCriteria.every(c => typeof c === 'string' && s.specCriteria.includes(c)),
+          '收尾需要现有 spec 内的明确缺口');
         const task = buildTicket({ number: s.spec, kind: 'software', dependencies: [], criteria: data.remainingCriteria.map(String), visual: data.visual === true }, s.facts.base, true);
         task.key = `spec-final-${s.auditEpoch}`; task.planPath = String(data.planPath); s.tickets.push(task); s.specAudit = undefined; s.auditEpoch++;
-      } else if (r.status === 'waiting_human') { ensure(data.humanHandoffUrl, '人工阶段需要现有 issue/spec 上的交接记录'); s.status = 'waiting_human'; }
+      } else if (r.status === 'waiting_human') {
+        ensure(data.humanHandoffUrl && (s.protocol !== currentProtocol ||
+          Array.isArray(data.pendingCriteria) && data.pendingCriteria.length > 0 &&
+          typeof data.resumeCommand === 'string' && data.resumeCommand.trim()),
+          '人工阶段需要待验条件、现有 issue/spec 交接记录和恢复入口');
+        ensure(s.facts.issueStates[String(s.spec)] === 'OPEN' &&
+          s.tickets.filter(x => x.kind === 'human').every(x => s.facts.issueStates[String(x.number)] !== 'CLOSED' || x.phase === 'done'),
+          '人工缺口未完成时必须保持相关 issue 和父 spec 打开');
+        ensure(s.tickets.filter(x => x.kind === 'software' && x.phase !== 'done').every(x =>
+          x.dependencies.some(n => s.tickets.some(h => h.number === n && h.kind === 'human' &&
+            s.facts.issueStates[String(n)] !== 'CLOSED'))),
+          '有未完成的技术工作或非人工前置，不能标为等待人工验收');
+        s.status = 'waiting_human';
+      }
       else if (r.status !== 'complete') s.status = 'blocked';
       else {
         ensure(s.tickets.every(t => t.phase === 'done'), '仍有未完成工单时不能关闭 spec');
-        ensure(!s.tickets.some(t => t.phase === 'human' && s.facts.issueStates[String(t.number)] !== 'CLOSED'), '未完成人工工单时不能关闭 spec');
+        ensure(s.tickets.every(t => t.kind !== 'software' || !t.pr ||
+          s.facts.prs[String(t.pr)]?.state === 'MERGED' &&
+          s.facts.prs[String(t.pr)].baseRef === s.inputs.targetBranch &&
+          (t.closeout || s.facts.issueStates[String(t.number)] === 'CLOSED')),
+          '最终审计须核对每个软件 PR 合入指定目标且关联 issue 已关闭');
+        ensure(!s.tickets.some(t => t.kind === 'human' && s.facts.issueStates[String(t.number)] !== 'CLOSED'),
+          '未完成人工工单时不能关闭 spec');
         ensure(Array.isArray(data.satisfiedCriteria) && s.specCriteria.every(c => (data.satisfiedCriteria as Json[]).includes(c)), 'spec 条件必须全部满足，包括迁移到父 spec 的人工条件');
       }
       break;
@@ -428,6 +1232,19 @@ export function submit(s: State, id: string, r: Result) {
       ensure(s.specAudit?.status === 'complete' && s.specAudit.base === s.facts.base && j.base === s.facts.base, 'spec 验收已过期，需要新 L1 重新验收');
       ensure(s.facts.issueStates[String(s.spec)] === 'CLOSED', 'spec 尚未关闭'); s.status = 'complete';
       for (const x of s.tickets) if (x.closeout && x.worktree && !x.cleaned) { x.phase = 'cleanup'; s.status = 'running'; } break;
+  }
+  if (s.protocol === currentProtocol && j.executor === 'agent' && j.tier === 'L1' && r.complete) {
+    const kind = ({ plan: 'ticket-plan', 'plan-check': 'plan-check', replan: 'replan', adjudicate: 'adjudication', 'spec-audit': 'spec-audit' } as Partial<Record<Action, L1DecisionRecord['kind']>>)[j.action];
+    if (kind && (j.action !== 'plan-check' || r.status === 'pass')) {
+      ensure(j.session && j.decisionArtifactDigest && j.decisionArtifactFiles?.length, 'L1 决策缺少原生会话或决策产物指纹');
+      recordL1Decision(s, { id: j.id, kind, scope: t?.key || '$spec', inputVersion: inputVersion(s),
+        sourceVersion: s.planSourceVersion,
+        candidateVersion: j.candidateVersion!, appliesToCandidateVersion:
+          j.action==='adjudicate' && s.protocol===currentProtocol ? j.candidateVersion! : candidateVersion(s, t),
+        artifactPath: r.evidencePath, artifactFiles: j.decisionArtifactFiles,
+        artifactDigest: j.decisionArtifactDigest,
+        session: j.session, at: new Date().toISOString() });
+    }
   }
   if (paused) s.status = 'paused';
   event(s, `${j.ticket} · ${j.action} → ${r.status}`);
@@ -439,8 +1256,12 @@ export function reconcileFacts(s: State, facts: LiveFacts) {
   if (s.status === 'retired') return;
   if (s.specAudit && s.specAudit.base !== facts.base) { s.specAudit = undefined; s.auditEpoch++; }
   for (const t of s.tickets) {
+    if (t.kind === 'human' && t.phase === 'done' && facts.issueStates[String(t.number)] === 'OPEN') {
+      t.phase = 'human'; s.specAudit = undefined; s.auditEpoch++;
+      if (s.status === 'complete') s.status = 'running';
+    }
     if (t.phase === 'human' && facts.issueStates[String(t.number)] === 'CLOSED') t.phase = 'done';
-    if (['done', 'human', 'cleanup', 'close'].includes(t.phase) || s.jobs.some(j => j.ticket === t.key && busy(j))) continue;
+    if (['done', 'human', 'cleanup', 'close', 'recovery'].includes(t.phase) || s.jobs.some(j => j.ticket === t.key && busy(j))) continue;
     const p = facts.prs[String(t.pr)];
     if (p?.state === 'MERGED') {
       const intended = s.jobs.some(j => j.ticket === t.key && j.action === 'merge' && j.head === p.head && j.nativeId);
@@ -450,8 +1271,10 @@ export function reconcileFacts(s: State, facts: LiveFacts) {
       t.phase = t.closeout ? 'done' : facts.issueStates[String(t.number)] === 'CLOSED' ? 'cleanup' : 'close'; continue;
     }
     if (p?.state === 'CLOSED') { t.phase = 'blocked'; t.reason = 'PR 已关闭但未合并，保留资源'; continue; }
-    if (p && p.head !== t.head && (['review', 'fresh', 'accept', 'merge'].includes(t.phase) || t.reason === 'stale')) {
-      resetCandidate(t, p.head, facts.base, 'integrate'); t.reason = '已发布候选被外部更新；先同步再验证';
+    if (p && p.head !== t.head && t.pendingPushHead !== t.head &&
+        (['review', 'fresh', 'accept', 'merge'].includes(t.phase) || t.reason === 'stale')) {
+      resetCandidate(t, p.head, facts.base, 'integrate'); t.pendingPushHead = undefined;
+      t.reason = '已发布候选被外部更新；先同步再验证';
     }
     else if (t.base !== facts.base) {
       if (!t.worktree) { resetCandidate(t, t.head, facts.base, 'claim'); }
@@ -467,7 +1290,8 @@ export function reconcileFacts(s: State, facts: LiveFacts) {
     }
     if (t.phase === 'blocked' && t.reason === 'waiting_ci' && p && ciAllowed(p)) { t.phase = 'accept'; t.epoch++; }
     if (t.phase === 'blocked' && t.reason === 'waiting_ci' && p?.checks.some(c=>c.status==='failed')) {
-      problem(s,t,`CI 执行失败：${p.checks.filter(c=>c.status==='failed').map(c=>c.id).sort().join(',')}`,'implement');
+      const failed = p.checks.filter(c=>c.status==='failed').map(c=>c.id).sort().join(',');
+      recordFailure(s, t, { id: `ci:${t.key}:${p.head}:${failed}`, category: 'ci', reason: `CI 执行失败：${failed}`, next: 'implement' });
     }
     if (t.phase === 'merge' && p?.mergeable === 'CONFLICTING') resetCandidate(t, t.head, facts.base, 'integrate');
   }
@@ -477,7 +1301,7 @@ export function reconcileFacts(s: State, facts: LiveFacts) {
   }
   if (s.specAudit?.status === 'complete' && facts.issueStates[String(s.spec)] === 'CLOSED') {
     for (const t of s.tickets) if (t.closeout && t.worktree && !t.cleaned && t.phase === 'done') {
-      t.phase = 'cleanup'; if (s.status !== 'paused') s.status = 'running';
+      t.phase = 'cleanup'; if (!['paused','waiting_human','retired'].includes(s.status)) s.status = 'running';
     }
   }
   if (s.status === 'running' && !s.jobs.some(busy) && s.specAudit?.status === 'complete' && facts.issueStates[String(s.spec)] === 'CLOSED' && s.tickets.every(t => t.phase === 'done')) s.status = 'complete';

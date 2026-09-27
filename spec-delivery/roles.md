@@ -1,6 +1,6 @@
 # 角色与派发规则
 
-本文件是宿主消费核心派发 job 时使用的角色契约。先读共同约束，再按 `action` 读取自己的角色与结果字段。使用 job 中的实际 `model`、`fresh`、`contextKey` 和 `packet`；行动范围限于已选 spec 与目标仓库有效规则。
+本文件是宿主消费核心派发 job 时使用的角色契约。先读共同约束，再按 `action` 读取自己的角色与结果字段。job 的 `model` 是请求值；实际身份必须由宿主原生会话观测验证。行动范围限于已选 spec 与目标仓库有效规则。
 
 ## 所有角色的共同约束
 
@@ -13,15 +13,23 @@
 - spec/issue 的 GitHub 来源已经明确；没有 Matt 专用的 `docs/agents/issue-tracker.md` 时继续使用这些来源，不因此要求用户重新配置需求系统。
 - 测试、构建和重型实验按 README 的 `test` 命令取得实际配额，保存退出码与日志；`testBatches:0` 表示尚未取得配额。预算不足时等待。所有技能涉及的子 agent 由核心派发，实验不能另走未登记的 shell。
 
-## L1 主控：调度与认领授权
+绑定技能的调用遵循 packet 中的 `skillBindings`。执行者由宿主先绑定真实 session，再使用 `skill-start` 取得本次能力、版本和实际模式；`native_explicit` 调宿主明确支持的技能入口，`source_execution` 动态加载归档中的原 `SKILL.md` 及资源。不得改写技能文件、改变宿主全局自动调用设置、把源码加载称为原生调用，或仅凭读到技能文本便声称专业步骤完成。真正缺少调用能力时报告具体工具缺口。
 
-主控必须实际使用用户选定的 L1。只向用户收集 spec、目标分支和三个模型，仓库从 cwd 自动识别；其它资源与循环配置由 L1 根据能力、负载和仓库规则自主决定。
+实际调用结束后保留原始输出和专业证据，由执行者给出 `pass`、`changes_required`、`incomplete` 或 `skipped` 及阻断结论，宿主将真实执行身份/模式写入回执并使用 `skill-finish` 收取。外围只整理引用，不能补造发现或评分。完整实现回执必须在 `data.skillInvocationIds` 引用已完成的实现或诊断技能及原始 handoff 技能调用；未完成、跳过、空白或缺失产物均不能满足门禁。若技能或依赖指纹变化，先由维护者显式迁移并重取受影响证据。
+
+技能需要专业子任务时，以 `skill-delegate` 按当前父调用登记稳定 key、角色 tier、明确指令及独立上下文要求。由核心的 `next` 和宿主 `dispatch` 按同一预算执行；技能从 `skill-continue` 读取每项结果后可继续请求后续子任务。子 actor 只执行 packet 的 `skillChild.instruction`，返回 `completed`、`failed` 或 `incomplete` 和真实证据；引用另一技能时先按 `skillChild.skillCapability` 通过绑定调用并在 `data.skillInvocationIds` 附其完成 ID。失败子任务由父调用显式 `skill-retry`，不得私下另派 actor。父宿主中断时，先对账停机，再由新 actor 按 packet 的 `skillResume` 续接原技能调用与已完成子结果。
+
+## 主会话转发与 L1 决策
+
+宿主主会话可使用与 L1 不同的模型。它向用户收集 spec、目标分支和三个模型，从 cwd 识别仓库，转发任务、展示状态，并执行 CLI 已授权的确定性动作。主会话身份被记录为宿主观测值或 `unknown`，绝不充当 L1 决策证明。
+
+配置的真实 L1 会话决定完整执行图、资源策略、每票计划及独立计划复核；重规划、跨轮裁决和最终审计也须由对应 L1 job 完成。宿主须用原生查询适配器取得每个模型 actor 的 provider、model、nativeId 与观测证据。配置字符串、persona、角色提示或 actor 自述不能替代观测。缺失或不匹配时 CLI 拒绝绑定与采用回执。若宿主不能限制角色工具权限，应报告此能力缺口；本文提示约束不构成强工具隔离。
 
 获取完整 spec/sub-issues，建立 blocked DAG；核对现有认领、PR、worktree和活动任务，确认某工单技术前置满足后才认领。计划完成、PR已开或review通过本身不解除依赖。不得覆盖其它执行者的有效认领。
 
 为每个候选保存需求与验收映射。根据目标仓库规则创建或复用隔离工作区，继续旧工作区前检查未提交/未推送变化并同步必要远端信息。
 
-状态转换通过 CLI 串行提交。主控按真实活动 jobs/native runs 预留资源；ZCode 同批 actors 各自计入预算，真正完成即收取，不等批次屏障。未确认终态和进程退出前不释放预算。相同工单只有一个写执行者；本运行的目标分支从集成到合并共用一个最终验证队列，队外可计划和实现。认领、关闭和清理由 `drive/execute` 执行。
+状态转换通过 CLI 串行提交。主会话按真实活动 jobs/native runs 预留资源；ZCode 同批 actors 各自计入预算，真正完成即收取，不等批次屏障。未确认终态和进程退出前不释放预算。相同工单只有一个写执行者；本运行的目标分支从集成到合并共用一个最终验证队列，队外可计划和实现。认领、关闭和清理由 `drive/execute` 执行，不计作模型任务。既定策略覆盖的轮询与命令不另行召唤 L1。
 
 每次派发及恢复前 live 核对 GitHub。对认领、评论、PR、合并与关闭预先登记稳定动作ID，执行后保存远端对象ID与结果；响应不确定时先查远端，再补账本，避免中断回放重复操作。
 
@@ -29,11 +37,11 @@
 
 ## 上下文与交接
 
-同模型且宿主支持保留上下文时，按稳定 `contextKey` 继续原执行者。跨模型、跨ZCode run或上下文不可恢复时，通过交接文档恢复，不声称保留了同一物理会话。
+`contextKey` 仅提示宿主路由；是否续接以可信宿主观测中的 contextId、`mode` 与祖先证明为准。作者实现/修复及 regular 各自保留职责内的历史；独立动作必须新建上下文。无法证明续接时启动新会话，在交接核验前不执行该 job 的其它技能或提交结果。
 
-由交出工作的 agent 显式加载并调用宿主可用的 `handoff` 技能，先按技能要求写入 OS 临时目录，记录候选、目标、已完成/未完成、关键判断及理由、失败尝试、未提交变化、待确定外部动作、证据路径和下一步；再将原文副本归档到本次运行的持久目录，以归档路径填写 `handoffPath`。L1核验并转发；接任者读取原始spec、代码、规范和证据后核对当前状态。技能不可用须明确报告，不能声称已经调用。
+由交出工作的 agent 显式加载并调用宿主可用的 `handoff` 技能，先按原技能要求写入 OS 临时目录并列出 suggested skills，引用已有 spec、计划、提交和证据，不复制无关历史或凭据；再由外围逐字归档。L1 用 `context-handoff` 核验原技能调用、来源、当前候选及原文 SHA 后转发引用；接任者从 `contextReferencePath` 读取原文并核对当前状态。技能不可用须明确报告，不能声称已经调用。
 
-实现侧保持计划→实现→修复的判断连续性；regular审查侧保存自己的问题与复核历史。两侧分别交接。原agent已不可恢复时，由L1基于持久化证据重建并标明未知项。
+实现侧保持计划→实现→修复的判断连续性；regular审查侧保存自己的问题与复核历史。两侧分别交接。原 agent 经宿主证实不可恢复时，由 L1 基于持久化证据重建并标明未知项，使用 `context-reconstruct` 留下独立记录，不冒称原 actor 已调用 handoff。
 
 fresh job的全部参与者使用新上下文，初始材料包含原始需求、完整diff、仓库规范和原始测试证据，排除旧review结论和作者的辩解摘要。先独立审查，再核对历史问题去重；fresh不是“不读来源”。恢复旧任务不是fresh。
 
@@ -55,7 +63,7 @@ packet 内联当前有限索引，历史结果通过 `historyIndexPath` 按需�
 
 由L1在spec范围内确认TDD测试边界，不为每个常规测试再次询问用户。涉及改变原需求、未知现场事实或真正无法代替的决定时，返回具体缺口。
 
-计划完成后，宿主安排新的L1上下文进行计划复核；复核者实际读计划涉及的代码，寻找遗漏、矛盾及无法验收之处。存在保留问题先修订计划，再进入实现。计划和复核作为显式jobs计入预算。
+计划完成后，宿主安排另一原生 L1 会话进行计划复核；复核者实际读计划涉及的代码，寻找遗漏、矛盾及无法验收之处。两个 job 的原生会话 ID 与观测 ID 必须不同。存在保留问题先修订计划，再进入实现。计划和复核作为显式 jobs 计入预算，产物指纹及输入/候选版本写入 L1DecisionRecord。
 
 ## 实现与修复 — L3
 
@@ -65,17 +73,13 @@ TDD在已约定seam上进行。测试范围以目标仓库有效规范和任务�
 
 涉及界面、图像结果、布局或交互时，运行相应窗口/场景并实际查看截图或结果，记录候选、尺寸、状态与运行方式。自动化或模拟检查不能代替现场实物验收。
 
-实现和每轮修复完成后，调用作者 `code-review` 的双轴自检契约；由核心派发同级L3审查jobs。诊断技能本身没有结束后调用 `code-review` 的规定，本流程统一补上。
+`implement` 内部要求的 `/code-review` 应在已提交候选上通过 `skill-delegate` 调用当前 `authorReview` 绑定，保留该调用及其真实子结果；外层实现回执只引用实现/诊断与 handoff 技能 ID。有效的内嵌作者自检由门禁直接复用。`diagnosing-bugs` 若未内嵌审查，实现完成后由一个 `author-review` job 调用绑定技能。技能的专业方法和独立子任务要求见其固定版本，核心不额外派发固定双轴任务。
 
 根据自检和后续验证结果修复问题，生成连续性的handoff，交给发布阶段。实现者不执行PR合并或提前关闭工单。
 
-## 作者自检 — L3 的两个独立审查者
+## 作者自检 — 已绑定技能
 
-**Standards**：核对完整候选diff、提交列表、适用规范和 `code-review` 的设计启发规则；规范违规与设计判断分开陈述，引用规则和代码。
-
-**Spec**：读取原始工单/spec，检查遗漏、不完整、超范围及实现错误；逐项引用验收要求与代码。缺spec或无法完成该轴时明确阻断，不将另一轴通过当全部通过。
-
-两轴使用独立上下文并分别报告。作者自检不替代L2独立review，也没有自动套用另一技能的置信度门槛。
+作者自检收到当前 issue URL、提交 SHA、固定比较点、已批准的计划/检查范围和仓库规范来源候选。默认版本化 `code-review` 技能负责 Standards、Spec 两个独立轴及报告；替代技能可采用不同方法。外围只校验当前候选、来源与技能版本、完整执行结果及明确的阻断结论。旧来源或未完成结果不能进入验证。
 
 ## 验证 — 纯命令 job
 
@@ -91,31 +95,23 @@ TDD在已约定seam上进行。测试范围以目标仓库有效规范和任务�
 
 按主控分配的稳定动作ID发布进度评论；已有PR或评论优先核对并更新，避免重试重复创建。完成后交接当前head与待审范围，不合并PR。
 
-## 独立 review — L2 显式审查 jobs
+## PR 独立审查 — L2 绑定技能
 
-按 `code-review-from-claude` 的判断与置信度规则工作。五个视角分别是：仓库规范、明显bug、Git历史/blame、相关旧PR讨论、代码注释约束。每个视角由同级L2 job独立执行，随后由显式L2确认jobs逐条复核候选问题。
+`pr-review` job 显式调用当前固定版本的 `prReview` 技能。读取绑定包中的 `SKILL.md`、自动化上下文与契约；通过 `skill-delegate` 登记技能要求的子任务，等待必需子任务完成，再以 `skill-finish` 归档宿主终态、原始报告和专业依据。审查方法、子任务拓扑、筛选规则和报告形式由绑定包决定。
 
-派发前显式加载宿主安装的 `code-review-from-claude/SKILL.md`。把该版本第5步的完整 **0/25/50/75/100评分量表逐字**传给每个 `confirm` job，并提供PR、待确认问题及规范文件列表；只说明“≥50要修”不能代替量表。记录技能来源；规则与当前核心阈值不一致时交主控核对，不自行换阈值。
+完整审查以 `status:"reviewed"` 和 `data.skillInvocationIds` 引用一次当前候选、当前技能版本的 `prReview` 调用。技能返回 `pass` 且无阻断时，本轮报告发布后进入下一门禁。regular 阻断时发布原文并交回实现修复；fresh 完成后，外围只比较同候选、同技能版本的两轮阻断结论，一致阻断则修复，结论相反则派新的独立 L1 裁决。即使 regular 没有最终 findings 或只有过滤观察，也依据其完整终态比较。`skipped`、`incomplete`、空报告和缺失宿主回执均不能完成一轮审查。`review-report` 是命令 job：核对原始技能产物后，按稳定标记幂等发布原文；actor 不自行改写报告。
 
-置信度 **≥50** 的问题进入保留列表；50也要处理。这是问题成立的评分，不是严重程度阈值。每条保留问题提供具体触发、影响、当前候选代码位置和证据；历史问题或误报必须给出排除依据。
+regular 可以用真实宿主续接审查侧上下文跟踪修复；fresh 必须使用独立新上下文，从当前 PR diff、工单、规范和测试重新开始，不接收 regular 的结论或作者辩解。两轮证据绑定同一 head/base 和同一技能指纹；候选或技能版本改变就重新取证。审查通过后仍由独立 L2 `accept` 核对工单、CI 和关闭条件。
 
-finding 提供稳定 `identity:{path,rule,trigger}`：仓库相对路径、违反的具体规则/行为、触发条件。仅同一事实使用相同身份；不确定时分开保留。核心合并同身份的多视角发现，保留全部 `sources`，随后独立确认一次。确认记录事实成立性、是否属于本次改动的责任、影响严重程度和评分理由，三者分开判断。
+## 审查分歧裁决 — 独立 L1
 
-复用regular审查侧上下文以跟踪修复；同PR的新head必须可重新审查。“已经审过”、简单PR、自动生成PR、技能跳过或没有评论均不等于通过。
-
-**review-report — L2** 汇总各视角和确认结果，记录当前head/base、审查范围、保留问题、未完成项和明确结论。即使无问题，也必须有完成报告。按稳定动作ID提交有证据的评论。
-
-review发现保留问题时进入L3修复→作者自检→验证→发布→regular复审的main loop。所有角色、包括五路、确认与汇总，在fresh轮次均使用新上下文，对完整当前PR重新审查；不能只看上次问题的修复。
-
-regular收敛后必须fresh通过。fresh发现问题则返回修复，候选变化后重新取得fresh完整审查。通过结论绑定候选，不永久绑定PR编号。
-
-同一 head/base、同一问题在 regular/fresh 的评分跨过 50 门槛时，核心签发 **adjudicate — L1 fresh**。裁决者读取 packet.dispute 中两份结论和原始代码/证据，输出同问题 ID、评分及 `assessment:{factual,responsibility,severity,rationale}`。明确解释分歧；不能靠重抽一次评分或把低严重度当低置信度来消除问题。最终报告采用裁决，≥50 仍返回修复。
+`adjudicate` 的 `packet.reviewDisagreement` 给出两轮原始报告、观察与确认附件、来源归档、候选 SHA、技能指纹和相反阻断结论。先独立读取这些原件与归档技能规则；无法稳定匹配具体问题也必须解释总体阻断差异。输出 JSON 裁决产物，写入 `head`、`base`、`candidateVersion`，以及与 `data` 相同的 `disagreementId`、两个 invocation ID、`skillFingerprint`、布尔 `blocking`、非空 `rationale` 和 `skillRuleRefs`。每条规则引用用归档内的相对文件路径，可附 `#` 片段。回执使用 `status:"resolved"`；阻断则回实现修复，解除分歧则进入 L2 验收。裁决保留两轮原件及 L1 会话指纹，不能代替候选版本、CI、人工或合并门禁。
 
 ## PR独立验收 — L2
 
 在与实现者、reviewer分离的上下文中逐条核对工单验收条件、当前head/base、适用验证、视觉证据、CI、平台合并条件，以及合并后是否足以关闭工单。
 
-未满足spec内条件时，形成补充计划，交L1复核范围与测试边界，再由L3执行；进入sub loop后仍需重新经过main loop和fresh审查。验收通过不是“review无问题”的同义词。
+未满足spec内条件时，回执列出 `data.missingCriteria`（原 issue 条件）、`data.planPath`、原因和当前候选证据。独立 L1 `replan` 须引用 `data.gapEvidencePath`，明确 `data.scopeDecision` 与 `data.testBoundary`，随后独立 `plan-check` 复核，再由L3实现并重走作者自检、验证、regular/fresh审查及验收。验收通过不是“review无问题”的同义词。
 
 CI按下列规则处理，无需逐次请求用户批准：
 
@@ -134,7 +130,7 @@ CI按下列规则处理，无需逐次请求用户批准：
 
 ## 合并与关闭工单 — L2
 
-取得目标分支的合并权后，再live核对候选head/base、当前审查/验收、CI或合法豁免、平台保护和关闭条件。立即合并前调用`guard <state> <jobId>`，通过后使用平台支持的预期head约束合并；guard失败或观察过期就停止，交主控重新调度。
+取得目标分支的合并权后，再live核对候选head/base、当前审查/验收、CI或合法豁免、平台保护和关闭条件。调用 `merge-pr <state> <jobId> <request.json>` 执行平台支持的预期 head 约束合并；请求仅含明确的 merge/squash/rebase 策略。`guard` 可预览当前门禁，实际 `merge-pr` 仍重新读取远端。返回的 Result 通过正常回执入口提交；不能绕过稳定操作 ID 手写成功结果。
 
 操作超时或中断时先查询是否已合并。远端确认 `MERGED` 后，核对目标分支实际提交和工单状态；关闭关键字只表示意图，不能代替状态确认。非默认目标分支未自动关闭issue时，满足条件后明确关闭并记录依据。
 
@@ -192,32 +188,32 @@ CI按下列规则处理，无需逐次请求用户批准：
 }
 ```
 
-`Finding`为`{id,description,evidence,identity?,sources?,assessment?,confidence?,confirmed?,advisory?}`，identity/assessment 见上文独立 review 规则；sources 由核心保留。置信度为0–100数值；`advisory:true`仅用于作者自检的非阻断建议。独立评分必须按技能量表，不能借`advisory`排除≥50问题。
+`Finding`为`{id,description,evidence,identity?,sources?,assessment?,confidence?,confirmed?,advisory?}`。作者自检可用`advisory:true`表示非阻断建议。PR审查的发现、评分与判断保存在绑定技能的原始报告和子任务证据中。
 
 | action | `complete:true`时的`status` | 顶层补充字段及`data` |
 | --- | --- | --- |
 | `claim` | `claimed` | `data:{branch,worktree,head,claimCommentUrl}`；worktree绝对路径，位于当前仓库`.agents/worktrees/` |
 | `plan`、`replan` | `planned` | `data:{planPath,checksPath}`；两者为已存在的计划与验证清单文件；随后由`plan-check`批准 |
 | `plan-check` | `pass`、`changes` | `changes`附`data.reason`；`pass`可用`data.checksPath`提交复核后的清单 |
-| `implement`、`integrate` | `implemented`、`replan` | `implemented`必须有新候选`head/base`与`handoffPath`；适用时`data.visualEvidence`；`replan`附`data.reason` |
-| `self-standards`、`self-spec` | `reviewed` | 顶层`findings`必填，允许空数组；两个轴各自提交 |
+| `skill-child` | `completed`、`failed` | 按 `skillChild` 请求执行；任一状态都保留原始证据；未完成执行使用 `complete:false,status:"incomplete"`；引用技能时 `data.skillInvocationIds` 指向真实通过的调用 |
+| `implement`、`integrate` | `implemented`、`replan` | 两种完成状态都必须有真实已提交候选`head/base`与`handoffPath`；`replan`另附`data.reason`，适用时`data.visualEvidence`；WIP/冲突由工作区恢复入口保全，不报作已验证候选 |
+| `author-review` | `reviewed` | 诊断或来源变化后的单个补审 job；`data.skillInvocationIds` 引用一次真实通过的 `authorReview` 调用 |
 | `verify` | `pass`、`fail` | 由`execute`生成；失败时`data.failureSignature`及原始日志 |
-| `publish` | `published` | `data:{pr,commentUrl}`，pr为正整数；远端必须是当前候选的开放非draft PR |
-| `review-lens` | `reviewed` | 顶层`findings`必填；遵循packet指定的单个lens |
-| `confirm` | `confirmed` | 顶层`findings`恰好一项，保留被派发的问题ID，给出`confidence`和复核证据；≥50须`confirmed:true` |
-| `adjudicate` | `confirmed` | L1 裁决同一候选判定分歧；字段同 confirm，另须完整 assessment，rationale 解释差异 |
-| `review-report` | `posted` | `data.commentUrl`与顶层`handoffPath`必填；由核心根据全部确认结果决定进入修复或下一阶段 |
+| `publish` | `published` | `publish-pr` 返回 `data:{pr,commentUrl,operationId}`；远端必须是当前候选的开放非draft PR |
+| `pr-review` | `reviewed` | `data.skillInvocationIds` 恰好引用一次当前绑定的 `prReview`；原始报告由技能调用归档，结论来自其 `pass`/`changes_required` 及阻断值 |
+| `review-report` | `posted` | v3 由命令发布技能原文并记录 `data.commentUrl`、`data.reviewInvocationId`；不由 actor 填写报告模板 |
+| `adjudicate` | `resolved` | 仅对 `packet.reviewDisagreement` 的当前候选/技能分歧；`data` 包含分歧 ID、两轮 invocation ID、技能指纹、`blocking`、`rationale`、`skillRuleRefs`，JSON 原文还写入 head/base/candidateVersion |
 | `accept` | `ready` | `data.satisfiedCriteria`逐字包含packet全部criteria；附适用CI事实及下述豁免结构 |
-| `accept` | `gap`、`conflict`、`waiting_ci`、`needs_human`、`blocked` | `gap`必须`data.planPath`，并附`reason`；其它状态附具体原因和证据；补充计划先过L1 `plan-check` |
-| `merge` | `merged`、`waiting_merge` | 真实远端合并证据或等待原因；`merged`仍须核心live观察到MERGED |
+| `accept` | `gap`、`conflict`、`waiting_ci`、`needs_human`、`blocked` | `gap`必须有`data.planPath`、`data.missingCriteria`及原因；其它状态附具体原因和证据；补充计划先经独立 L1 `replan` 和 `plan-check` |
+| `merge` | `merged`、`waiting_merge` | `merge-pr` 返回稳定 `data.operationId`、真实远端合并证据或等待原因；`merged`仍须核心 live 观察到 MERGED |
 | `close`、`spec-close` | `closed` | 由 execute 生成真实远端关闭证据；核对 L2 验收/L1 spec 审计后操作，再观察 CLOSED |
 | `cleanup` | `cleaned` | 仅由`execute`生成；再次核对MERGED与CLOSED及待保全工作 |
 | `spec-audit` | `complete` | `data.satisfiedCriteria`逐字包含packet.criteria中的全部spec条件，含迁移的人工条件 |
 | `spec-audit` | `needs_closeout` | `data:{planPath,remainingCriteria,visual?}`；只生成内部工作项，PR关联原父spec |
-| `spec-audit` | `waiting_human`、`blocked` | 前者必须`data.humanHandoffUrl`指向现有工单/spec人工交接；后者附明确原因和证据 |
+| `spec-audit` | `waiting_human`、`blocked` | 前者必须`data.humanHandoffUrl`指向已发布在现有工单/spec 的人工交接，并列 `data.pendingCriteria` 和 `data.resumeCommand`；后者附明确原因和证据 |
 
-`confirm.status="confirmed"`只表示复核动作完成；问题可被排除，低于50时记录实际评分与理由。`reviewed/posted`也不等于无问题。
+`reviewed/posted`只表示专业审查与报告发布完成；阻断结论以绑定技能的终态为准。
 
-合法CI豁免放在`accept.data.ciWaiver`：`{reason:"no_ci"|"billing",evidence:"<原始依据>",notStartedIds?:["<检查ID>"]}`。`no_ci`同时要求`data.ciConfigured:false`且远端无检查；`billing`列明因计费/额度未启动的检查ID。状态与理由必须符合本文件的CI边界，不能仅填写该对象就宣称豁免成立。
+合法 CI 豁免由 `ci-attest` 返回 `accept.data.ciWaiver`，包含原因、远端观测文件、当前 head/base 和逐项未启动检查 ID。`no_ci` 同时要求 `data.ciConfigured:false`、远端无检查、空工作流清单及目标分支无必需检查；`billing` 须有远端检查原文的计费未启动通知。状态与理由必须符合本文件的 CI 边界，不能仅填写对象宣称豁免。
 
 `checksPath`指向`{scopeReason,commands:[{name,argv,timeoutSeconds,env?}]}` JSON。argv为非空字符串数组，按实际工具拆参数；cwd固定任务worktree，`shell:false`，超时为L1决定的有限正数。选用目标仓库真实验证入口，并使“零用例/全部跳过”能被相应入口判为未验证；不要提交只打印成功的占位命令。

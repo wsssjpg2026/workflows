@@ -5,3 +5,4 @@ node_modules/
 /.agents/workflow-runs/
 /.agents/worktrees/
 /.agents/harness-test/
+/.agents/acceptance/

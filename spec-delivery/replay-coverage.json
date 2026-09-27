@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "evidenceLevel": "local protocol 3 public CLI with isolated Git and simulated host/GitHub fixtures; separate full native host round remains open",
+  "requirements": [
+    {
+      "id": "combined-protocol-3-ledger",
+      "checks": [
+        "单账本 v3 组合回放：依赖、并行实现、独立审查、补充计划与交付"
+      ]
+    },
+    {
+      "id": "plan-dependencies-parallel",
+      "checks": [
+        "v3 公开 CLI 从五项输入初始化、规划、认领并登记一次 agent 结果",
+        "每票独立计划复核及过期工件门禁通过公开 CLI 生效",
+        "技能双子任务走公开 CLI 预算和持久派发；乱序完成、失败重试及父门禁",
+        "五工单回放：十组五路审查完成交付，队列无基线反复失效"
+      ]
+    },
+    {
+      "id": "implementation-review-adjudication",
+      "checks": [
+        "批准计划到 implement 内嵌双轴作者自检只采纳一次，并生成可发布候选",
+        "公开 CLI 以替代 prReview 执行 regular/fresh、归档原文并幂等发布两轮报告",
+        "公开 CLI 对 regular 空发现与 fresh 阻断签发真实 L1 分歧裁决并保留原报告"
+      ]
+    },
+    {
+      "id": "acceptance-gap-and-delivery",
+      "checks": [
+        "L2 验收缺口保存 issue 条件；L1 明确范围和测试边界后才回实现",
+        "单账本 v3 组合回放：依赖、并行实现、独立审查、补充计划与交付",
+        "合并响应不确定时复用固定意图，远端已合并则不再写入",
+        "公开 CLI 清理前再次读取 MERGED+CLOSED，并保留脏 worktree"
+      ]
+    },
+    {
+      "id": "ci-and-human-gates",
+      "checks": [
+        "CI 实际失败不可豁免；缺 CI 需明确证据",
+        "公开 CLI 的无 CI 豁免要求当前 PR 空检查及远端空工作流清单",
+        "CI 等待保留队首并等待事件，通过后恢复验收，不派空转审计",
+        "人工延期仅接收真实原生人工依赖，且需两端不同记录",
+        "人工尾项保持父 spec 打开并产生交接"
+      ]
+    },
+    {
+      "id": "recovery-history-metrics",
+      "checks": [
+        "不同失败修订耗尽统一预算后停止同候选重试，旧 ready 不会再消费",
+        "旧协议保持只读，暂停迁移有原账本备份且不会自动恢复；退役与未知协议拒绝推进",
+        "旧账本（无 protocol）与 paused/waiting_human/complete/retired 状态均可读取",
+        "离线 metrics 保留两种 provider 原文和未知费用，重复观测不重计并可同口径比较"
+      ]
+    },
+    {
+      "id": "fixed-candidate",
+      "checks": [
+        "精确 Git 提交物化隔离候选、五技能及依赖；全局技能变化不改变安装清单",
+        "隔离候选完整回放保留命令、环境、输出哈希和前后指纹",
+        "首次测试失败保留原始回放并拒绝以同目录覆盖",
+        "PR CI 对新的 T21 目标分支开放，历史 push 过滤仍保留"
+      ]
+    }
+  ]
+}

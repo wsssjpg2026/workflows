@@ -287,6 +287,43 @@ test('fresh 父调用强制子任务独立上下文，技能文字不能改写�
   } finally {x.cleanup();}
 });
 
+test('四槽计划为实现、作者审查与专业审查保留完整链路，暂停另一票实现',()=>{
+  const x=setup();try {
+    const head='a'.repeat(40);
+    x.t.head=head;x.j.head=head;x.j.candidateVersion=core.candidateVersion(x.s,x.t);
+    const other=core.buildTicket({number:102,kind:'software',dependencies:[],criteria:['done'],visual:false},x.t.base);
+    other.phase='implement';other.head=head;x.s.tickets.push(other);
+    const invocation=skills.prepareSkillCall(x.s,x.j,'implementation',
+      {sourceExecution:{allowed:true,acceptsOriginalFiles:true}},x.statePath).invocation;
+    assert.throws(()=>skills.delegateSkillChildren(x.s,invocation.id,[
+      {key:'author',tier:'L3',instruction:'Review committed implementation',skillCapability:'authorReview'}
+    ]),/必须绑定当前已提交且干净的候选 head/);
+    skills.delegateSkillChildren(x.s,invocation.id,[
+      {key:'author',tier:'L3',instruction:'Review committed implementation',skillCapability:'authorReview',head}
+    ]);
+    const first=core.reserve(x.s);
+    assert.deepEqual(first.map(j=>j.action),['skill-child']);
+    const reviewer=first[0];assert.equal(reviewer.head,head);
+    reviewer.status='running';reviewer.nativeId='author-review-actor';
+    reviewer.session={...x.j.session!,jobId:reviewer.id,nativeId:reviewer.nativeId};
+    const reviewInvocation:core.SkillInvocation={...structuredClone(invocation),id:'author-review-invocation',
+      capability:'authorReview',jobId:reviewer.id,session:reviewer.session,
+      bindingFingerprint:skills.bindingFor(x.s,'authorReview').fingerprint};
+    x.s.v3!.skillInvocations.push(reviewInvocation);
+    assert.throws(()=>skills.delegateSkillChildren(x.s,reviewInvocation.id,[
+      {key:'nested-method',tier:'L3',instruction:'Launch another nested skill',skillCapability:'prReview'}
+    ]),/至少需要 5 个 agent 槽位/);
+    skills.delegateSkillChildren(x.s,reviewInvocation.id,[
+      {key:'standards',tier:'L3',instruction:'Inspect committed candidate against standards'}
+    ]);
+    const second=core.reserve(x.s);
+    assert.deepEqual(second.map(j=>j.action),['skill-child']);
+    assert.equal(second[0].parentInvocationId,reviewInvocation.id);
+    assert.equal(x.s.jobs.filter(j=>['leased','running'].includes(j.status)&&j.executor==='agent').length,3);
+    assert.ok(!x.s.jobs.some(j=>j.ticket===other.key&&j.action==='implement'));
+  }finally{x.cleanup();}
+});
+
 function contextFixture(mode:'resumed'|'new') {
   const x=setup();
   x.t.phase='review';x.t.epoch=2;x.t.pr=0;

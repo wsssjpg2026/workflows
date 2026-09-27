@@ -27,6 +27,12 @@ const rolesPath = path.join(home, 'spec-delivery', 'roles.md');
 const active = (j: engine.Job) => j.status === 'leased' || j.status === 'running';
 const recovering = (s: engine.State, j: engine.Job) => s.tickets.some(t => t.key === j.ticket && t.phase === 'recovery');
 const sha = (x: string | Buffer) => createHash('sha256').update(x).digest('hex');
+function testCommandEnv(explicit?:Record<string,string>) {
+  const inherited={...process.env};
+  for(const name of Object.keys(inherited))
+    if(name.startsWith('SPEC_DELIVERY_')||name.startsWith('DSH_'))delete inherited[name];
+  return {...inherited,...explicit};
+}
 function read<T>(file: string): T { return JSON.parse(fs.readFileSync(file, 'utf8')); }
 function write(file: string, value: unknown) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -1193,7 +1199,7 @@ function verify(s: engine.State, j: engine.Job, statePath: string): engine.Resul
     const stdout = path.join(directory, `${n}.stdout.log`), stderr = path.join(directory, `${n}.stderr.log`);
     const a = fs.openSync(stdout, 'w'), b = fs.openSync(stderr, 'w');
     try {
-      const r = spawnSync(c.argv[0], c.argv.slice(1), { cwd: t.worktree, env: { ...process.env, ...c.env }, shell: false,
+      const r = spawnSync(c.argv[0], c.argv.slice(1), { cwd: t.worktree, env: testCommandEnv(c.env), shell: false,
         timeout: c.timeoutSeconds * 1000, stdio: ['ignore', a, b] });
       rows.push({ name: c.name, argv: c.argv, exitCode: r.status, signal: r.signal, error: r.error?.message, stdout, stderr });
       if (r.status !== 0 || r.error) { passed = false; break; }
@@ -2262,7 +2268,7 @@ function runTest(statePath:string,id:string,request:{argv:string[];timeoutSecond
     const beforeFingerprint=worktreeFingerprint(worktree,statusBefore);
     const workingTreeFingerprint=statusBefore ? beforeFingerprint : null;
     fs.mkdirSync(out,{recursive:true});a=fs.openSync(path.join(out,'stdout.log'),'w');b=fs.openSync(path.join(out,'stderr.log'),'w');
-    const r=spawnSync(request.argv[0],request.argv.slice(1),{cwd:worktree,env:{...process.env,...request.env},
+    const r=spawnSync(request.argv[0],request.argv.slice(1),{cwd:worktree,env:testCommandEnv(request.env),
       timeout:request.timeoutSeconds*1000,stdio:['ignore',a,b],shell:false,detached:true});
     testGroupPid=r.pid;
     const statusAfter=gitRaw(worktree,'status','--porcelain=v1','--untracked-files=all');
@@ -2510,9 +2516,18 @@ export async function main(argv: string[]): Promise<unknown> {
       const invocation=s.v3?.skillInvocations.find(i=>i.id===extra);
       const parent=invocation && s.jobs.find(j=>j.id===invocation.jobId);
       const ticket=parent && s.tickets.find(t=>t.key===parent.ticket);
-      for(const child of request.children || []) if(child.head && child.head!==parent?.head) {
-        engine.ensure(parent && ticket?.worktree && localHead(ticket)===child.head && clean(ticket),
-          '技能子任务候选 head 必须是当前已提交且干净的工作区');
+      for(const child of request.children || []) {
+        if(child.skillCapability==='authorReview' && parent && ['implement','integrate'].includes(parent.action)) {
+          engine.ensure(ticket?.worktree && clean(ticket),
+            'authorReview 子任务需要当前已提交且干净的工作区；先提交或清理改动');
+          const committedHead=localHead(ticket);
+          engine.ensure(!child.head || child.head===committedHead,
+            'authorReview 子任务 head 不是当前已提交候选；请用当前工作区 HEAD');
+          child.head=committedHead;
+        } else if(child.head && child.head!==parent?.head) {
+          engine.ensure(parent && ticket?.worktree && localHead(ticket)===child.head && clean(ticket),
+            '技能子任务候选 head 必须是当前已提交且干净的工作区');
+        }
       }
       skills.delegateSkillChildren(s,extra,request.children);
       const snapshot=skills.skillChildrenSnapshot(s,extra);

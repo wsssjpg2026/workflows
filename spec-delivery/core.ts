@@ -433,6 +433,8 @@ export function applyPlan(s: State, p: ExecutionPlan, discovered: { number: numb
   for (const m of Object.values(s.inputs.models)) ensure(p.capabilities.models.includes(m), `宿主未确认模型可用：${m}`);
   for (const k of ['agents', 'issues', 'tests', 'noProgress', 'rounds'] as const) ensure(Number.isSafeInteger(p.policy[k]) && p.policy[k] > 0, `L1 的资源策略 ${k} 必须是正整数`);
   ensure(p.policy.agents >= 2, '至少留出主 agent 和一个子 agent 的额度');
+  if (s.protocol === currentProtocol) ensure(p.policy.agents >= 4,
+    '统一技能执行的 L1 policy.agents 至少为 4：主控、实现、作者审查和专业审查各需一个槽位；请修订执行计划');
   ensure(p.specCriteria.length && p.evidencePath, '需要 L1 的 spec 执行计划和验收条件');
   ensure(new Set(p.tickets.map(t => t.number)).size === p.tickets.length, '工单编号重复');
   for (const i of discovered) ensure(p.tickets.some(t => t.number === i.number), `执行计划遗漏既有子工单 #${i.number}`);
@@ -638,6 +640,56 @@ function candidates(s: State): Candidate[] {
   }
   return out;
 }
+type AgentSlotCandidate = Pick<Job, 'id' | 'action' | 'parentInvocationId' | 'childRequestId'> &
+  Partial<Pick<Job, 'ticket' | 'epoch' | 'candidateVersion'>>;
+/** Keep room for the required implement → authorReview → professional review chain. */
+function agentSlotsRequired(s: State, next?: AgentSlotCandidate) {
+  const active: AgentSlotCandidate[] = s.jobs.filter(j => busy(j) && j.executor === 'agent');
+  if (next) active.push(next);
+  const jobs = new Map<string, AgentSlotCandidate>(s.jobs.map(j => [j.id, j]));
+  if (next) jobs.set(next.id, next);
+  const invocationOwner = new Map((s.v3?.skillInvocations || []).map(i => [i.id, i.jobId]));
+  const rootOf = (job: AgentSlotCandidate) => {
+    let current = job;
+    const seen = new Set([job.id]);
+    while (current.parentInvocationId) {
+      const parentId = invocationOwner.get(current.parentInvocationId);
+      const parent = parentId && jobs.get(parentId);
+      if (!parent || seen.has(parent.id)) break;
+      seen.add(parent.id); current = parent;
+    }
+    // A stopped parent may have a live child while a new actor is leased to
+    // resume that same skill invocation. Both actors belong to one tree.
+    if (current.id === job.id && current.ticket && current.candidateVersion) {
+      const prior = s.jobs.findLast(old => old.id !== current.id && old.status === 'cancelled' &&
+        old.stopConfirmation?.processTreeStopped && old.ticket === current.ticket &&
+        old.epoch === current.epoch && old.action === current.action &&
+        old.candidateVersion === current.candidateVersion &&
+        s.v3?.skillInvocations.some(i => i.jobId === old.id && !i.result));
+      if (prior) current = prior;
+    }
+    return current;
+  };
+  const groups = new Map<string, AgentSlotCandidate[]>();
+  for (const job of active) {
+    const root = rootOf(job);
+    const group = groups.get(root.id) || [];
+    group.push(job); groups.set(root.id, group);
+  }
+  // One slot belongs to the coordinator. Implementation reserves its mandatory
+  // author-review and professional-review descendants. Other bound roots
+  // reserve one child; an active child with a bound skill reserves its own child.
+  let slots = 1;
+  for (const [rootId, group] of groups) {
+    const root = jobs.get(rootId)!;
+    const nestedWaiting = group.filter(job => job.action === 'skill-child' &&
+      s.v3?.skillChildren.find(child => child.id === job.childRequestId)?.skillCapability &&
+      !group.some(child => invocationOwner.get(child.parentInvocationId || '') === job.id)).length;
+    const minimum = root.action === 'implement' ? 3 : actionMetadata[root.action].skills.length ? 2 : 1;
+    slots += Math.max(minimum, group.length + nestedWaiting);
+  }
+  return slots;
+}
 export function reserve(s: State): Job[] {
   ensure(s.status === 'running' && s.policy, '只有运行中的已规划 workflow 可以派发');
   if(s.protocol===currentProtocol) ensure(unifiedSkillsReady(s),
@@ -657,7 +709,10 @@ export function reserve(s: State): Job[] {
         child.base !== owner.base ||
         (child.head !== owner.head && !['implement', 'integrate'].includes(owner.action))) continue;
     const active = s.jobs.filter(busy);
-    if (active.filter(j => j.executor === 'agent').length + 2 > s.policy.agents ||
+    if ((s.protocol === currentProtocol
+      ? agentSlotsRequired(s, {id:`${child.id}:try-${child.jobIds.length + 1}`,action:'skill-child',
+          parentInvocationId:parent.id,childRequestId:child.id})
+      : active.filter(j => j.executor === 'agent').length + 2) > s.policy.agents ||
         active.reduce((n, j) => n + j.tests, 0) > s.policy.tests) continue;
     const attempt = child.jobIds.length + 1;
     const id = `${child.id}:try-${attempt}`;
@@ -684,7 +739,10 @@ export function reserve(s: State): Job[] {
     const command = ['verify', 'cleanup', 'close', 'spec-close'].includes(c.action) ||
       s.protocol === currentProtocol && c.action === 'review-report';
     const executor = command ? 'command' : c.action === 'claim' ? 'main' : 'agent';
-    if (active.filter(j => j.executor === 'agent').length + 1 + (executor === 'agent' ? 1 : 0) > s.policy.agents) continue;
+    if ((s.protocol === currentProtocol && executor === 'agent'
+      ? agentSlotsRequired(s, {id,action:c.action,ticket:key,epoch,
+          candidateVersion:candidateVersion(s,c.t)})
+      : active.filter(j => j.executor === 'agent').length + 1 + (executor === 'agent' ? 1 : 0)) > s.policy.agents) continue;
     if (active.reduce((n, j) => n + j.tests, 0) + hasTests(c.action) > s.policy.tests) continue;
     const inFlightIssues = new Set(s.tickets.filter(t => !['claim', 'done', 'human', 'blocked'].includes(t.phase)).map(t => t.key));
     for (const j of active) if (j.action === 'claim') inFlightIssues.add(j.ticket);

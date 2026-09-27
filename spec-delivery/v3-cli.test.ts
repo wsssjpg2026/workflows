@@ -115,6 +115,23 @@ function planned(x: ReturnType<typeof fixture>) {
   assert.ok(planning);
   return { statePath, planning };
 }
+test('L1 三槽资源计划在派发前拒绝必需的三级技能执行链',()=>{
+  const x=fixture();try {
+    const started=x.call('init',x.inputPath);assert.equal(started.status,0,started.stderr);
+    const statePath=JSON.parse(started.stdout).statePath as string;
+    const plan=JSON.parse(fs.readFileSync(x.planPath,'utf8'));
+    Object.assign(plan,JSON.parse(started.stdout).decisionContext,{decisionNativeId:'native-global-plan'});
+    plan.policy.agents=3;fs.writeFileSync(x.planPath,JSON.stringify(plan));
+    x.observe('native-global-plan','$spec:execution-plan','large');
+    const rejected=x.call('plan',statePath,x.planPath);
+    assert.notEqual(rejected.status,0);assert.match(rejected.stderr,/policy\.agents.*至少为 4/);
+    const after=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(after.status,'planning');assert.equal(after.jobs.length,0);
+    plan.policy.agents=4;fs.writeFileSync(x.planPath,JSON.stringify(plan));
+    const accepted=x.call('plan',statePath,x.planPath);
+    assert.equal(accepted.status,0,accepted.stderr);
+  }finally{fs.rmSync(x.temp,{recursive:true,force:true});}
+});
 test('统一新租约拒绝手动 bind/stage/submit 绕过持久派发与宿主终态',()=>{
   const x=fixture();try {
     const {statePath,planning}=planned(x),nativeId='manual-unrelated-actor';
@@ -952,6 +969,8 @@ test('技能双子任务走公开 CLI 预算和持久派发；乱序完成、失
 test('技能可在五项并行结果后追加确认任务；引用替代技能版本并从账本续接', () => {
   const x=fixture();
   try {
+    const plan=JSON.parse(fs.readFileSync(x.planPath,'utf8'));
+    plan.policy.agents=5;fs.writeFileSync(x.planPath,JSON.stringify(plan));
     const alternate=path.join(x.temp,'.agents','skills','code-review','method.md');
     fs.writeFileSync(alternate,'Alternate professional method\n');
     const h=skillChildHarness(x,path.join(path.dirname(alternate),'SKILL.md')), invocationId=h.parent.invocationId;
@@ -966,7 +985,7 @@ test('技能可在五项并行结果后追加确认任务；引用替代技能�
       assert.ok(running.length>0);
       h.complete(running.at(-1).id);
       assert.ok(state.jobs.filter((j:{action:string;status:string})=>j.action==='skill-child'&&
-        ['leased','running'].includes(j.status)).length<=2,'并行数遵守父 actor 占用后的预算');
+        ['leased','running'].includes(j.status)).length<=3,'并行数遵守父 actor 占用后的预算');
     }
     assert.equal(seen.size,5);
     const firstSnapshot=h.call('skill-continue',h.statePath,invocationId);
@@ -1290,15 +1309,33 @@ test('批准计划到 implement 内嵌双轴作者自检只采纳一次，并生
     fs.writeFileSync(path.join(worktree,'source.txt'),'delivered\n');
     git(worktree,'add','source.txt');git(worktree,'commit','-m','Implement #101');
     const head=git(worktree,'rev-parse','HEAD');
+    x.env.DSH_HOME=path.join(x.temp,'controller-home');
+    x.env.SPEC_DELIVERY_LEAK_MARKER='controller-only';
     const tested=h.call('test',statePath,h.parentJob.id,h.file('author-test.json',
-      {argv:['true'],timeoutSeconds:5,reason:'TDD acceptance smoke for #101'}));
+      {argv:[process.execPath,'-e',
+        "const keys=Object.keys(process.env).filter(k=>k.startsWith('SPEC_DELIVERY_')||k.startsWith('DSH_')).sort();if(JSON.stringify(keys)!==JSON.stringify(['DSH_EXPLICIT','SPEC_DELIVERY_EXPLICIT']))process.exit(73)"],
+        env:{DSH_EXPLICIT:'approved',SPEC_DELIVERY_EXPLICIT:'approved'},
+        timeoutSeconds:5,reason:'TDD acceptance smoke for #101'}));
     assert.equal(tested.exitCode,0);
-    h.call('skill-delegate',statePath,h.parent.invocationId,h.file('embedded-review.json',{children:[
+    const oldHead=t.head;
+    const staleRequest=h.file('stale-review.json',{children:[
+      {key:'author-review',tier:'L3',instruction:'Review the committed candidate',
+        skillCapability:'authorReview',head:oldHead},
+    ]});
+    const refused=x.call('skill-delegate',statePath,h.parent.invocationId,staleRequest);
+    assert.notEqual(refused.status,0);assert.match(refused.stderr,/不是当前已提交候选/);
+    fs.appendFileSync(path.join(worktree,'source.txt'),'uncommitted change\n');
+    const implicit=h.file('embedded-review.json',{children:[
       {key:'author-review',tier:'L3',instruction:'Execute the currently bound two-axis authorReview on committed #101',
-        skillCapability:'authorReview',head},
-    ]}));
+        skillCapability:'authorReview'},
+    ]});
+    const dirty=x.call('skill-delegate',statePath,h.parent.invocationId,implicit);
+    assert.notEqual(dirty.status,0);assert.match(dirty.stderr,/已提交且干净/);
+    git(worktree,'restore','source.txt');
+    assert.equal(JSON.parse(fs.readFileSync(statePath,'utf8')).v3.skillChildren.length,0);
+    h.call('skill-delegate',statePath,h.parent.invocationId,implicit);
     const reviewer=h.call('next',statePath).jobs.find((j:{action:string})=>j.action==='skill-child');
-    assert.ok(reviewer);h.call('dispatch',statePath,reviewer.id);
+    assert.ok(reviewer);assert.equal(reviewer.head,head);h.call('dispatch',statePath,reviewer.id);
     const review=h.call('skill-start',statePath,reviewer.id,h.file('author-review-call.json',{capability:'authorReview'}));
     const source=JSON.parse(fs.readFileSync(review.sourceArchivePath,'utf8'));
     assert.ok(source.files.some((f:{relativePath:string})=>f.relativePath==='automation-context.md'));
@@ -1686,7 +1723,8 @@ test('单账本 v3 组合回放：依赖、并行实现、独立审查、补充�
     Object.assign(x.env,{SPEC_DELIVERY_COMBINED_REMOTE:remotePath,
       SPEC_DELIVERY_COMBINED_HOST_DB:hostPath,SPEC_DELIVERY_COMBINED_SESSIONS:x.sessions,
       SPEC_DELIVERY_HOST_ADAPTER:path.join(x.temp,'bin','combined-host'),
-      SPEC_DELIVERY_SKILL_OBSERVER:path.join(x.temp,'bin','combined-skill-observer')});
+      SPEC_DELIVERY_SKILL_OBSERVER:path.join(x.temp,'bin','combined-skill-observer'),
+      DSH_HOME:path.join(x.temp,'controller-home')});
     const remote=()=>JSON.parse(fs.readFileSync(remotePath,'utf8'));
     const updateRemote=(mutate:(value:ReturnType<typeof remote>)=>void)=>{
       const value=remote();mutate(value);fs.writeFileSync(remotePath,JSON.stringify(value));
@@ -1791,7 +1829,9 @@ test('单账本 v3 组合回放：依赖、并行实现、独立审查、补充�
     const replan=by(next(),101,'replan');dispatch(replan);
     const revisedPlan=file('combined-replan-101.md','L1 overflow scope and test boundary');
     const revisedChecks=file('combined-checks-replan.json',{scopeReason:'Overflow and initial behavior',
-      commands:[{name:'overflow-smoke',argv:[process.execPath,'-e','process.exit(0)'],timeoutSeconds:5}]});
+      commands:[{name:'overflow-smoke',argv:[process.execPath,'-e',
+        "const keys=Object.keys(process.env).filter(k=>k.startsWith('SPEC_DELIVERY_')||k.startsWith('DSH_')).sort();if(JSON.stringify(keys)!==JSON.stringify(['DSH_EXPLICIT','SPEC_DELIVERY_EXPLICIT']))process.exit(73)"],
+        env:{DSH_EXPLICIT:'approved',SPEC_DELIVERY_EXPLICIT:'approved'},timeoutSeconds:5}]});
     finish(replan,{complete:true,status:'planned',evidencePath:revisedPlan,
       data:{planPath:revisedPlan,checksPath:revisedChecks}});
     const recheck=by(next(),101,'plan-check');dispatch(recheck);

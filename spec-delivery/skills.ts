@@ -113,6 +113,17 @@ function activeParent(s: State, invocationId: string) {
   verifySkillBinding(bindingFor(s, invocation.capability));
   return { invocation, job };
 }
+function skillActorDepth(s: State, job: Job) {
+  let depth = 1, current = job;
+  const seen = new Set([job.id]);
+  while (current.parentInvocationId) {
+    const invocation = s.v3?.skillInvocations.find(i => i.id === current.parentInvocationId);
+    const parent = invocation && s.jobs.find(j => j.id === invocation.jobId);
+    if (!parent || seen.has(parent.id)) break;
+    seen.add(parent.id); current = parent; depth++;
+  }
+  return depth;
+}
 export function skillChildState(s: State, child: SkillChildRequest) {
   const job = child.jobIds.length ? s.jobs.find(j => j.id === child.jobIds.at(-1)) : undefined;
   if (child.pending) return 'pending' as const;
@@ -137,7 +148,12 @@ export function delegateSkillChildren(s: State, invocationId: string, specs: Ski
       Object.keys(spec).every(key=>['key','instruction','tier','required','independent','skillCapability','head'].includes(key)),
       '技能子任务定义无效；模型只能来自已确认的 L1/L2/L3 路由');
     ensure(!spec.skillCapability || capabilities.includes(spec.skillCapability), '子任务引用未知技能能力');
+    const requiredAgents = skillActorDepth(s, job) + 2 + (spec.skillCapability ? 1 : 0);
+    ensure(s.policy && s.policy.agents >= requiredAgents,
+      `技能子任务 ${spec.key} 的嵌套深度至少需要 ${requiredAgents} 个 agent 槽位（含主控）；请提高 L1 policy.agents 并重新规划`);
     ensure(spec.head === undefined || /^[0-9a-f]{40}$/.test(spec.head), '子任务候选 head 必须是完整提交 SHA');
+    if (spec.skillCapability === 'authorReview' && ['implement', 'integrate'].includes(job.action))
+      ensure(spec.head, '实现后的 authorReview 子任务必须绑定当前已提交且干净的候选 head；通过公开 skill-delegate 核实工作区或显式指定 head');
     ensure(!spec.head || spec.head === job.head || ['implement', 'integrate'].includes(job.action),
       '只读父任务不能指定不同候选 head');
     const dependency = spec.skillCapability ? verifySkillBinding(bindingFor(s, spec.skillCapability)) : undefined;

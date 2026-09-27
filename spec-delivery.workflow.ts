@@ -466,6 +466,21 @@ export function initialize(inputs: engine.Inputs, cwd = process.cwd()) {
 export function packet(s: engine.State, j: engine.Job, statePath: string) {
   const t = s.tickets.find(t => t.key === j.ticket);
   const out = path.join(path.dirname(statePath), 'jobs', sha(j.id).slice(0, 20));
+  if (j.action === 'repair-receipt') {
+    fs.mkdirSync(out,{recursive:true});
+    const original=s.jobs.find(x=>x.id===j.repairOfJobId), revision=s.v3?.receiptRecords
+      ?.find(x=>x.jobId===original?.id)?.revisions.find(x=>x.id===j.repairTargetRevisionId);
+    engine.ensure(original && revision, '独立修复任务缺少原始回执上下文');
+    return {jobId:j.id,action:j.action,tier:j.tier,model:j.model,dispatchToken:j.dispatchToken,
+      inputVersion:j.inputVersion,candidateVersion:j.candidateVersion,
+      repairContext:{originalJobId:original.id,originalAction:original.action,rawPath:revision.rawPath,
+        rawSha256:revision.rawSha256,parseOrValidationError:revision.error || '',
+        previousRevisionId:revision.id,expectedHead:original.head,expectedBase:original.base,
+        evidencePath:original.result?.evidencePath || '',previousSourceHostEvent:revision.sourceHostEvent || ''},
+      outputDirectory:out,resultPath:path.join(out,'result.json'),rolesPath,
+      resourceGrant:{agentSlots:1,testBatches:0,nestedAgents:false,worktreeWrite:false},
+      note:'只纠正回执格式；读取原始字节及上下文后返回完整 JSON 结果。禁止实现、推送、评论、合并或修改工作区。'};
+  }
   const authored = ['implement', 'publish', 'integrate', 'replan'].includes(j.action);
   const prior = s.jobs.filter(x => x.ticket === j.ticket && x.status === 'done' && x.result &&
     (j.action === 'review-report' ? x.epoch === j.epoch && ['review-lens', 'confirm', 'adjudicate'].includes(x.action)
@@ -723,7 +738,9 @@ function selectRemote(s: engine.State) {
 type HostState = 'not_found' | 'running' | 'completed' | 'cancelled' | 'unknown';
 interface HostReply {
   token: string; jobId: string; targetHost: string; state: HostState;
-  nativeId?: string; authoritative?: boolean; result?: unknown; startedAt?: string; completedAt?: string;
+  nativeId?: string; authoritative?: boolean; result?: unknown; resultFile?: string;
+  /** Human-readable terminal text is never parsed as a receipt. */
+  finalText?: string; continuationSupported?: boolean; startedAt?: string; completedAt?: string;
   cancelledAt?: string; usage?: engine.Json;
 }
 interface HostCall { ref: engine.HostEventRef; reply?: HostReply; error?: string }
@@ -762,7 +779,10 @@ function journalBoundSession(s: engine.State, j: engine.Job) {
   d.nativeId = j.nativeId; d.status = j.status === 'done' ? 'completed' : 'running'; d.updatedAt = at;
 }
 /** A bad or unbound host reply is still an instance/event in the journal. */
-function applyHostCall(statePath: string, jobId: string, call: HostCall): {state: HostState | 'uncertain'; nativeId?: string; result?: unknown; error?: string} {
+function applyHostCall(statePath: string, jobId: string, call: HostCall): {
+  state: HostState | 'uncertain'; nativeId?: string; result?: unknown; resultFile?: string;
+  sourceHostEvent: string; error?: string
+} {
   const release = lock(statePath);
   try {
     const s = read<engine.State>(statePath); requireProtocol(s);
@@ -776,6 +796,7 @@ function applyHostCall(statePath: string, jobId: string, call: HostCall): {state
       firstSeenAt: call.ref.at, lastSeenAt: call.ref.at, events: [] }; d.instances.push(instance); }
     instance.events.push(call.ref); instance.lastSeenAt = call.ref.at;
     if (reply?.usage !== undefined) instance.rawUsage = reply.usage;
+    if (typeof reply?.continuationSupported === 'boolean') instance.continuationSupported = reply.continuationSupported;
     for(const field of ['startedAt','completedAt','cancelledAt'] as const) if(reply?.[field]) {
       if(Number.isFinite(Date.parse(reply[field]!))) instance[field] ||= reply[field];
     }
@@ -813,7 +834,9 @@ function applyHostCall(statePath: string, jobId: string, call: HostCall): {state
     if (reply?.state === 'completed' && !error) instance.state = 'completed';
     engine.event(s, error ? `${jobId} 宿主派发状态不确定：${error}` : `${jobId} 宿主 ${call.ref.kind}：${reply!.state}`);
     save(statePath, s);
-    return error ? { state: 'uncertain', nativeId: reply?.nativeId, error } : { state: reply!.state, nativeId: reply!.nativeId, result: reply!.result };
+    return error ? { state: 'uncertain', nativeId: reply?.nativeId, sourceHostEvent: call.ref.evidencePath, error } :
+      { state: reply!.state, nativeId: reply!.nativeId, result: reply!.result,
+        resultFile: reply!.resultFile, sourceHostEvent: call.ref.evidencePath };
   } finally { release(); }
 }
 function dispatchRound(statePath: string, jobId: string, launch: boolean) {
@@ -848,10 +871,30 @@ function dispatchRound(statePath: string, jobId: string, launch: boolean) {
       outcome = applyHostCall(statePath, jobId, callHost(statePath, request!, 'start'));
     }
     if (outcome.state === 'completed') {
-      if (outcome.result === undefined) outcome = applyHostCall(statePath, jobId, callHost(statePath, request!, 'collect'));
-      if (outcome.state === 'completed' && outcome.result !== undefined) {
+      if (outcome.result === undefined && !outcome.resultFile)
+        outcome = applyHostCall(statePath, jobId, callHost(statePath, request!, 'collect'));
+      if (outcome.state === 'completed' && (outcome.result !== undefined || outcome.resultFile)) {
         try {
-          const receipt = stageResult(statePath, jobId, outcome.result);
+          let raw: Buffer, source: engine.ReceiptSource;
+          if (outcome.result !== undefined) {
+            raw = Buffer.from(typeof outcome.result === 'string' ? outcome.result : JSON.stringify(outcome.result));
+            source = 'host_structured';
+          } else {
+            const packetRecord=read<{outputDirectory:string}>(request!.packetPath);
+            const output=fs.realpathSync(packetRecord.outputDirectory);
+            const named=path.resolve(output,outcome.resultFile!);
+            engine.ensure(named.startsWith(output+path.sep) && !fs.lstatSync(named).isSymbolicLink() &&
+              fs.realpathSync(named)===named && fs.statSync(named).isFile(),
+              '宿主结果文件必须是当前 packet 输出目录中的普通文件');
+            raw=fs.readFileSync(named); source='host_file';
+          }
+          const current=read<engine.State>(statePath).jobs.find(j=>j.id===jobId)!;
+          const receipt = current.action==='repair-receipt'
+            ? stageRawResult(statePath,current.repairOfJobId!,raw,'repair',
+              {sourceHostEvent:outcome.sourceHostEvent,sourceNativeId:outcome.nativeId,
+                previousId:current.repairTargetRevisionId,repairJobId:current.id})
+            : stageRawResult(statePath, jobId, raw, source,
+              {sourceHostEvent:outcome.sourceHostEvent,sourceNativeId:outcome.nativeId});
           engine.ensure(!receipt.rejected.length, `宿主完成结果未通过回执核验：${JSON.stringify(receipt.rejected)}`);
         }
         catch (e) {
@@ -948,13 +991,27 @@ export function consumeStaged(statePath: string, ids?: string[]) {
       s.tickets.find(t => t.key === j.ticket)?.phase !== 'recovery' && (!ids || ids.includes(j.id)) &&
       (!s.v3?.dispatchRecords.find(d => d.jobId === j.id)?.managed ||
         s.v3.dispatchRecords.find(d => d.jobId === j.id)?.status === 'completed') &&
-      fs.existsSync(resultPaths(statePath, j.id).ready));
+      fs.existsSync(resultPaths(statePath, j.id).ready) &&
+      (s.protocol!==engine.currentProtocol || (()=>{
+        const current=s.v3?.receiptRecords?.find(x=>x.jobId===j.id)?.currentId;
+        if(!current)return false;
+        try{return read<{revisionId?:string}>(resultPaths(statePath,j.id).ready).revisionId===current;}
+        catch{return false;}
+      })()));
     if (!jobs.length) return { submitted: [], rejected: [] };
     s.facts = observe(s, jobs);
     const submitted: string[] = [], rejected: {jobId:string; error:string}[] = [];
     for (const j of jobs) {
       try {
-        const r = normalizeResult(s, j, read(resultPaths(statePath, j.id).result));
+        const receipt = s.v3?.receiptRecords?.find(x => x.jobId === j.id);
+        const revision = receipt?.revisions.find(x => x.id === receipt.currentId);
+        if (s.protocol===engine.currentProtocol) {
+          engine.ensure(revision,'协议 3 只从已归档的原始回执读取结果');
+          engine.ensure(read<{revisionId?:string}>(resultPaths(statePath,j.id).ready).revisionId===revision.id,
+            'ready 文件不指向当前不可变回执修订');
+        }
+        const raw = revision ? readReceiptRaw(revision) : read(resultPaths(statePath, j.id).result);
+        const r = normalizeResult(s, j, raw);
         const trial = structuredClone(s), job = trial.jobs.find(x => x.id === j.id)!;
         if (trial.protocol === engine.currentProtocol) { engine.ensure(job.session, '模型任务缺少原生会话观测'); verifySessionArtifact(job.session); }
         engine.ensure(!job.testExecution,'测试进程未完成，不能提交任务');
@@ -963,38 +1020,338 @@ export function consumeStaged(statePath: string, ids?: string[]) {
           const artifact = decisionArtifacts(trial, job, r);
           job.decisionArtifactDigest = artifact.digest; job.decisionArtifactFiles = artifact.files;
         }
-        validateResult(trial, job, r); engine.submit(trial, job.id, r); journalBoundSession(trial, job); s = trial; submitted.push(j.id);
+        validateResult(trial, job, r); engine.submit(trial, job.id, r); journalBoundSession(trial, job);
+        const accepted = trial.v3?.receiptRecords?.find(x => x.jobId === j.id)?.revisions.find(x => x.id === revision?.id);
+        if (accepted) accepted.status = 'accepted';
+        const record = trial.v3?.receiptRecords?.find(x => x.jobId === j.id);
+        if (record && revision) record.acceptedId = revision.id;
+        s = trial; submitted.push(j.id);
       } catch (error) {
-        recordRejectedReceipt(s, j, statePath, error as Error, true);
+        const record = s.v3?.receiptRecords?.find(x => x.jobId === j.id);
+        const revision = record?.revisions.find(x => x.id === record.currentId);
+        if (revision) { revision.status = 'rejected'; revision.error = (error as Error).message;
+          recordReceiptFailure(s, j, statePath, revision, error as Error, true); }
+        else recordRejectedReceipt(s, j, statePath, error as Error, true);
         rejected.push({jobId:j.id,error:(error as Error).message});
       }
     }
     save(statePath, s); return { submitted, rejected };
   } finally { release(); }
 }
-export function stageResult(statePath: string, id: string, value: unknown) {
+function receiptRecord(s: engine.State, jobId: string) {
+  engine.ensure(s.v3, '缺少 v3 回执账本');
+  s.v3.receiptRecords ??= [];
+  let record = s.v3.receiptRecords.find(x => x.jobId === jobId);
+  if (!record) { record = { jobId, revisions: [] }; s.v3.receiptRecords.push(record); }
+  return record;
+}
+interface RecoveryDecision {
+  kind: engine.RecoveryRecord['kind']; jobId: string; expectedRevision: number;
+  dispatchToken: string; attempt: number; expectedCandidateVersion: string;
+  reason: string; evidencePath: string; previousRevisionId?: string; rawPath?: string;
+  expectedNativeId?: string; nativeId?: string; processTreeStopped?: boolean;
+  observedState?: 'stopped' | 'lost';
+}
+function recoveryTarget(s: engine.State, d: RecoveryDecision) {
+  requireProtocol(s);
+  engine.ensure(d.expectedRevision === s.revision, '恢复决定版本已过期；重新 inspect');
+  engine.ensure(typeof d.reason === 'string' && !!d.reason.trim(), '恢复决定需要明确原因');
+  safeFile(d.evidencePath);
+  const j=s.jobs.find(j=>j.id===d.jobId), dispatch=s.v3?.dispatchRecords.find(x=>x.jobId===d.jobId);
+  engine.ensure(j && dispatch && j.executor==='agent', '恢复目标不是已派发模型任务');
+  engine.ensure(dispatch.token===d.dispatchToken && dispatch.attempt===d.attempt &&
+    j.dispatchToken===d.dispatchToken, '恢复目标 token 或 attempt 已改变');
+  const t=s.tickets.find(x=>x.key===j.ticket);
+  engine.ensure(d.expectedCandidateVersion === engine.candidateVersion(s,t) &&
+    j.candidateVersion===d.expectedCandidateVersion,
+    '候选已变化；进入正常诊断，不能用旧候选回执纠错');
+  engine.ensure(j.inputVersion===engine.inputVersion(s),
+    '模型配置或输入已变化；先诊断并重规划，不能修订旧执行回执');
+  engine.ensure(s.status!=='retired' && s.status!=='complete', '终态运行不能恢复回执');
+  return {j,dispatch,t};
+}
+function appendRecovery(s: engine.State, d: RecoveryDecision, fields: Partial<engine.RecoveryRecord> = {}) {
+  s.v3!.recoveryRecords ??= [];
+  const record:engine.RecoveryRecord={id:randomUUID(),kind:d.kind,jobId:d.jobId,
+    expectedRevision:d.expectedRevision,dispatchToken:d.dispatchToken,attempt:d.attempt,
+    evidencePath:path.resolve(d.evidencePath),reason:d.reason.trim(),at:new Date().toISOString(),...fields};
+  s.v3!.recoveryRecords.push(record);
+  engine.event(s, `${d.jobId} 恢复 ${d.kind}：${record.reason}`);
+  return record;
+}
+function readReceiptRaw(revision: engine.ReceiptRevision): unknown {
+  const bytes = fs.readFileSync(revision.rawPath);
+  engine.ensure(createHash('sha256').update(bytes).digest('hex') === revision.rawSha256, '原始回执字节已改变');
+  return JSON.parse(bytes.toString('utf8'));
+}
+function archiveReceipt(s: engine.State, statePath: string, j: engine.Job, bytes: Buffer,
+  source: engine.ReceiptSource, options: {sourceHostEvent?:string;sourceNativeId?:string;previousId?:string;repairJobId?:string} = {}) {
+  const record = receiptRecord(s, j.id), digest = createHash('sha256').update(bytes).digest('hex');
+  const existing=record.revisions.find(x=>x.source===source && x.rawSha256===digest &&
+    x.repairJobId===options.repairJobId && (!options.previousId || x.previousId===options.previousId));
+  if(existing)return existing;
+  const previousId=options.previousId || record.currentId;
+  const key = JSON.stringify([j.id, source, digest, previousId || '', options.repairJobId || '']);
+  const id = sha(key).slice(0, 32);
+  const prior = record.revisions.find(x => x.id === id);
+  if (prior) return prior;
+  const rawPath = path.join(path.dirname(statePath), 'receipt-raw', sha(j.id).slice(0, 20), `${id}.bin`);
+  fs.mkdirSync(path.dirname(rawPath), { recursive: true });
+  try { const fd = fs.openSync(rawPath, 'wx', 0o444);
+    try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  } catch (error) {
+    engine.ensure((error as NodeJS.ErrnoException).code === 'EEXIST' &&
+      createHash('sha256').update(fs.readFileSync(rawPath)).digest('hex') === digest,
+      '同一回执原文归档冲突');
+  }
+  const t = s.tickets.find(t => t.key === j.ticket);
+  const revision: engine.ReceiptRevision = { id, previousId, source,
+    rawPath, rawSha256: digest, sourceHostEvent: options.sourceHostEvent,
+    sourceNativeId: options.sourceNativeId, repairJobId: options.repairJobId,
+    candidateVersion: j.candidateVersion || engine.candidateVersion(s, t),
+    at: new Date().toISOString(), status: 'raw' };
+  record.revisions.push(revision); record.currentId = id;
+  engine.event(s, `${j.id} 原始回执 ${id} 已归档 (${source})`);
+  return revision;
+}
+function recordReceiptFailure(s: engine.State, j: engine.Job, statePath: string,
+  revision: engine.ReceiptRevision, error: Error, invariant = false) {
+  const t = s.tickets.find(t => t.key === j.ticket);
+  if (t && active(j) && t.epoch === j.epoch) {
+    const budget = t.failureBudget;
+    const limit = !!s.policy && ((budget?.totalRetries || 0) + 1 >= s.policy.rounds ||
+      (budget?.lastSignature === `receipt_validation:${error.message}` &&
+        (budget?.consecutiveNoProgress || 0) + 1 >= s.policy.noProgress));
+    engine.recordFailure(s, t, { id: `${j.id}:receipt:${revision.rawSha256}`, category: 'receipt_validation',
+      reason: error.message, jobId: j.id, next: t.phase, invariant: invariant || limit, preservePhase: !invariant && !limit });
+  }
+  recoverOnRejectedResult(s, j, statePath, error);
+}
+function stageLegacyResult(statePath:string,id:string,bytes:Buffer) {
+  const release=lock(statePath);
+  try {
+    const s=read<engine.State>(statePath),j=s.jobs.find(x=>x.id===id);allowCompletion(s);
+    engine.ensure(s.protocol!==engine.currentProtocol && j && j.executor==='agent' && active(j),
+      '旧协议只能暂存当前在途模型任务结果');
+    const r=normalizeResult(s,j,JSON.parse(bytes.toString('utf8'))),files=resultPaths(statePath,id);
+    safeFile(r.evidencePath);if(r.handoffPath)safeFile(r.handoffPath);
+    if(fs.existsSync(files.ready)) {
+      engine.ensure(fs.readFileSync(files.result,'utf8')===JSON.stringify(r,null,2)+'\n',
+        '已有不同回执；不能覆盖旧结果');
+    } else {
+      write(files.result,r);write(files.ready,{jobId:id,at:new Date().toISOString(),resultPath:files.result});
+    }
+    save(statePath,s);
+  } finally {release();}
+  return {jobId:id,resultPath:resultPaths(statePath,id).result,...consumeStaged(statePath,[id])};
+}
+function stageRawResult(statePath: string, id: string, bytes: Buffer, source: engine.ReceiptSource,
+  options: {sourceHostEvent?:string;sourceNativeId?:string;previousId?:string;repairJobId?:string;
+    recovery?:RecoveryDecision} = {}) {
+  if(read<engine.State>(statePath).protocol!==engine.currentProtocol)
+    return stageLegacyResult(statePath,id,bytes);
   const release = lock(statePath);
+  let revisionId = '', parseError = '';
   try {
     const s = read<engine.State>(statePath), j = s.jobs.find(j => j.id === id); allowCompletion(s);
     engine.ensure(j && j.executor === 'agent' && (active(j) || j.status === 'done'), '只能接收已登记的 agent 任务结果');
-    const r = normalizeResult(s, j, value), files = resultPaths(statePath, id);
-    if(j.status==='done') engine.ensure(JSON.stringify(j.result)===JSON.stringify(r),'已完成任务的回执不能改变');
-    safeFile(r.evidencePath); if (r.handoffPath) safeFile(r.handoffPath);
-    if (fs.existsSync(files.ready)) engine.ensure(JSON.stringify(normalizeResult(s,j,read(files.result))) === JSON.stringify(r),
-      '同一任务的结果不能被覆盖');
-    else {
-      write(files.result, r);
-      write(files.ready, {jobId:id,at:new Date().toISOString(),resultPath:files.result});
+    if (options.recovery) {
+      const target=recoveryTarget(s,options.recovery);
+      engine.ensure(target.j.id===id && options.recovery.kind==='revise-receipt' && active(j),
+        '仅可修订当前在途任务的回执');
+      if(target.dispatch.managed)engine.ensure(target.dispatch.instances.some(i=>i.nativeId===j.nativeId &&
+        i.state==='completed'),'宿主尚未确认原业务执行终态');
+      const current=receiptRecord(s,id);
+      engine.ensure(current.currentId && !current.acceptedId &&
+        current.currentId===options.recovery.previousRevisionId,'原始回执修订链已改变');
+      engine.ensure(current.revisions.find(x=>x.id===current.currentId)?.candidateVersion===
+        options.recovery.expectedCandidateVersion,'原始回执的候选版本已变化；进入正常诊断');
+      options.previousId=current.currentId;
     }
-  } catch (error) {
-    const s = read<engine.State>(statePath), j = s.jobs.find(j => j.id === id);
-    if (j && active(j)) {
-      recordRejectedReceipt(s, j, statePath, error as Error);
+    if (source === 'repair' && options.repairJobId) {
+      const repair=s.jobs.find(x=>x.id===options.repairJobId), rd=s.v3?.dispatchRecords.find(x=>x.jobId===repair?.id);
+      engine.ensure(active(j) && receiptRecord(s,id).currentId===options.previousId &&
+        repair && active(repair) && repair.repairOfJobId===id &&
+        repair.repairTargetRevisionId===options.previousId &&
+        rd?.managed && rd.status==='completed' && repair.nativeId===options.sourceNativeId &&
+        rd.instances.some(i=>i.nativeId===repair.nativeId && i.state==='completed') && repair.session,
+        '独立修复者未完成或原生身份未核实');
+      verifySessionArtifact(repair.session);
+    }
+    if (source === 'host_structured' || source === 'host_file') {
+      const d = s.v3?.dispatchRecords.find(x => x.jobId === id);
+      engine.ensure(d?.managed && d.status === 'completed' && j.nativeId === options.sourceNativeId &&
+        d.instances.some(i => i.nativeId === j.nativeId && i.state === 'completed'),
+        '宿主终态尚未确认，不能采用已出现的结果文件');
+    }
+    const record = receiptRecord(s, id);
+    if(j.status==='done' && record.acceptedId) {
+      const accepted=record.revisions.find(x=>x.id===record.acceptedId);
+      engine.ensure(accepted && accepted.rawSha256===createHash('sha256').update(bytes).digest('hex'),
+        '已完成任务的权威回执不能改变');
+      return {jobId:id,revisionId:accepted.id,resultPath:resultPaths(statePath,id).result,
+        submitted:[],rejected:[]};
+    }
+    engine.ensure(!record.acceptedId || j.status === 'done', '已有权威回执，不能覆盖');
+    engine.ensure(!record.currentId || source === 'repair' || record.revisions.some(x => x.id === record.currentId && x.rawSha256 === createHash('sha256').update(bytes).digest('hex')),
+      '已有不同回执；请通过 recover-result 修订');
+    const priorCurrentId=record.currentId;
+    const revision = archiveReceipt(s, statePath, j, bytes, source, options); revisionId = revision.id;
+    if (priorCurrentId!==revision.id && record.currentId===revision.id && fs.existsSync(resultPaths(statePath,id).ready))
+      fs.rmSync(resultPaths(statePath,id).ready);
+    if (options.recovery) appendRecovery(s,options.recovery,{receiptRevisionId:revision.id});
+    if (source === 'repair' && options.repairJobId) {
+      const repair=s.jobs.find(x=>x.id===options.repairJobId)!;
+      repair.status='done';repair.timing??={leasedAt:''};repair.timing.completedAt=new Date().toISOString();
+      engine.event(s, `${repair.id} 独立回执修复已交付修订 ${revision.id}`);
+    }
+    if (j.status === 'done') {
+      const normalized=normalizeResult(s,j,readReceiptRaw(revision));
+      engine.ensure(JSON.stringify(j.result)===JSON.stringify(normalized),
+        '已完成任务的回执不能改变');
+      revision.status='accepted';record.acceptedId=revision.id;
       save(statePath, s);
+      return { jobId: id, revisionId, resultPath: resultPaths(statePath,id).result, submitted: [], rejected: [] };
     }
-    throw error;
+    try {
+      const r = normalizeResult(s, j, readReceiptRaw(revision)), files = resultPaths(statePath, id);
+      safeFile(r.evidencePath); if (r.handoffPath) safeFile(r.handoffPath);
+      // The normalized file is a staging cache; the immutable revision remains authoritative.
+      write(files.result, r);
+      write(files.ready, {jobId:id,at:new Date().toISOString(),resultPath:files.result,revisionId});
+      revision.status = 'schema_valid'; revision.error = undefined;
+      if (source==='repair') {
+        const d=s.v3?.dispatchRecords.find(x=>x.jobId===id);
+        if(d?.managed && d.instances.some(i=>i.nativeId===j.nativeId && i.state==='completed')) {
+          d.status='completed';d.uncertainty=undefined;
+        }
+      }
+    } catch (error) {
+      parseError = (error as Error).message; revision.status = 'rejected'; revision.error = parseError;
+      recordReceiptFailure(s, j, statePath, revision, error as Error);
+    }
+    save(statePath, s);
   } finally { release(); }
-  return { jobId:id, resultPath:resultPaths(statePath,id).result, ...consumeStaged(statePath,[id]) };
+  if (parseError) return { jobId:id, revisionId, resultPath:resultPaths(statePath,id).result,
+    submitted: [], rejected: [{jobId:id,error:parseError}] };
+  return { jobId:id, revisionId, resultPath:resultPaths(statePath,id).result, ...consumeStaged(statePath,[id]) };
+}
+export function stageResult(statePath: string, id: string, value: unknown) {
+  return stageRawResult(statePath, id, Buffer.from(JSON.stringify(value)), 'stage');
+}
+function confirmStopped(s:engine.State,statePath:string,j:engine.Job,proof:{
+  state:'stopped'|'lost';evidencePath:string;processTreeStopped?:boolean;commandDisposition?:'recover'|'cancel'
+}) {
+  safeFile(proof.evidencePath);
+  engine.ensure(proof.processTreeStopped===true,'须确认执行者与测试的整个进程树已停止');
+  engine.ensure(!j.testExecution || !processAlive(j.testExecution.pid),'测试进程仍在运行，不能释放预算');
+  const d=s.v3?.dispatchRecords.find(x=>x.jobId===j.id);
+  if(j.executor==='agent' && d?.managed) {
+    const instance=d.instances.find(i=>i.nativeId===j.nativeId);
+    engine.ensure(instance && ['completed','cancelled'].includes(instance.state),
+      '宿主实例仍可能运行；先归档取消或终态确认');
+  }
+  if(j.executor!=='agent' && /^command:\d+:/.test(j.nativeId) && s.protocol!==undefined) {
+    engine.ensure(!processAlive(Number(j.nativeId.split(':')[1])), '命令父进程仍在运行');
+    if(proof.commandDisposition==='recover') {
+      j.commandRecovery={nativeId:j.nativeId,evidencePath:proof.evidencePath,at:new Date().toISOString()};
+      return;
+    }
+    delete j.commandRecovery;
+  }
+  j.status='cancelled';
+  j.stopConfirmation={state:proof.state,evidencePath:proof.evidencePath,processTreeStopped:true,at:new Date().toISOString()};
+  j.timing??={leasedAt:''};j.timing.cancelledAt=new Date().toISOString();delete j.testExecution;
+  if(j.ticket==='$spec')s.specAudit=undefined;
+  else {
+    const t=engine.ticket(s,j.ticket);
+    if(t.failures?.some(f=>f.jobId===j.id))engine.finalizeRejectedReceipt(s,t,j);
+    else if(j.nativeId)engine.recordFailure(s,t,{id:`${j.id}:host`,category:'host',jobId:j.id,
+      reason:`宿主执行 ${proof.state}；${proof.evidencePath}`,signature:`${j.action}:${proof.state}`,
+      next:t.phase,preservePhase:t.phase==='recovery'});
+  }
+  engine.event(s,`${j.id} 已用完整进程树证据确认停止`);
+}
+function recoverResult(statePath:string,d:RecoveryDecision) {
+  if(d.kind==='revise-receipt') {
+    engine.ensure(d.rawPath,'回执修订需要原文文件');
+    const bytes=fs.readFileSync(safeFile(d.rawPath));
+    const receipt=stageRawResult(statePath,d.jobId,bytes,'repair',{recovery:d});
+    engine.ensure(!receipt.rejected.length,`修订已保留但未通过核验：${JSON.stringify(receipt.rejected)}`);
+    return receipt;
+  }
+  if(d.kind==='cancel') {
+    const release=lock(statePath);
+    try {const s=read<engine.State>(statePath),{j,dispatch}=recoveryTarget(s,d);
+      engine.ensure(active(j) && dispatch.managed && dispatch.status==='running',
+        '取消前须确认当前托管实例正在运行');
+      appendRecovery(s,d,{beforeNativeId:j.nativeId});save(statePath,s);
+    } finally {release();}
+    return cancelDispatch(statePath,d.jobId);
+  }
+  const release=lock(statePath);
+  try {
+    const s=read<engine.State>(statePath),{j,dispatch}=recoveryTarget(s,d);
+    engine.ensure(active(j) && j.status!=='done','已完成任务不能恢复身份或停止');
+    if(d.kind==='confirm-stop' || d.kind==='abandon') {
+      engine.ensure(d.observedState==='stopped' || d.observedState==='lost','需要明确停止或遗失状态');
+      if(d.kind==='abandon')engine.ensure(!!s.v3?.receiptRecords?.find(x=>x.jobId===j.id)?.currentId,
+        '放弃纠错前须有原始回执');
+      confirmStopped(s,statePath,j,{state:d.observedState,evidencePath:d.evidencePath,
+        processTreeStopped:d.processTreeStopped});
+      appendRecovery(s,d,{beforeNativeId:j.nativeId});
+    } else if(d.kind==='correct-binding') {
+      engine.ensure(d.expectedNativeId===j.nativeId && d.nativeId && d.nativeId!==j.nativeId,
+        '绑定纠错必须准确声明旧身份与不同的新身份');
+      engine.ensure(!s.v3?.receiptRecords?.find(x=>x.jobId===j.id)?.acceptedId,
+        '已接纳回执的原生身份不能替换');
+      const target=dispatch.instances.find(i=>i.nativeId===d.nativeId);
+      engine.ensure(target && ['running','completed','cancelled'].includes(target.state) &&
+        target.events.length>0,'新身份必须来自当前 token 的宿主实例日志');
+      const old=dispatch.instances.find(i=>i.nativeId===j.nativeId);
+      if(old && ['running','unknown'].includes(old.state))
+        engine.ensure(d.processTreeStopped===true,'旧实例仍可能运行，必须确认整个进程树停止');
+      const session=nativeSession(statePath,d.nativeId,j.id);
+      engine.verifyNativeSession(s,session,d.nativeId,j.tier);verifySessionArtifact(session);
+      const before=j.nativeId,priorBindingError=target.bindingError||old?.bindingError;
+      j.nativeId=d.nativeId;j.session=session;j.status='running';
+      dispatch.nativeId=d.nativeId;dispatch.status=target.state==='completed'?'completed':
+        target.state==='cancelled'?'cancelled':'running';
+      target.session=session;dispatch.uncertainty=undefined;
+      appendRecovery(s,d,{beforeNativeId:before,afterNativeId:d.nativeId,priorBindingError});
+    } else if(d.kind==='prepare-repair') {
+      engine.ensure(s.status==='running','暂停时不能启动新的修复任务');
+      const current=receiptRecord(s,j.id),rev=current.revisions.find(x=>x.id===current.currentId);
+      engine.ensure(rev && rev.status==='rejected' && !current.acceptedId &&
+        d.previousRevisionId===rev.id,'只为当前失败修订登记独立修复任务');
+      engine.ensure(!s.jobs.some(x=>x.repairOfJobId===j.id && active(x)),
+        '已有在途的独立回执修复任务');
+      const instance=dispatch.instances.find(i=>i.nativeId===j.nativeId);
+      engine.ensure(!dispatch.managed || instance?.state==='completed',
+        '原业务执行尚未确认完成，不能派发独立修复');
+      const repairId=`${j.id}:receipt-repair:${rev.id.slice(0,12)}:try-1`;
+      engine.ensure(!s.jobs.some(x=>x.id===repairId),'此修订的独立修复任务已登记');
+      const token=randomUUID();
+      const repair:engine.Job={id:repairId,ticket:j.ticket,epoch:j.epoch,action:'repair-receipt',part:rev.id,
+        tier:j.tier,model:j.model,executor:'agent',fresh:true,contextKey:`receipt-repair:${j.id}:${rev.id}`,
+        head:j.head,base:j.base,tests:0,status:'leased',nativeId:'',repairOfJobId:j.id,
+        repairTargetRevisionId:rev.id,dispatchToken:token,inputVersion:j.inputVersion,
+        candidateVersion:j.candidateVersion,timing:{leasedAt:new Date().toISOString()}};
+      s.jobs.push(repair);
+      const packetPath=path.join(path.dirname(statePath),'packets',sha(repair.id).slice(0,20)+'.json');
+      write(packetPath,packet(s,repair,statePath));
+      const requestPath=path.join(path.dirname(statePath),'dispatch',`${sha(repair.id).slice(0,20)}.json`);
+      const request={token,jobId:repair.id,attempt:1,targetHost:s.capabilities?.framework||'unknown',
+        requestedModel:repair.model,packetPath};
+      write(requestPath,request);const at=new Date().toISOString();
+      s.v3!.dispatchRecords.push({...request,requestPath,requestDigest:sha(fs.readFileSync(requestPath)),
+        status:'prepared',createdAt:at,updatedAt:at,events:[],instances:[{key:`token:${token}`,
+          nativeId:null,state:'requested',firstSeenAt:at,lastSeenAt:at,events:[]}]});
+      appendRecovery(s,d,{beforeNativeId:j.nativeId,receiptRevisionId:rev.id,repairJobId:repair.id});
+    } else throw new Error(`未知恢复类型 ${d.kind}`);
+    save(statePath,s);
+    return {statePath,status:s.status,revision:s.revision,record:s.v3!.recoveryRecords!.at(-1)};
+  } finally {release();}
 }
 export function bindBatch(statePath: string, binding: {runId:string; model?:string; jobs:{jobId:string; actorName:string}[]}) {
   const release = lock(statePath);
@@ -1088,7 +1445,7 @@ export async function main(argv: string[]): Promise<unknown> {
   const [op, file, extra, fourth] = argv;
   if(op==='version')return {workflow:'spec-delivery',version:workflowVersion};
   if (!op || op === 'help') return { workflow: 'spec-delivery', input: ['spec', 'targetBranch', 'models.L1', 'models.L2', 'models.L3'],
-    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan-context <state>', 'decision-context <state>', 'plan <state> <plan.json>', 'observe-main <state> <native-id>', 'drive <state>', 'next <state>', 'dispatch <state> <jobId>', 'dispatch-cancel <state> <jobId>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'skill-start <state> <jobId> <host-capabilities.json>', 'skill-finish <state> <invocationId> <outcome.json>', 'migrate-skills <state> <migration.json>', 'stage <state> <jobId> <result-json>', 'collect <state> [jobId]', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'test <state> <jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'recover-workspace <state> <ticket> <decision.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'metrics <state>', 'resume <state>', 'zcode <state>'] };
+    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan-context <state>', 'decision-context <state>', 'plan <state> <plan.json>', 'observe-main <state> <native-id>', 'drive <state>', 'next <state>', 'dispatch <state> <jobId>', 'dispatch-cancel <state> <decision.json>', 'recover-result <state> <decision.json>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'skill-start <state> <jobId> <host-capabilities.json>', 'skill-finish <state> <invocationId> <outcome.json>', 'migrate-skills <state> <migration.json>', 'stage <state> <jobId> <result-json>', 'stage-raw <state> <jobId> <raw-file>', 'collect <state> [jobId]', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'test <state> <jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'recover-workspace <state> <ticket> <decision.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'metrics <state>', 'resume <state>', 'zcode <state>'] };
   engine.ensure(file, '缺少输入文件/状态路径');
   // summary 在 lock() 之前返回：只验证可读协议，不创建/等待/恢复/删除状态锁，也不进入写路径。
   if (op === 'summary') return summarizeLedger(path.resolve(file));
@@ -1110,14 +1467,27 @@ export async function main(argv: string[]): Promise<unknown> {
   }
   if (op === 'execute') { engine.ensure(extra, '需要 command jobId'); return executeCommand(path.resolve(file), extra); }
   if (op === 'test') {engine.ensure(extra && fourth,'需要 jobId 与测试请求文件');return runTest(path.resolve(file),extra,read(fourth));}
-  if (op === 'stage') {
-    engine.ensure(extra && fourth, '需要 jobId 与结果 JSON 内容');
-    const receipt=stageResult(path.resolve(file),extra,JSON.parse(fourth));
+  if (op === 'stage' || op === 'stage-raw') {
+    engine.ensure(extra && fourth, '需要 jobId 与结果 JSON 内容或原文文件');
+    const bytes = op === 'stage' ? Buffer.from(fourth) : fs.readFileSync(safeFile(fourth));
+    const receipt=stageRawResult(path.resolve(file),extra,bytes,'stage');
     engine.ensure(!receipt.rejected.length,`回执已保留但未通过核验：${JSON.stringify(receipt.rejected)}；主控核对，不重跑外部动作`);
     return receipt;
   }
+  if (op === 'recover-result') {
+    engine.ensure(extra,'需要带版本与证据的恢复决定文件');
+    const decision=read<RecoveryDecision>(extra),statePath=path.resolve(file);
+    const recovered=recoverResult(statePath,decision);
+    return decision.kind==='correct-binding'
+      ? {...recovered,...consumeStaged(statePath,[decision.jobId])} : recovered;
+  }
   if (op === 'dispatch') { engine.ensure(extra, '需要 jobId'); return dispatchRound(path.resolve(file), extra, true); }
-  if (op === 'dispatch-cancel') { engine.ensure(extra, '需要 jobId'); return cancelDispatch(path.resolve(file),extra); }
+  if (op === 'dispatch-cancel') {
+    engine.ensure(extra,'取消需带版本与证据的决定文件');
+    const decision=read<RecoveryDecision>(extra);
+    engine.ensure(decision.kind==='cancel','取消决定类型必须为 cancel');
+    return recoverResult(path.resolve(file),decision);
+  }
   if (op === 'collect') {
     const statePath = path.resolve(file), state = read<engine.State>(statePath); requireProtocol(state);
     const records = state.v3!.dispatchRecords.filter(d => d.managed && (!extra || d.jobId === extra) &&
@@ -1396,30 +1766,8 @@ export async function main(argv: string[]): Promise<unknown> {
         engine.ensure(j.nativeId === observation.nativeId, '宿主任务身份不符'); safeFile(observation.evidencePath);
         if (observation.userStopped) { s.status = 'paused'; continue; }
         if (observation.state === 'stopped' || observation.state === 'lost') {
-          engine.ensure(!j.testExecution || !processAlive(j.testExecution.pid),'测试进程仍在运行，不能释放预算');
-          engine.ensure(!j.testExecution || observation.processTreeStopped===true,'中断测试须核对整个进程树');
-          if(j.executor==='agent' && s.tickets.some(t => t.key === j.ticket && t.worktree))
-            engine.ensure(observation.processTreeStopped===true,'工作区执行者须核对整个进程树后才能释放写权');
-          if(j.executor!=='agent' && /^command:\d+:/.test(j.nativeId) && s.protocol!==undefined) {
-            engine.ensure(!processAlive(Number(j.nativeId.split(':')[1])) && observation.processTreeStopped===true,'命令恢复须确认父进程与整个进程树已停止');
-            if(observation.commandDisposition==='recover') {
-              j.commandRecovery={nativeId:j.nativeId,evidencePath:observation.evidencePath,at:new Date().toISOString()};
-              continue;
-            }
-            delete j.commandRecovery;
-          }
-          j.status = 'cancelled';
-          j.stopConfirmation = {state:observation.state,evidencePath:observation.evidencePath,processTreeStopped:observation.processTreeStopped===true,at:new Date().toISOString()};
-          j.timing??={leasedAt:''};j.timing.cancelledAt=new Date().toISOString();delete j.testExecution;
-          if (j.ticket === '$spec') s.specAudit = undefined;
-          else {
-            const t = engine.ticket(s, j.ticket);
-            if (t.failures?.some(f => f.jobId === j.id)) engine.finalizeRejectedReceipt(s, t, j);
-            else if (j.nativeId)
-              engine.recordFailure(s, t, { id: `${j.id}:host`, category: 'host', jobId: j.id,
-                reason: `宿主执行 ${observation.state}；${observation.evidencePath}`, signature: `${j.action}:${observation.state}`,
-                next: t.phase, preservePhase: t.phase === 'recovery' });
-          }
+          confirmStopped(s,statePath,j,{state:observation.state,evidencePath:observation.evidencePath,
+            processTreeStopped:observation.processTreeStopped,commandDisposition:observation.commandDisposition});
         }
         // completed 必须读取并提交原结果，不重做外部动作；running 保留原租约。
       }

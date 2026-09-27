@@ -117,7 +117,8 @@ if(op==='query') {
   reply({state:'running',nativeId:db.actors[request.token].nativeId,startedAt:db.actors[request.token].startedAt});
 } else if(op==='collect') {
   if(!actor||actor.state!=='completed')process.exit(84);
-  reply({state:'completed',nativeId:actor.nativeId,result:actor.result});
+  reply({state:'completed',nativeId:actor.nativeId,result:actor.result,resultFile:actor.resultFile,
+    finalText:actor.finalText,continuationSupported:actor.continuationSupported});
 } else if(op==='cancel') {
   if(!actor)process.exit(86);
   actor.state='cancelled';save();reply({state:'cancelled',nativeId:actor.nativeId,cancelledAt:'2026-09-27T00:00:02.000Z'});
@@ -144,6 +145,18 @@ function approvedImplementation(x: ReturnType<typeof fixture>) {
   assert.equal(x.call('bind', statePath, checking.id, binding).status, 0);
   assert.equal(x.call('stage', statePath, checking.id, JSON.stringify({ complete: true, status: 'pass', evidencePath: x.planEvidence })).status, 0);
   return { statePath, checks, binding };
+}
+function recoveryDecision(statePath:string,jobId:string,kind:string,evidencePath:string,more:Record<string,unknown>={}) {
+  const state=JSON.parse(fs.readFileSync(statePath,'utf8'));
+  const job=state.jobs.find((j:{id:string})=>j.id===jobId);
+  const dispatch=state.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===jobId);
+  return {kind,jobId,expectedRevision:state.revision,dispatchToken:dispatch.token,
+    attempt:dispatch.attempt,expectedCandidateVersion:job.candidateVersion,
+    reason:'L1 核对宿主证据后纠正当前回执',evidencePath,...more};
+}
+function recoveryFile(x:ReturnType<typeof fixture>,value:unknown) {
+  const file=path.join(x.temp,`recovery-${Date.now()}-${Math.random()}.json`);
+  fs.writeFileSync(file,JSON.stringify(value));return file;
 }
 
 test('v3 公开 CLI 从五项输入初始化、规划、认领并登记一次 agent 结果', () => {
@@ -571,7 +584,8 @@ test('取消保留原生实例、时间与原始事件；任务写权等待独�
   try {
     const {statePath,planning}=planned(x),host=controlledHost(x);
     assert.equal(JSON.parse(x.call('dispatch',statePath,planning.id).stdout).status,'running');
-    const cancelled=x.call('dispatch-cancel',statePath,planning.id);assert.equal(cancelled.status,0,cancelled.stderr);
+    const cancelDecision=recoveryDecision(statePath,planning.id,'cancel',x.planEvidence);
+    const cancelled=x.call('dispatch-cancel',statePath,recoveryFile(x,cancelDecision));assert.equal(cancelled.status,0,cancelled.stderr);
     assert.equal(JSON.parse(cancelled.stdout).status,'cancelled');
     const state=JSON.parse(fs.readFileSync(statePath,'utf8'));
     const dispatch=state.v3.dispatchRecords[0],native=dispatch.nativeId;
@@ -579,8 +593,19 @@ test('取消保留原生实例、时间与原始事件；任务写权等待独�
     assert.equal(dispatch.instances.find((i:{nativeId:string})=>i.nativeId===native).state,'cancelled');
     assert.equal(dispatch.instances.find((i:{nativeId:string})=>i.nativeId===native).cancelledAt,'2026-09-27T00:00:02.000Z');
     assert.equal(state.jobs.find((j:{id:string})=>j.id===planning.id).status,'running');
+    assert.equal(state.v3.recoveryRecords.at(-1).kind,'cancel');
     assert.equal(JSON.parse(x.call('dispatch',statePath,planning.id).stdout).status,'cancelled');
     assert.equal(host.get().starts,1);
+    const unproven=recoveryDecision(statePath,planning.id,'confirm-stop',x.planEvidence,
+      {observedState:'stopped',processTreeStopped:false});
+    assert.notEqual(x.call('recover-result',statePath,recoveryFile(x,unproven)).status,0);
+    assert.equal(JSON.parse(fs.readFileSync(statePath,'utf8')).jobs.find((j:{id:string})=>j.id===planning.id).status,'running');
+    const proven=recoveryDecision(statePath,planning.id,'confirm-stop',x.planEvidence,
+      {observedState:'stopped',processTreeStopped:true});
+    assert.equal(x.call('recover-result',statePath,recoveryFile(x,proven)).status,0);
+    const stopped=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(stopped.jobs.find((j:{id:string})=>j.id===planning.id).status,'cancelled');
+    assert.equal(stopped.v3.recoveryRecords.at(-1).kind,'confirm-stop');
   } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
 });
 
@@ -630,5 +655,182 @@ test('派发请求文件被改写后禁止调用宿主，即使改写者填入�
     const recovered=x.call('dispatch',statePath,planning.id);assert.equal(recovered.status,0,recovered.stderr);
     assert.equal(JSON.parse(recovered.stdout).status,'running');
     assert.equal(host.get().starts,1);
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('畸形回执逐字节归档，带版本修订只重验回执且并发旧决定失败', () => {
+  const x=fixture();
+  try {
+    const {statePath,planning}=planned(x), binding=path.join(x.temp,'binding.json');
+    x.observe('receipt-author',planning.id,'large');
+    fs.writeFileSync(binding,JSON.stringify({nativeId:'receipt-author'}));
+    assert.equal(x.call('bind',statePath,planning.id,binding).status,0);
+    const checks=path.join(x.temp,'repair-checks.md');fs.writeFileSync(checks,'checked\n');
+    const bad=Buffer.from('```json\n{"complete":true,"status":"planned"}\n```\n');
+    const badFile=path.join(x.temp,'bad-receipt.bin');fs.writeFileSync(badFile,bad);
+    const staged=x.call('stage-raw',statePath,planning.id,badFile);
+    assert.notEqual(staged.status,0);
+    const failed=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const record=failed.v3.receiptRecords.find((r:{jobId:string})=>r.jobId===planning.id);
+    const original=record.revisions[0];
+    assert.deepEqual(fs.readFileSync(original.rawPath),bad);
+    assert.equal(original.status,'rejected');
+    assert.equal(failed.tickets[0].failureBudget.totalRetries,1);
+    assert.equal(failed.jobs.find((j:{id:string})=>j.id===planning.id).status,'running');
+    const corrected=path.join(x.temp,'corrected.json');
+    fs.writeFileSync(corrected,JSON.stringify({complete:true,status:'planned',evidencePath:x.planEvidence,
+      data:{planPath:x.planPath,checksPath:checks}}));
+    const decision=recoveryDecision(statePath,planning.id,'revise-receipt',x.planEvidence,
+      {previousRevisionId:original.id,rawPath:corrected});
+    const decisionFile=recoveryFile(x,decision),headBefore=git(x.root,'rev-parse','HEAD');
+    const repaired=x.call('recover-result',statePath,decisionFile);
+    assert.equal(repaired.status,0,repaired.stderr);
+    const final=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const chain=final.v3.receiptRecords.find((r:{jobId:string})=>r.jobId===planning.id);
+    assert.equal(chain.revisions.length,2);
+    assert.equal(chain.revisions[1].previousId,original.id);
+    assert.equal(chain.revisions[1].status,'accepted');
+    assert.equal(final.jobs.find((j:{id:string})=>j.id===planning.id).status,'done');
+    assert.deepEqual(fs.readFileSync(original.rawPath),bad);
+    assert.equal(final.tickets[0].failureBudget.totalRetries,1);
+    assert.equal(git(x.root,'rev-parse','HEAD'),headBefore);
+    const stale=x.call('recover-result',statePath,decisionFile);
+    assert.notEqual(stale.status,0);assert.match(stale.stderr,/版本已过期/);
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('宿主结构化结果优先于冲突文件和终态文本；纯文件结果保留非法原文', () => {
+  const x=fixture();
+  try {
+    const {statePath,planning}=planned(x),host=controlledHost(x);
+    assert.equal(JSON.parse(x.call('dispatch',statePath,planning.id).stdout).status,'running');
+    const state=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const token=state.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===planning.id).token;
+    const packet=JSON.parse(fs.readFileSync(state.v3.dispatchRecords[0].packetPath,'utf8'));
+    const file=path.join(packet.outputDirectory,'host-result.json');fs.writeFileSync(file,'{"complete":');
+    const checks=path.join(x.temp,'structured-checks.md');fs.writeFileSync(checks,'checked\n');
+    host.set(db=>{db.actors[token].state='completed';db.actors[token].resultFile=file;
+      db.actors[token].finalText='{"complete":false,"status":"wrong"}';
+      db.actors[token].result={complete:true,status:'planned',evidencePath:x.planEvidence,
+        data:{planPath:x.planPath,checksPath:checks}};});
+    const structured=x.call('collect',statePath,planning.id);assert.equal(structured.status,0,structured.stderr);
+    const accepted=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const rev=accepted.v3.receiptRecords.find((r:{jobId:string})=>r.jobId===planning.id).revisions[0];
+    assert.equal(rev.source,'host_structured');
+    assert.equal(accepted.jobs.find((j:{id:string})=>j.id===planning.id).status,'done');
+    assert.equal(host.get().starts,1);
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+  const y=fixture();
+  try {
+    const {statePath,planning}=planned(y),host=controlledHost(y);
+    assert.equal(JSON.parse(y.call('dispatch',statePath,planning.id).stdout).status,'running');
+    const state=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const token=state.v3.dispatchRecords[0].token;
+    const packet=JSON.parse(fs.readFileSync(state.v3.dispatchRecords[0].packetPath,'utf8'));
+    const file=path.join(packet.outputDirectory,'broken.json');
+    const bytes=Buffer.from('{"complete":true,"status":"planned","evidencePath":"bad\\q"');
+    fs.writeFileSync(file,bytes);
+    host.set(db=>{db.actors[token].state='completed';db.actors[token].resultFile=file;
+      db.actors[token].finalText='{"complete":true,"status":"planned"}';});
+    const collected=y.call('collect',statePath,planning.id);assert.equal(collected.status,0,collected.stderr);
+    assert.equal(JSON.parse(collected.stdout).polled[0].status,'uncertain');
+    const failed=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const rev=failed.v3.receiptRecords.find((r:{jobId:string})=>r.jobId===planning.id).revisions[0];
+    assert.equal(rev.source,'host_file');assert.deepEqual(fs.readFileSync(rev.rawPath),bytes);
+    assert.equal(failed.jobs.find((j:{id:string})=>j.id===planning.id).status,'running');
+  } finally {fs.rmSync(y.temp,{recursive:true,force:true});}
+});
+
+test('错误绑定经宿主实例日志纠正；相同版本的第二次纠正被拒绝', () => {
+  const x=fixture();
+  try {
+    const {statePath,planning}=planned(x),host=controlledHost(x);
+    host.set(db=>{db.mode='lost-response';});
+    assert.equal(JSON.parse(x.call('dispatch',statePath,planning.id).stdout).status,'uncertain');
+    host.set(db=>{db.mode='wrong-association';});
+    assert.equal(JSON.parse(x.call('collect',statePath,planning.id).stdout).polled[0].status,'uncertain');
+    const state=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const token=state.v3.dispatchRecords[0].token,nativeId='host-actor-'+token;
+    assert.equal(state.jobs.find((j:{id:string})=>j.id===planning.id).nativeId,'');
+    const decision=recoveryDecision(statePath,planning.id,'correct-binding',x.planEvidence,
+      {expectedNativeId:'',nativeId});
+    const decisionFile=recoveryFile(x,decision);
+    const fixed=x.call('recover-result',statePath,decisionFile);assert.equal(fixed.status,0,fixed.stderr);
+    const after=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(after.jobs.find((j:{id:string})=>j.id===planning.id).nativeId,nativeId);
+    assert.equal(after.v3.recoveryRecords.at(-1).afterNativeId,nativeId);
+    assert.equal(host.get().starts,1);
+    const stale=x.call('recover-result',statePath,decisionFile);assert.notEqual(stale.status,0);
+    assert.match(stale.stderr,/版本已过期/);
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('独立回执修复者只提交原任务修订，不重复启动原业务实例', () => {
+  const x=fixture();
+  try {
+    const {statePath,planning}=planned(x),host=controlledHost(x);
+    assert.equal(JSON.parse(x.call('dispatch',statePath,planning.id).stdout).status,'running');
+    const token=JSON.parse(fs.readFileSync(statePath,'utf8')).v3.dispatchRecords[0].token;
+    host.set(db=>{db.actors[token].state='completed';db.actors[token].result='{"complete":';});
+    assert.equal(JSON.parse(x.call('collect',statePath,planning.id).stdout).polled[0].status,'uncertain');
+    assert.equal(JSON.parse(x.call('collect',statePath,planning.id).stdout).polled[0].status,'uncertain');
+    const failed=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(failed.tickets[0].failureBudget.totalRetries,1);
+    const rev=failed.v3.receiptRecords.find((r:{jobId:string})=>r.jobId===planning.id).revisions[0];
+    const decision=recoveryDecision(statePath,planning.id,'prepare-repair',x.planEvidence,
+      {previousRevisionId:rev.id});
+    const prepared=x.call('recover-result',statePath,recoveryFile(x,decision));
+    assert.equal(prepared.status,0,prepared.stderr);
+    const pending=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const repair=pending.jobs.find((j:{action:string})=>j.action==='repair-receipt');assert.ok(repair);
+    const repairDispatch=pending.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===repair.id);
+    const packet=JSON.parse(fs.readFileSync(repairDispatch.packetPath,'utf8'));
+    assert.equal(packet.repairContext.rawPath,rev.rawPath);
+    assert.equal(packet.resourceGrant.worktreeWrite,false);
+    assert.equal(JSON.parse(x.call('dispatch',statePath,repair.id).stdout).status,'running');
+    const checks=path.join(x.temp,'independent-checks.md');fs.writeFileSync(checks,'checked\n');
+    host.set(db=>{db.actors[repairDispatch.token].state='completed';
+      db.actors[repairDispatch.token].result={complete:true,status:'planned',evidencePath:x.planEvidence,
+        data:{planPath:x.planPath,checksPath:checks}};});
+    const finished=x.call('collect',statePath,repair.id);assert.equal(finished.status,0,finished.stderr);
+    const final=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(final.jobs.find((j:{id:string})=>j.id===planning.id).status,'done');
+    assert.equal(final.jobs.find((j:{id:string})=>j.id===repair.id).status,'done');
+    const chain=final.v3.receiptRecords.find((r:{jobId:string})=>r.jobId===planning.id);
+    assert.equal(chain.revisions[1].previousId,rev.id);
+    assert.equal(chain.revisions[1].repairJobId,repair.id);
+    assert.equal(host.get().starts,2);
+    assert.equal(Object.keys(host.get().actors).filter(t=>t===token).length,1);
+    assert.deepEqual(fs.readFileSync(rev.rawPath),Buffer.from('{"complete":'));
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('不同失败修订耗尽统一预算后停止同候选重试，旧 ready 不会再消费', () => {
+  const x=fixture();
+  try {
+    const {statePath,planning}=planned(x),binding=path.join(x.temp,'binding.json');
+    x.observe('budget-actor',planning.id,'large');
+    fs.writeFileSync(binding,JSON.stringify({nativeId:'budget-actor'}));
+    assert.equal(x.call('bind',statePath,planning.id,binding).status,0);
+    const first=x.call('stage',statePath,planning.id,'{');assert.notEqual(first.status,0);
+    for(const bad of ['not-json','```json\n{}\n```']) {
+      const state=JSON.parse(fs.readFileSync(statePath,'utf8'));
+      const current=state.v3.receiptRecords.find((r:{jobId:string})=>r.jobId===planning.id).currentId;
+      const rawPath=path.join(x.temp,`bad-${state.revision}.txt`);fs.writeFileSync(rawPath,bad);
+      const decision=recoveryDecision(statePath,planning.id,'revise-receipt',x.planEvidence,
+        {previousRevisionId:current,rawPath});
+      const repaired=x.call('recover-result',statePath,recoveryFile(x,decision));
+      assert.notEqual(repaired.status,0);
+    }
+    const exhausted=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(exhausted.tickets[0].failureBudget.totalRetries,3);
+    assert.equal(exhausted.tickets[0].phase,'replan');
+    assert.equal(exhausted.v3.receiptRecords[0].revisions.length,3);
+    const collected=x.call('collect',statePath,planning.id);assert.equal(collected.status,0,collected.stderr);
+    const after=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(after.tickets[0].failureBudget.totalRetries,3);
+    assert.equal(after.jobs.find((j:{id:string})=>j.id===planning.id).status,'running');
+    const next=x.call('next',statePath);assert.equal(next.status,0,next.stderr);
+    assert.ok(!JSON.parse(next.stdout).jobs.some((j:{ticket:string})=>j.ticket===planning.ticket));
   } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
 });

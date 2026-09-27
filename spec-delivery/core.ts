@@ -32,6 +32,8 @@ export interface ProtocolV3 {
   skillMigrations?: { at: string; evidencePath: string;
     changes: { capability: SkillCapability; previousFingerprint: string; nextFingerprint: string }[] }[];
   dispatchRecords: DispatchRecord[];
+  receiptRecords?: ReceiptRecord[];
+  recoveryRecords?: RecoveryRecord[];
 }
 export function initialProtocolV3(): ProtocolV3 {
   return { executionPath: 'legacy-v02', decisionRecords: [], skillInvocations: [], dispatchRecords: [] };
@@ -48,6 +50,21 @@ export interface HostInstanceRecord {
   key: string; nativeId: string | null; state: 'requested' | 'running' | 'completed' | 'cancelled' | 'unknown';
   session?: NativeSession; firstSeenAt: string; lastSeenAt: string; events: HostEventRef[];
   startedAt?: string; completedAt?: string; cancelledAt?: string; rawUsage?: Json; bindingError?: string;
+  continuationSupported?: boolean;
+}
+export type ReceiptSource = 'stage' | 'host_structured' | 'host_file' | 'repair';
+export interface ReceiptRevision {
+  id: string; previousId?: string; source: ReceiptSource; rawPath: string; rawSha256: string;
+  sourceHostEvent?: string; sourceNativeId?: string; repairJobId?: string;
+  candidateVersion: string; at: string; status: 'raw' | 'schema_valid' | 'rejected' | 'accepted';
+  error?: string;
+}
+export interface ReceiptRecord { jobId: string; revisions: ReceiptRevision[]; currentId?: string; acceptedId?: string }
+export interface RecoveryRecord {
+  id: string; kind: 'cancel' | 'confirm-stop' | 'correct-binding' | 'revise-receipt' | 'prepare-repair' | 'abandon';
+  jobId: string; expectedRevision: number; dispatchToken: string; attempt: number;
+  evidencePath: string; reason: string; beforeNativeId?: string; afterNativeId?: string;
+  receiptRevisionId?: string; repairJobId?: string; priorBindingError?: string; at: string;
 }
 export interface DispatchRecord {
   jobId: string; attempt: number; token: string; targetHost: string; requestedModel: string;
@@ -83,7 +100,7 @@ export interface ExecutionPlan { capabilities: Capabilities; policy: Policy; tic
   inputVersion?: string; sourceVersion?: string; decisionNativeId?: string;
 }
 export type Phase = 'claim' | 'plan' | 'plan_check' | 'implement' | 'queued' | 'self' | 'verify' | 'publish' | 'review' | 'fresh' | 'accept' | 'integrate' | 'replan' | 'recovery' | 'merge' | 'close' | 'cleanup' | 'done' | 'human' | 'blocked';
-export type Action = 'claim' | 'plan' | 'plan-check' | 'implement' | 'self-standards' | 'self-spec' | 'verify' | 'publish' | 'review-lens' | 'confirm' | 'adjudicate' | 'review-report' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'spec-audit' | 'spec-close';
+export type Action = 'claim' | 'plan' | 'plan-check' | 'implement' | 'self-standards' | 'self-spec' | 'verify' | 'publish' | 'review-lens' | 'confirm' | 'adjudicate' | 'review-report' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'spec-audit' | 'spec-close' | 'repair-receipt';
 export interface Evidence {
   head: string; base: string; path: string;
   /** These are separate observations: a remote PR head need not equal an unpushed local head. */
@@ -141,6 +158,8 @@ export interface Job {
   tier: Tier; model: string; executor: 'agent' | 'main' | 'command'; fresh: boolean; contextKey: string;
   head: string; base: string; tests: number; status: 'leased' | 'running' | 'done' | 'cancelled';
   nativeId: string; result?: Result; finding?: Finding;
+  repairOfJobId?: string;
+  repairTargetRevisionId?: string;
   dispatchToken?: string;
   inputVersion?: string; candidateVersion?: string; session?: NativeSession; decisionArtifactDigest?: string; decisionArtifactFiles?: string[];
   timing?: { leasedAt: string; boundAt?: string; startedAt?: string; resultAt?: string; completedAt?: string; cancelledAt?: string };

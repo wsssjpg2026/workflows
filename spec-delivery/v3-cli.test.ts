@@ -805,6 +805,42 @@ test('独立回执修复者只提交原任务修订，不重复启动原业务�
   } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
 });
 
+test('可靠续接的原 actor 修订须匹配后续宿主事件和原始字节', () => {
+  const x=fixture();
+  try {
+    const {statePath,planning}=planned(x),host=controlledHost(x);
+    assert.equal(JSON.parse(x.call('dispatch',statePath,planning.id).stdout).status,'running');
+    const token=JSON.parse(fs.readFileSync(statePath,'utf8')).v3.dispatchRecords[0].token;
+    host.set(db=>{db.actors[token].state='completed';db.actors[token].result='{"complete":';
+      db.actors[token].continuationSupported=true;});
+    assert.equal(JSON.parse(x.call('collect',statePath,planning.id).stdout).polled[0].status,'uncertain');
+    const failed=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const previous=failed.v3.receiptRecords[0].currentId;
+    const checks=path.join(x.temp,'continued-checks.md');fs.writeFileSync(checks,'checked\n');
+    const corrected={complete:true,status:'planned',evidencePath:x.planEvidence,
+      data:{planPath:x.planPath,checksPath:checks}};
+    host.set(db=>{db.actors[token].result=corrected;});
+    assert.equal(JSON.parse(x.call('collect',statePath,planning.id).stdout).polled[0].status,'uncertain');
+    const evidence=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const continuedEvent=evidence.v3.dispatchRecords[0].events.at(-1).evidencePath;
+    const rawPath=path.join(x.temp,'continued.json');fs.writeFileSync(rawPath,JSON.stringify(corrected));
+    const decision=recoveryDecision(statePath,planning.id,'revise-receipt',x.planEvidence,
+      {previousRevisionId:previous,rawPath,continuationHostEvent:continuedEvent});
+    const wrong=path.join(x.temp,'wrong.json');fs.writeFileSync(wrong,'{}');
+    const rejected=x.call('recover-result',statePath,recoveryFile(x,{...decision,rawPath:wrong}));
+    assert.notEqual(rejected.status,0);assert.match(rejected.stderr,/权威结果字节不符/);
+    const accepted=x.call('recover-result',statePath,recoveryFile(x,decision));
+    assert.equal(accepted.status,0,accepted.stderr);
+    const final=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const revised=final.v3.receiptRecords[0].revisions[1];
+    assert.equal(revised.previousId,previous);
+    assert.equal(revised.sourceHostEvent,continuedEvent);
+    assert.equal(revised.sourceNativeId,'host-actor-'+token);
+    assert.equal(final.jobs.find((j:{id:string})=>j.id===planning.id).status,'done');
+    assert.equal(host.get().starts,1);
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
 test('不同失败修订耗尽统一预算后停止同候选重试，旧 ready 不会再消费', () => {
   const x=fixture();
   try {

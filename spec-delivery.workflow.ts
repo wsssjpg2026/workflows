@@ -1050,7 +1050,7 @@ interface RecoveryDecision {
   dispatchToken: string; attempt: number; expectedCandidateVersion: string;
   reason: string; evidencePath: string; previousRevisionId?: string; rawPath?: string;
   expectedNativeId?: string; nativeId?: string; processTreeStopped?: boolean;
-  observedState?: 'stopped' | 'lost';
+  observedState?: 'stopped' | 'lost'; continuationHostEvent?: string;
 }
 function recoveryTarget(s: engine.State, d: RecoveryDecision) {
   requireProtocol(s);
@@ -1078,6 +1078,39 @@ function appendRecovery(s: engine.State, d: RecoveryDecision, fields: Partial<en
   s.v3!.recoveryRecords.push(record);
   engine.event(s, `${d.jobId} 恢复 ${d.kind}：${record.reason}`);
   return record;
+}
+function verifyContinuationSource(s:engine.State,d:engine.DispatchRecord,j:engine.Job,
+  decision:RecoveryDecision,previous:engine.ReceiptRevision,bytes:Buffer) {
+  engine.ensure(decision.continuationHostEvent && j.nativeId && j.session,
+    '托管 actor 的修订需要可靠续接宿主事件；否则先 prepare-repair');
+  verifySessionArtifact(j.session);
+  const instance=d.instances.find(i=>i.nativeId===j.nativeId);
+  engine.ensure(instance?.continuationSupported===true,
+    '宿主未证明同一 actor 可续接；请登记独立回执修复任务');
+  const ref=d.events.find(e=>e.evidencePath===decision.continuationHostEvent);
+  engine.ensure(ref && ['query','collect','start'].includes(ref.kind) &&
+    Date.parse(ref.at)>=Date.parse(previous.at) &&
+    sha(fs.readFileSync(safeFile(ref.evidencePath),'utf8'))===ref.digest,
+    '续接事件不是当前 token 的可信后续宿主事件');
+  const event=read<{stdout:string}>(ref.evidencePath);
+  const reply=JSON.parse(event.stdout) as HostReply;
+  engine.ensure(reply.token===d.token && reply.jobId===j.id && reply.targetHost===d.targetHost &&
+    reply.nativeId===j.nativeId && reply.state==='completed' && reply.continuationSupported===true,
+    '续接事件未证明原 actor 完成修订');
+  let authoritative:Buffer;
+  if(reply.result!==undefined)
+    authoritative=Buffer.from(typeof reply.result==='string'?reply.result:JSON.stringify(reply.result));
+  else {
+    engine.ensure(reply.resultFile,'续接事件缺少权威结果');
+    const packet=read<{outputDirectory:string}>(d.packetPath),output=fs.realpathSync(packet.outputDirectory);
+    const named=path.resolve(output,reply.resultFile);
+    engine.ensure(named.startsWith(output+path.sep) && !fs.lstatSync(named).isSymbolicLink() &&
+      fs.realpathSync(named)===named && fs.statSync(named).isFile(),
+      '续接结果文件必须位于当前 packet 输出目录');
+    authoritative=fs.readFileSync(named);
+  }
+  engine.ensure(authoritative.equals(bytes),'修订原文与宿主续接的权威结果字节不符');
+  return ref.evidencePath;
 }
 function readReceiptRaw(revision: engine.ReceiptRevision): unknown {
   const bytes = fs.readFileSync(revision.rawPath);
@@ -1166,6 +1199,12 @@ function stageRawResult(statePath: string, id: string, bytes: Buffer, source: en
         current.currentId===options.recovery.previousRevisionId,'原始回执修订链已改变');
       engine.ensure(current.revisions.find(x=>x.id===current.currentId)?.candidateVersion===
         options.recovery.expectedCandidateVersion,'原始回执的候选版本已变化；进入正常诊断');
+      if(target.dispatch.managed) {
+        const previous=current.revisions.find(x=>x.id===current.currentId)!;
+        options.sourceHostEvent=verifyContinuationSource(s,target.dispatch,j,
+          options.recovery,previous,bytes);
+        options.sourceNativeId=j.nativeId;
+      }
       options.previousId=current.currentId;
     }
     if (source === 'repair' && options.repairJobId) {
@@ -1199,7 +1238,8 @@ function stageRawResult(statePath: string, id: string, bytes: Buffer, source: en
     const revision = archiveReceipt(s, statePath, j, bytes, source, options); revisionId = revision.id;
     if (priorCurrentId!==revision.id && record.currentId===revision.id && fs.existsSync(resultPaths(statePath,id).ready))
       fs.rmSync(resultPaths(statePath,id).ready);
-    if (options.recovery) appendRecovery(s,options.recovery,{receiptRevisionId:revision.id});
+    if (options.recovery) appendRecovery(s,options.recovery,
+      {receiptRevisionId:revision.id,afterNativeId:options.sourceNativeId});
     if (source === 'repair' && options.repairJobId) {
       const repair=s.jobs.find(x=>x.id===options.repairJobId)!;
       repair.status='done';repair.timing??={leasedAt:''};repair.timing.completedAt=new Date().toISOString();

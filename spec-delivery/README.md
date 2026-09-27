@@ -67,7 +67,7 @@ TypeScript 宿主也可使用 `spec-delivery/skills.ts` 的 `invokeBoundSkill`�
 
 `recover-result <state> <decision.json>` 接受 `kind` 为 `cancel`、`confirm-stop`、`correct-binding`、`revise-receipt`、`prepare-repair` 或 `abandon` 的决定。共同字段为 `{jobId,expectedRevision,dispatchToken,attempt,expectedCandidateVersion,reason,evidencePath}`，均取自最新 `inspect` 与派发记录，并指向已存在的证据文件。`dispatch-cancel <state> <decision.json>` 是 `kind:"cancel"` 的兼容入口。取消只归档请求；`confirm-stop` 还需 `{observedState:"stopped"|"lost",processTreeStopped:true}`，并确认宿主实例与测试进程树停止后才释放租约。`correct-binding` 需 `{expectedNativeId,nativeId}`，新身份必须在当前 token 的实例日志中，并由原生会话查询再次核对真实模型；仍可能运行的旧实例还需完整进程树停止证明。
 
-格式修订用 `kind:"revise-receipt"`，增加 `{previousRevisionId,rawPath}`。命令在锁内检查版本和原始修订，追加链接原件的新修订，只重新验证结果，不重新执行实现、推送、评论或合并。宿主无法可靠续接时，可用 `kind:"prepare-repair"` 加 `{previousRevisionId}` 登记独立 `repair-receipt` job；其 packet 带原始字节、错误、候选与预期 head/base，禁止工作区写入。按普通 `dispatch/collect` 收取该 job 的真实宿主身份和新回执，原 job 仍须通过全部门禁。候选变化或证据不足需按正常诊断和重规划处理。
+格式修订用 `kind:"revise-receipt"`，增加 `{previousRevisionId,rawPath}`。托管宿主还须提供 `continuationHostEvent`，指向当前 token 的后续 `query/collect/start` 原始事件；命令核对同一原生 actor 的续接能力、终态及权威结果字节。命令在锁内检查版本和原始修订，追加链接原件的新修订，只重新验证结果，不重新执行实现、推送、评论或合并。宿主无法可靠续接时，可用 `kind:"prepare-repair"` 加 `{previousRevisionId}` 登记独立 `repair-receipt` job；其 packet 带原始字节、错误、候选与预期 head/base，禁止工作区写入。按普通 `dispatch/collect` 收取该 job 的真实宿主身份和新回执，原 job 仍须通过全部门禁。候选变化或证据不足需按正常诊断和重规划处理。
 
 **ZCode**：先读取本机 `dynamic-workflows` 技能。`zcode <state>` 为已预留的同模型 jobs 生成原生脚本、`CreateWorkflow` 参数和 `binding` 模板。实际调用后，把返回的 `runId` 加入模板并调用 `bind-batch <state> <binding.json>`。身份格式为 `{runId,jobs:[{jobId,actorName}]}`。CLI 以 `{runId}/{actorName}` 查询宿主观测。响应不确定时先查询原生运行，不能重新启动同一批。
 

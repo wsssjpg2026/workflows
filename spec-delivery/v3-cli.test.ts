@@ -102,7 +102,12 @@ test('v3 公开 CLI 从五项输入初始化、规划、认领并登记一次 ag
     const initial = JSON.parse(fs.readFileSync(statePath, 'utf8'));
     assert.equal(initial.protocol, 3);
     assert.equal(initial.mainSession.source, 'unknown');
-    assert.deepEqual(initial.v3, { executionPath: 'legacy-v02', decisionRecords: [], skillInvocations: [], dispatchRecords: [] });
+    assert.equal(initial.v3.executionPath, 'legacy-v02');
+    assert.deepEqual(initial.v3.decisionRecords, []);
+    assert.deepEqual(initial.v3.skillInvocations, []);
+    assert.deepEqual(initial.v3.dispatchRecords, []);
+    assert.deepEqual(initial.v3.skillBindings.map((binding: {capability:string})=>binding.capability),
+      ['implementation','diagnosis','authorReview','prReview','handoff']);
     assert.deepEqual(Object.keys(initial.inputs).sort(), ['models', 'spec', 'targetBranch']);
     assert.equal(initial.repo.root, x.root);
     assert.equal(initial.facts.base, x.head);

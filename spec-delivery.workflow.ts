@@ -14,6 +14,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import * as engine from './spec-delivery/core.ts';
 import * as gh from './spec-delivery/github.ts';
 import { normalizeResult, resultPaths, metrics } from './spec-delivery/host.ts';
+import * as skills from './spec-delivery/skills.ts';
 import { summarize } from './spec-delivery/summary.ts';
 export * from './spec-delivery/core.ts';
 
@@ -64,6 +65,20 @@ function nativeSession(statePath: string, nativeId: string, jobId: string): engi
 function verifySessionArtifact(session: engine.NativeSession) {
   engine.ensure(sha(fs.readFileSync(safeFile(session.evidencePath), 'utf8').trimEnd()) === session.evidenceDigest,
     '宿主原生会话观测归档已改变');
+}
+function skillObservation(statePath: string, operation: 'capabilities' | 'result', id: string, jobId: string) {
+  const observer = process.env.SPEC_DELIVERY_SKILL_OBSERVER;
+  engine.ensure(observer && path.isAbsolute(observer) && fs.statSync(observer).isFile(),
+    '宿主未提供可信技能调用查询适配器 SPEC_DELIVERY_SKILL_OBSERVER');
+  const output = command(path.dirname(statePath), observer, [operation, id, jobId]);
+  const raw = JSON.parse(output) as Record<string, unknown>;
+  engine.ensure(raw?.source === 'native_host' && raw.jobId === jobId, '技能宿主观测不属于当前 job');
+  const directory = path.join(path.dirname(statePath), 'skill-observations');
+  fs.mkdirSync(directory, { recursive: true });
+  const file = path.join(directory, `${sha(`${operation}:${id}:${jobId}`).slice(0, 20)}-${sha(output).slice(0, 20)}.json`);
+  if (!fs.existsSync(file)) fs.writeFileSync(file, output + '\n', { flag: 'wx', mode: 0o444 });
+  else engine.ensure(fs.readFileSync(file, 'utf8').trimEnd() === output, '技能宿主观测归档发生冲突');
+  return { raw, file };
 }
 function artifactFingerprint(files: string[]) {
   const unique = [...new Set(files.map(file => path.resolve(file)))];
@@ -417,7 +432,9 @@ export function initialize(inputs: engine.Inputs, cwd = process.cwd()) {
   engine.ensure(parent.state === 'OPEN', '目标 spec 已关闭'); engine.ensure(children.length, '目标 spec 尚无可读取的既有 sub-issues');
   const base = gh.targetHead(repo, inputs.targetBranch);
   excludeRuntime(repo.root);
-  const s: engine.State = { schema: 1, protocol: engine.currentProtocol, v3: engine.initialProtocolV3(), id: randomUUID(), revision: 0, inputs, spec, repo, status: 'planning', tickets: [], jobs: [],
+  const v3 = engine.initialProtocolV3();
+  v3.skillBindings = skills.defaultSkillBindings();
+  const s: engine.State = { schema: 1, protocol: engine.currentProtocol, v3, id: randomUUID(), revision: 0, inputs, spec, repo, status: 'planning', tickets: [], jobs: [],
     specCriteria: [], planEvidence: '', auditEpoch: 1, events: [], mainSession: { source: 'unknown', at: new Date().toISOString() },
     facts: { base, issueStates: Object.fromEntries([parent, ...children].map(i => [String(i.number), i.state])), prs: {}, at: new Date().toISOString() } };
   if (process.env.SPEC_DELIVERY_MAIN_NATIVE_ID) {
@@ -461,6 +478,13 @@ export function packet(s: engine.State, j: engine.Job, statePath: string) {
     dispute: j.dispute ? Object.fromEntries(Object.entries(j.dispute).map(([key, id]) => [key, resultPaths(statePath, id).result])) : null,
     remainingWork: j.ticket === '$spec' ? s.tickets.map(x => ({number:x.number,phase:x.phase,dependencies:x.dependencies,reason:x.reason})) : [],
     lens: j.action === 'review-lens' ? engine.lenses[Number(j.part)] : '',
+    skillBindings: s.v3?.skillBindings?.map(b => ({ capability: b.capability, name: b.name,
+      sourcePath: b.sourcePath, fingerprint: b.fingerprint })) || [],
+    skillCall: j.action === 'implement'
+      ? { capabilities: ['implementation', 'diagnosis', 'handoff'], command: 'skill-start',
+          finishCommand: 'skill-finish', resultField: 'data.skillInvocationIds',
+          note: '按计划显式调用已绑定 implement 或 diagnosing-bugs；完成候选后显式调用原始 handoff。宿主执行真实技能后提交外围回执。' }
+      : null,
     rolesPath, outputDirectory: out, resultPath: path.join(out, 'result.json'),
     resourceGrant: { agentSlots: j.executor === 'agent' ? 1 : 0, testBatches: j.tests, nestedAgents: false },
     note: '读角色约束与来源；仅执行本 job。main loop 和并行审查由内核调度，agent 不自行派隐藏子 agent。' };
@@ -477,6 +501,11 @@ function claimLease(s: engine.State, j: engine.Job, statePath: string) {
 function validateResult(s: engine.State, j: engine.Job, r: engine.Result) {
   safeFile(r.evidencePath);
   if (r.handoffPath) safeFile(r.handoffPath);
+  if (s.v3?.skillBindings && r.data?.skillInvocationIds) {
+    engine.ensure(Array.isArray(r.data.skillInvocationIds) && r.data.skillInvocationIds.every(x => typeof x === 'string'),
+      '技能调用引用必须是 ID 数组');
+    skills.verifySkillResultFiles(s, j, r.data.skillInvocationIds as string[], r.handoffPath);
+  }
   const t = s.tickets.find(t => t.key === j.ticket); if (!t || !r.complete) return;
   engine.ensure(t.phase !== 'recovery', '工作区尚在恢复，原任务回执不能签发新候选证据');
   if (j.action === 'plan-check' && s.planEvidence) {
@@ -847,7 +876,7 @@ export async function main(argv: string[]): Promise<unknown> {
   const [op, file, extra, fourth] = argv;
   if(op==='version')return {workflow:'spec-delivery',version:workflowVersion};
   if (!op || op === 'help') return { workflow: 'spec-delivery', input: ['spec', 'targetBranch', 'models.L1', 'models.L2', 'models.L3'],
-    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan-context <state>', 'decision-context <state>', 'plan <state> <plan.json>', 'observe-main <state> <native-id>', 'drive <state>', 'next <state>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'stage <state> <jobId> <result-json>', 'collect <state>', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'test <state> <jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'recover-workspace <state> <ticket> <decision.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'metrics <state>', 'resume <state>', 'zcode <state>'] };
+    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan-context <state>', 'decision-context <state>', 'plan <state> <plan.json>', 'observe-main <state> <native-id>', 'drive <state>', 'next <state>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'skill-start <state> <jobId> <host-capabilities.json>', 'skill-finish <state> <invocationId> <outcome.json>', 'migrate-skills <state> <migration.json>', 'stage <state> <jobId> <result-json>', 'collect <state>', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'test <state> <jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'recover-workspace <state> <ticket> <decision.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'metrics <state>', 'resume <state>', 'zcode <state>'] };
   engine.ensure(file, '缺少输入文件/状态路径');
   // summary 在 lock() 之前返回：只验证可读协议，不创建/等待/恢复/删除状态锁，也不进入写路径。
   if (op === 'summary') return summarizeLedger(path.resolve(file));
@@ -912,10 +941,51 @@ export async function main(argv: string[]): Promise<unknown> {
       }
       if(s.status!=='complete'){s.specAudit=undefined;s.auditEpoch++;}
       s.validationOwner=undefined;s.protocol=engine.currentProtocol;s.v3=engine.initialProtocolV3();
+      s.v3.skillBindings=skills.defaultSkillBindings();
       engine.event(s,`迁移为运行协议 3；原账本备份：${backup}；保留全部原结果和已完成工单。对账依据：${proof.evidencePath}`);
       save(statePath,s);return {statePath,status:s.status,upgraded:true,backupPath:backup};
     }
     if(!['bind','submit','reconcile','retire'].includes(op))requireProtocol(s);
+    if (op === 'skill-start') {
+      engine.ensure(extra && fourth, '需要 jobId 与宿主技能能力文件');
+      const j = s.jobs.find(j => j.id === extra); engine.ensure(j, '未知技能执行 job');
+      engine.ensure(j.session, '技能调用需要真实宿主会话观测'); verifySessionArtifact(j.session);
+      const request = read<{capability:engine.SkillCapability}>(fourth);
+      engine.ensure(skills.skillCapabilities.includes(request.capability), '未知技能能力，不能查询宿主或启动调用');
+      const observation = skillObservation(statePath, 'capabilities', request.capability, j.id);
+      engine.ensure(observation.raw.capability === request.capability && observation.raw.capabilities,
+        '技能宿主未返回当前能力的实际调用入口');
+      const prepared = skills.prepareSkillCall(s, j, request.capability,
+        observation.raw.capabilities as skills.SkillHostCapabilities, statePath);
+      if (!prepared.alreadyStarted) {
+        prepared.invocation.hostCapabilityPath=observation.file;
+        prepared.invocation.hostCapabilitySha256=sha(fs.readFileSync(observation.file,'utf8'));
+      }
+      save(statePath, s);
+      return { invocationId: prepared.invocation.id, mode: prepared.invocation.mode,
+        nativeEntry: prepared.nativeEntry || null, sourceArchivePath: prepared.invocation.sourceArchivePath,
+        bindingFingerprint: prepared.invocation.bindingFingerprint, alreadyStarted: prepared.alreadyStarted,
+        instruction: prepared.alreadyStarted ? '已登记调用；先查询宿主状态，不重复启动' :
+          '宿主按 mode 执行已授权技能；native_explicit 调原生入口，source_execution 加载 sourceArchivePath 的原始文件。终态后提交 skill-finish。' };
+    }
+    if (op === 'skill-finish') {
+      engine.ensure(extra && fourth, '需要技能调用 ID 与外围回执文件');
+      const invocation=s.v3?.skillInvocations.find(i=>i.id===extra);
+      engine.ensure(invocation, '未知技能调用'); verifySessionArtifact(invocation.session);
+      const observation=skillObservation(statePath,'result',extra,invocation.jobId);
+      const outcome=read<Omit<skills.SkillOutcome,'hostReceiptPath'>>(fourth);
+      const result = skills.finishSkillCall(s, extra, {...outcome,hostReceiptPath:observation.file});
+      save(statePath, s);
+      return { invocationId: extra, status: result.status, blocking: result.blocking, result };
+    }
+    if (op === 'migrate-skills') {
+      engine.ensure(extra, '需要显式技能迁移文件');
+      const request=read<{expectedRevision:number;evidencePath:string;replacements:Partial<Record<engine.SkillCapability,string>>}>(extra);
+      engine.ensure(request.expectedRevision===s.revision, '技能迁移决定已过期；重新 inspect 当前账本');
+      const changed=skills.migrateSkillBindings(s,request.replacements || {},path.resolve(request.evidencePath));
+      save(statePath,s);
+      return {statePath,changed,revision:s.revision,status:s.status};
+    }
     if (op === 'recover-workspace') {
       engine.ensure(extra && fourth, '需要工单 key 与恢复决定文件');
       s.facts = observe(s);

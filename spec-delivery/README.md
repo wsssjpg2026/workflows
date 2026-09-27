@@ -71,7 +71,7 @@ TypeScript 宿主也可使用 `spec-delivery/skills.ts` 的 `invokeBoundSkill`�
 
 可信宿主设置绝对路径 `SPEC_DELIVERY_HOST_ADAPTER`，指向可执行适配器。CLI 以 `<operation> <request.json>` 调用它；`request.json` 是已落盘的 `{token,jobId,attempt,targetHost,requestedModel,packetPath}`。操作包括 `query`、`start`、`collect`、`cancel`。每次调用的原始 stdout、stderr、退出码和时间会以只追加文件保存在 `host-events/`；账本持有摘要和路径。适配器不能直接修改 `state.json`。
 
-`query` 应按 token 查询原生任务，返回 `{token,jobId,targetHost,state,nativeId?,authoritative?}`。`state` 可为 `not_found`、`running`、`completed`、`cancelled`、`unknown`。只有宿主能权威保证 token 不存在时才返回 `not_found,authoritative:true`。`start` 应先向宿主登记 token 与 job，再返回 `running` 或 `completed` 及稳定 `nativeId`；启动后响应丢失时，下次查询必须能找到同一实例。`collect` 返回 `completed`、`nativeId` 和 actor 的结构化 `result`，或指定 `resultFile`；完成事件也可在 `query` 或 `start` 中携带结果。两者并存时只采用结构化 `result`。`finalText` 是人类摘要，不作为第二份 JSON 来源。指定文件须位于本 job 的 packet `outputDirectory` 内。`cancel` 返回原生身份和终止状态；取消请求本身不释放工作区写权。运行中的回复可附 `startedAt`，终态可附 `completedAt/cancelledAt`、`continuationSupported` 与原始 `usage`。
+`query` 应按 token 查询原生任务，返回 `{token,jobId,targetHost,state,nativeId?,authoritative?}`。`state` 可为 `not_found`、`running`、`completed`、`cancelled`、`unknown`。只有宿主能权威保证 token 不存在时才返回 `not_found,authoritative:true`。`start` 应先向宿主登记 token 与 job，再返回 `running` 或 `completed` 及稳定 `nativeId`；启动后响应丢失时，下次查询必须能找到同一实例。`collect` 返回 `completed`、`nativeId` 和 actor 的结构化 `result`，或指定 `resultFile`；完成事件也可在 `query` 或 `start` 中携带结果。两者并存时只采用结构化 `result`。`finalText` 是人类摘要，不作为第二份 JSON 来源。指定文件须位于本 job 的 packet `outputDirectory` 内。文件回复可附 `resultSha256`；存在时核心对实际读入并归档的同一原始字节核对摘要，续接修订也执行同一核对。DSH 适配器在原生终态后将指定文件复制为只创建一次的终态快照并始终返回其摘要。现有 Codex/ZCode 适配器仍使用可选摘要契约，其原生终态与文件字节之间没有 DSH 快照的额外绑定。`cancel` 返回原生身份和终止状态；取消请求本身不释放工作区写权。运行中的回复可附 `startedAt`，终态可附 `completedAt/cancelledAt`、`continuationSupported` 与原始 `usage`。
 
 `dispatch <state> <jobId>` 总是先查询 token，确认不存在后才启动。`collect <state> [jobId]` 按 actor 独立查询、绑定和收取，重复调用不会覆盖完成结果。原生身份与角色模型由 `SPEC_DELIVERY_HOST_OBSERVER` 再次查询核验；适配器回复中声称的模型或 caller JSON 中的 `source` 不能充当该观测。查询错误、身份不符、无法确认是否已启动或结果尚不可读时，账本记为 `uncertain`，保留实际实例和原始事件。后续按同一 token 查询；不能盲目启动另一个 actor，也不宣称跨宿主事务的 exactly-once。
 
@@ -113,7 +113,7 @@ fresh 首轮 packet 只传原始 spec/issue 链接及缓存原件索引、候选
 
 ## 测试与 GitHub 观测
 
-所有 agent 的测试/构建/重型核验通过 `test <state> <jobId> <request.json>` 执行，请求格式 `{argv,timeoutSeconds,env?,reason}`。cwd 为任务 worktree。测试配额按实际执行占用；不足时等待，不改用未登记的旁路命令。退出码、候选、日志和失败证据保留，完成后释放配额。最终 spec 审计的测试会临时建立冻结目标 SHA 的 detached worktree，完成后清理干净的审计目录；`candidateStable:false` 的结果不能用于验收。确定性 `verify` 直接使用核心预留的配额。该协议依赖宿主和角色遵守，无法限制框架外的任意 shell 进程。
+所有 agent 的测试/构建/重型核验通过 `test <state> <jobId> <request.json>` 执行，请求格式 `{argv,timeoutSeconds,env?,reason}`。cwd 为任务 worktree。测试配额按实际执行占用；不足时等待，不改用未登记的旁路命令。测试命令和确定性 `verify` 不继承控制器的 `SPEC_DELIVERY_*`、`DSH_HOME`、`DSH_SESSION_ID`、`DSH_ADAPTER_WORKER`、`DSH_PERMISSION_MODE`；其它 `DSH_*` 变量保留，命令明确给出的 `env` 最后覆盖继承值。退出码、候选、日志和失败证据保留，完成后释放配额。最终 spec 审计的测试会临时建立冻结目标 SHA 的 detached worktree，完成后清理干净的审计目录；`candidateStable:false` 的结果不能用于验收。确定性 `verify` 直接使用核心预留的配额。该协议依赖宿主和角色遵守，无法限制框架外的任意 shell 进程。
 
 测试回执的 `candidate` 分别记录观察到的 `prHead`、`targetBase`、`localHead`、`testedHead`、`testedTree` 和适用时的 `integrationHead`。未提交工作参与测试时 `testedTree` 为 `null`，另记工作区内容指纹；不能把 Git HEAD 的树称为实际测试树。确定性 `verify` 对干净工作区记录真实 Git tree，候选变动则撤销旧测试证据。合并门禁核对本地测试树、集成候选和目标基线；GitHub 检查另记实际检查提交及其 Git tree，PR merge-ref 检查与 head 检查分开对账。
 

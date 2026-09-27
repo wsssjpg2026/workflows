@@ -138,16 +138,30 @@ function entryExists(file){
   try{fs.lstatSync(file);return true;}
   catch(error){if(error.code==='ENOENT')return false;throw error;}
 }
-function resultBytes(m){
-  const file=m.resultPath;
-  if(typeof file!=='string'||path.basename(file)!=='result.json'||
-    path.dirname(file)!==m.outputDirectory)return null;
+const terminalFile=m=>`dsh-terminal-${runId(m.token)}.raw`;
+function outputBytes(m,name){
+  if(typeof name!=='string'||path.basename(name)!==name)return null;
+  const file=path.join(m.outputDirectory,name);
   try{
     const output=fs.realpathSync(m.outputDirectory),stat=fs.lstatSync(file);
     if(output!==m.outputDirectory||!stat.isFile()||stat.isSymbolicLink()||
       fs.realpathSync(file)!==file)return null;
     return fs.readFileSync(file);
   }catch{return null;}
+}
+function resultBytes(m){
+  if(m.resultPath!==path.join(m.outputDirectory,'result.json'))return null;
+  return outputBytes(m,'result.json');
+}
+function snapshotTerminalResult(m,bytes){
+  const file=path.join(m.outputDirectory,terminalFile(m)),temporary=`${file}.${process.pid}.tmp`;
+  try{
+    const fd=fs.openSync(temporary,'wx',0o400);
+    try{fs.writeFileSync(fd,bytes);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
+    fs.linkSync(temporary,file); // no replacement of an earlier terminal snapshot
+    syncDir(m.outputDirectory);
+  }finally{if(fs.existsSync(temporary))fs.unlinkSync(temporary);}
+  return terminalFile(m);
 }
 function groupAlive(pid){
   if(!Number.isSafeInteger(pid)||pid<=0)return false;
@@ -197,11 +211,12 @@ function hostReply(c,r,digest,operation,kind='host'){
     const resultFile=finished.resultFile;
     if(!resultFile)return {...fields,state:'unknown',reason:'native task finished without a durable final message'};
     if((m.kind||'host')==='host'){
-      const bytes=resultBytes(m);
-      if(resultFile!=='result.json'||!bytes||sha(bytes)!==finished.resultSha256)
-        return {...fields,state:'unknown',reason:'designated result file is missing or changed'};
+      const bytes=outputBytes(m,resultFile);
+      if(resultFile!==terminalFile(m)||!bytes||sha(bytes)!==finished.resultSha256)
+        return {...fields,state:'unknown',reason:'terminal result snapshot is missing or changed'};
     }
-    return {...fields,state:'completed',completedAt:finished.at,resultFile};
+    return {...fields,state:'completed',completedAt:finished.at,resultFile,
+      resultSha256:finished.resultSha256};
   }
   const launchPath=path.join(m.home,'launch.json');
   if(fs.existsSync(launchPath)&&!groupAlive(read(launchPath).pid))
@@ -393,7 +408,10 @@ async function worker(c,home,configPath){
       }catch{/* retain the native instance and raw log; an invalid plan is not completed */}
     }else if(!bootstrap&&terminal){
       const bytes=resultBytes(m);
-      if(bytes){resultFile='result.json';resultSha256=sha(bytes);}
+      if(bytes){
+        try{resultFile=snapshotTerminalResult(m,bytes);resultSha256=sha(bytes);}
+        catch{/* conflicting or unwritable snapshot leaves native completion uncertain */}
+      }
     }
   }
   atomic(path.join(home,'finished.json'),{at:now(),exitCode:exitCode.code,signal:exitCode.signal,

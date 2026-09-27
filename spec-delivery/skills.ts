@@ -5,7 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {skillCapabilities,skillPackageNames,skillIdentity} from './skill-package.mjs';
-import { candidateVersion, ensure, event, currentProtocol, verifyNativeSession, type Job, type SkillBinding, type SkillCapability,
+import { candidateVersion, ensure, event, currentProtocol, skillChildAgentSlots, verifyNativeSession, type Job, type SkillBinding, type SkillCapability,
   inputVersion, type SkillChildRequest, type Tier, type SkillInvocation, type SkillMode, type SkillResult, type SkillStatus, type State } from './core.ts';
 
 const digest = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex');
@@ -148,7 +148,7 @@ export function delegateSkillChildren(s: State, invocationId: string, specs: Ski
       Object.keys(spec).every(key=>['key','instruction','tier','required','independent','skillCapability','head'].includes(key)),
       '技能子任务定义无效；模型只能来自已确认的 L1/L2/L3 路由');
     ensure(!spec.skillCapability || capabilities.includes(spec.skillCapability), '子任务引用未知技能能力');
-    const requiredAgents = skillActorDepth(s, job) + 2 + (spec.skillCapability ? 1 : 0);
+    const requiredAgents = skillChildAgentSlots(skillActorDepth(s, job),!!spec.skillCapability);
     ensure(s.policy && s.policy.agents >= requiredAgents,
       `技能子任务 ${spec.key} 的嵌套深度至少需要 ${requiredAgents} 个 agent 槽位（含主控）；请提高 L1 policy.agents 并重新规划`);
     ensure(spec.head === undefined || /^[0-9a-f]{40}$/.test(spec.head), '子任务候选 head 必须是完整提交 SHA');

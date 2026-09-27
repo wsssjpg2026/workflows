@@ -127,7 +127,9 @@ test('指定结果文件只在真实终态后交付；最终消息保留为非�
     assert.equal(x.ok('host',['query',requestPath]).state,'running',
       'an early result file cannot establish native completion');
     const complete=until(()=>x.ok('host',['collect',requestPath]),r=>r.state==='completed');
-    assert.equal(complete.resultFile,'result.json');
+    assert.match(complete.resultFile,/^dsh-terminal-[0-9a-f]{32}\.raw$/);
+    assert.equal(complete.resultSha256,sha(raw));
+    assert.equal(fs.readFileSync(path.join(path.dirname(resultPath),complete.resultFile),'utf8'),raw);
     assert.equal(fs.readFileSync(resultPath,'utf8'),raw);
     const home=path.join(x.runtime,'runs',sha('file-terminal').slice(0,32));
     assert.equal(fs.readFileSync(path.join(home,'native-final.txt'),'utf8'),finalText);
@@ -177,12 +179,19 @@ test('格式错误的指定文件保留原字节；终态后篡改或软链接�
     const raw='```json\n{"complete":true}\n```';
     x.ok('host',['start',malformed.requestPath],{env:{FAKE_RESULT_BYTES:raw}});
     const complete=until(()=>x.ok('host',['collect',malformed.requestPath]),r=>r.state==='completed');
-    assert.equal(complete.resultFile,'result.json');
+    assert.match(complete.resultFile,/^dsh-terminal-[0-9a-f]{32}\.raw$/);
+    assert.equal(complete.resultSha256,sha(raw));
     assert.equal(fs.readFileSync(malformed.resultPath,'utf8'),raw,
       'adapter must leave JSON/schema validation and raw archiving to the workflow');
+    const snapshot=path.join(malformed.outputDirectory,complete.resultFile);
+    assert.deepEqual(fs.readFileSync(snapshot),Buffer.from(raw));
     fs.appendFileSync(malformed.resultPath,'\nchanged');
     const changed=x.ok('host',['collect',malformed.requestPath]);
-    assert.equal(changed.state,'unknown');assert.match(changed.reason,/changed/);
+    assert.equal(changed.state,'completed','native result.json may change after the terminal snapshot');
+    assert.deepEqual(fs.readFileSync(snapshot),Buffer.from(raw));
+    fs.chmodSync(snapshot,0o600);fs.appendFileSync(snapshot,'\nchanged');
+    const tampered=x.ok('host',['collect',malformed.requestPath]);
+    assert.equal(tampered.state,'unknown');assert.match(tampered.reason,/snapshot.*changed/);
     const linked=x.dispatch('linked-file'),outside=path.join(x.root,'outside.json');
     fs.writeFileSync(outside,'{"complete":true}');
     x.ok('host',['start',linked.requestPath],{env:{FAKE_RESULT_LINK:outside}});

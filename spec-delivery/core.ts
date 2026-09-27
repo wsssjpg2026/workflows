@@ -385,6 +385,15 @@ export const actionMetadata = {
   'skill-child':   {tier:'L2',fresh:false,authored:false,skills:[],rawSource:true},
   'repair-receipt':{tier:'L2',fresh:false,authored:false,skills:[],rawSource:false},
 } as const satisfies Record<Action,ActionMetadata>;
+export const coordinatorAgentSlots = 1;
+/** Minimum actor capacity held for a root while its bound skill may delegate. */
+export function rootSkillActorSlots(action:Action) {
+  return action === 'implement' ? 3 : actionMetadata[action].skills.length ? 2 : 1;
+}
+/** One new child, optional child-of-child, plus the coordinator. */
+export function skillChildAgentSlots(parentActorDepth:number,childCanDelegate:boolean) {
+  return coordinatorAgentSlots + parentActorDepth + 1 + (childCanDelegate ? 1 : 0);
+}
 const boundAuthorReview = (s: State) => unifiedSkillsReady(s);
 // agent 的测试按实际执行申请，不能在整段读代码/推理时间占住测试批次。
 const hasTests = (a: Action) => a === 'verify' ? 1 : 0;
@@ -433,7 +442,7 @@ export function applyPlan(s: State, p: ExecutionPlan, discovered: { number: numb
   for (const m of Object.values(s.inputs.models)) ensure(p.capabilities.models.includes(m), `宿主未确认模型可用：${m}`);
   for (const k of ['agents', 'issues', 'tests', 'noProgress', 'rounds'] as const) ensure(Number.isSafeInteger(p.policy[k]) && p.policy[k] > 0, `L1 的资源策略 ${k} 必须是正整数`);
   ensure(p.policy.agents >= 2, '至少留出主 agent 和一个子 agent 的额度');
-  if (s.protocol === currentProtocol) ensure(p.policy.agents >= 4,
+  if (s.protocol === currentProtocol) ensure(p.policy.agents >= coordinatorAgentSlots + rootSkillActorSlots('implement'),
     '统一技能执行的 L1 policy.agents 至少为 4：主控、实现、作者审查和专业审查各需一个槽位；请修订执行计划');
   ensure(p.specCriteria.length && p.evidencePath, '需要 L1 的 spec 执行计划和验收条件');
   ensure(new Set(p.tickets.map(t => t.number)).size === p.tickets.length, '工单编号重复');
@@ -679,14 +688,13 @@ function agentSlotsRequired(s: State, next?: AgentSlotCandidate) {
   // One slot belongs to the coordinator. Implementation reserves its mandatory
   // author-review and professional-review descendants. Other bound roots
   // reserve one child; an active child with a bound skill reserves its own child.
-  let slots = 1;
+  let slots = coordinatorAgentSlots;
   for (const [rootId, group] of groups) {
     const root = jobs.get(rootId)!;
     const nestedWaiting = group.filter(job => job.action === 'skill-child' &&
       s.v3?.skillChildren.find(child => child.id === job.childRequestId)?.skillCapability &&
       !group.some(child => invocationOwner.get(child.parentInvocationId || '') === job.id)).length;
-    const minimum = root.action === 'implement' ? 3 : actionMetadata[root.action].skills.length ? 2 : 1;
-    slots += Math.max(minimum, group.length + nestedWaiting);
+    slots += Math.max(rootSkillActorSlots(root.action), group.length + nestedWaiting);
   }
   return slots;
 }

@@ -202,6 +202,7 @@ if(op==='query') {
 } else if(op==='collect') {
   if(!actor||actor.state!=='completed')process.exit(84);
   reply({state:'completed',nativeId:actor.nativeId,result:actor.result,resultFile:actor.resultFile,
+    resultSha256:actor.resultSha256,
     finalText:actor.finalText,continuationSupported:actor.continuationSupported,
     completedAt:actor.completedAt,usage:actor.usage,usageScope:actor.usageScope,
     modelCallId:actor.modelCallId,provider:actor.provider});
@@ -1157,6 +1158,60 @@ test('宿主结构化结果优先于冲突文件和终态文本；纯文件结�
   } finally {fs.rmSync(y.temp,{recursive:true,force:true});}
 });
 
+test('公开 CLI 对终态文件按同一原文字节验摘要；匹配摘要的畸形传输副本仍可正式修复',()=>{
+  for(const mode of ['late-tamper','transport-copy'] as const){
+    const x=fixture();try {
+      const {statePath,planning}=planned(x),host=controlledHost(x);
+      assert.equal(JSON.parse(x.call('dispatch',statePath,planning.id).stdout).status,'running');
+      const state=JSON.parse(fs.readFileSync(statePath,'utf8'));
+      const dispatch=state.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===planning.id);
+      const packet=JSON.parse(fs.readFileSync(dispatch.packetPath,'utf8'));
+      const original=path.join(packet.outputDirectory,'terminal-original.json');
+      fs.mkdirSync(packet.outputDirectory,{recursive:true});
+      const originalBytes=Buffer.from(JSON.stringify({complete:true,status:'planned',
+        evidencePath:x.planEvidence,data:{planPath:x.planPath,checksPath:x.planPath}}));
+      fs.writeFileSync(original,originalBytes);
+      host.set(db=>{db.actors[dispatch.token].state='completed';
+        db.actors[dispatch.token].resultFile=original;
+        db.actors[dispatch.token].resultSha256=sha(originalBytes);});
+      const adapter=x.env.SPEC_DELIVERY_HOST_ADAPTER;
+      const wrapper=path.join(x.temp,`terminal-${mode}.cjs`);
+      const malformed=Buffer.from('{"complete":');
+      fs.writeFileSync(wrapper,`#!/usr/bin/env node
+const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),cp=require('node:child_process');
+const result=cp.spawnSync(${JSON.stringify(adapter)},process.argv.slice(2),{encoding:'utf8',env:process.env});
+if(result.status!==0){process.stderr.write(result.stderr);process.exit(result.status||1);}
+const reply=JSON.parse(result.stdout);
+if(process.argv[2]==='collect'&&reply.state==='completed'&&reply.resultFile){
+  const digest=bytes=>crypto.createHash('sha256').update(bytes).digest('hex');
+  const before=fs.readFileSync(reply.resultFile);
+  if(digest(before)!==reply.resultSha256)process.exit(92);
+  if(${JSON.stringify(mode)}==='late-tamper')fs.writeFileSync(reply.resultFile,Buffer.concat([before,Buffer.from(' changed')]));
+  else {const copy=path.join(path.dirname(reply.resultFile),'transport-corrupt.json');
+    const corrupt=Buffer.from(${JSON.stringify(malformed.toString())});fs.writeFileSync(copy,corrupt);
+    reply.resultFile=copy;reply.resultSha256=digest(corrupt);}
+}
+process.stdout.write(JSON.stringify(reply));
+`);
+      fs.chmodSync(wrapper,0o755);x.env.SPEC_DELIVERY_HOST_ADAPTER=wrapper;
+      const collected=x.call('collect',statePath,planning.id);
+      assert.equal(collected.status,0,collected.stderr);
+      assert.equal(JSON.parse(collected.stdout).polled[0].status,'uncertain');
+      const after=JSON.parse(fs.readFileSync(statePath,'utf8'));
+      const receipts=after.v3.receiptRecords?.find((r:{jobId:string})=>r.jobId===planning.id);
+      if(mode==='late-tamper'){
+        assert.match(after.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===planning.id).uncertainty,/SHA-256/);
+        assert.equal(receipts,undefined,'digest mismatch must not archive or stage changed bytes');
+      }else{
+        assert.equal(receipts.revisions[0].source,'host_file');
+        assert.equal(receipts.revisions[0].status,'rejected');
+        assert.deepEqual(fs.readFileSync(receipts.revisions[0].rawPath),malformed);
+        assert.equal(receipts.revisions[0].rawSha256,sha(malformed));
+      }
+    }finally{fs.rmSync(x.temp,{recursive:true,force:true});}
+  }
+});
+
 test('错误绑定经宿主实例日志纠正；相同版本的第二次纠正被拒绝', () => {
   const x=fixture();
   try {
@@ -1265,6 +1320,41 @@ test('可靠续接的原 actor 修订须匹配后续宿主事件和原始字节'
   } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
 });
 
+test('续接文件回执只接受宿主事件摘要绑定的原始字节',()=>{
+  const x=fixture();try {
+    const {statePath,planning}=planned(x),host=controlledHost(x);
+    assert.equal(JSON.parse(x.call('dispatch',statePath,planning.id).stdout).status,'running');
+    const state=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const token=state.v3.dispatchRecords[0].token;
+    const packet=JSON.parse(fs.readFileSync(state.v3.dispatchRecords[0].packetPath,'utf8'));
+    host.set(db=>{db.actors[token].state='completed';db.actors[token].result='{"complete":';
+      db.actors[token].continuationSupported=true;});
+    assert.equal(JSON.parse(x.call('collect',statePath,planning.id).stdout).polled[0].status,'uncertain');
+    const previous=JSON.parse(fs.readFileSync(statePath,'utf8')).v3.receiptRecords[0].currentId;
+    const corrected=Buffer.from(JSON.stringify({complete:true,status:'planned',evidencePath:x.planEvidence,
+      data:{planPath:x.planPath,checksPath:x.planPath}}));
+    const file=path.join(packet.outputDirectory,'continued-file.json');
+    fs.mkdirSync(packet.outputDirectory,{recursive:true});fs.writeFileSync(file,corrected);
+    host.set(db=>{delete db.actors[token].result;db.actors[token].resultFile=file;
+      db.actors[token].resultSha256=sha(corrected);});
+    assert.equal(JSON.parse(x.call('collect',statePath,planning.id).stdout).polled[0].status,'uncertain');
+    const evidence=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const continuedEvent=evidence.v3.dispatchRecords[0].events.at(-1).evidencePath;
+    const rawPath=path.join(x.temp,'continued-file-raw.json');fs.writeFileSync(rawPath,corrected);
+    const decision=recoveryDecision(statePath,planning.id,'revise-receipt',x.planEvidence,
+      {previousRevisionId:previous,rawPath,continuationHostEvent:continuedEvent});
+    fs.appendFileSync(file,' changed');
+    const rejected=x.call('recover-result',statePath,recoveryFile(x,decision));
+    assert.notEqual(rejected.status,0);assert.match(rejected.stderr,/SHA-256/);
+    fs.writeFileSync(file,corrected);
+    const accepted=x.call('recover-result',statePath,recoveryFile(x,decision));
+    assert.equal(accepted.status,0,accepted.stderr);
+    const final=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(final.v3.receiptRecords[0].revisions[1].status,'accepted');
+    assert.equal(final.jobs.find((j:{id:string})=>j.id===planning.id).status,'done');
+  }finally{fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
 test('不同失败修订耗尽统一预算后停止同候选重试，旧 ready 不会再消费', () => {
   const x=fixture();
   try {
@@ -1310,10 +1400,14 @@ test('批准计划到 implement 内嵌双轴作者自检只采纳一次，并生
     git(worktree,'add','source.txt');git(worktree,'commit','-m','Implement #101');
     const head=git(worktree,'rev-parse','HEAD');
     x.env.DSH_HOME=path.join(x.temp,'controller-home');
+    x.env.DSH_SESSION_ID='controller-session';
+    x.env.DSH_ADAPTER_WORKER='1';
+    x.env.DSH_PERMISSION_MODE='controller-mode';
+    x.env.DSH_APP_HINT='retained';
     x.env.SPEC_DELIVERY_LEAK_MARKER='controller-only';
     const tested=h.call('test',statePath,h.parentJob.id,h.file('author-test.json',
       {argv:[process.execPath,'-e',
-        "const keys=Object.keys(process.env).filter(k=>k.startsWith('SPEC_DELIVERY_')||k.startsWith('DSH_')).sort();if(JSON.stringify(keys)!==JSON.stringify(['DSH_EXPLICIT','SPEC_DELIVERY_EXPLICIT']))process.exit(73)"],
+        "const keys=Object.keys(process.env).filter(k=>k.startsWith('SPEC_DELIVERY_')||k.startsWith('DSH_')).sort();if(JSON.stringify(keys)!==JSON.stringify(['DSH_APP_HINT','DSH_EXPLICIT','SPEC_DELIVERY_EXPLICIT'])||process.env.DSH_APP_HINT!=='retained')process.exit(73)"],
         env:{DSH_EXPLICIT:'approved',SPEC_DELIVERY_EXPLICIT:'approved'},
         timeoutSeconds:5,reason:'TDD acceptance smoke for #101'}));
     assert.equal(tested.exitCode,0);
@@ -1724,7 +1818,8 @@ test('单账本 v3 组合回放：依赖、并行实现、独立审查、补充�
       SPEC_DELIVERY_COMBINED_HOST_DB:hostPath,SPEC_DELIVERY_COMBINED_SESSIONS:x.sessions,
       SPEC_DELIVERY_HOST_ADAPTER:path.join(x.temp,'bin','combined-host'),
       SPEC_DELIVERY_SKILL_OBSERVER:path.join(x.temp,'bin','combined-skill-observer'),
-      DSH_HOME:path.join(x.temp,'controller-home')});
+      DSH_HOME:path.join(x.temp,'controller-home'),DSH_SESSION_ID:'controller-session',
+      DSH_ADAPTER_WORKER:'1',DSH_PERMISSION_MODE:'controller-mode',DSH_APP_HINT:'inherited'});
     const remote=()=>JSON.parse(fs.readFileSync(remotePath,'utf8'));
     const updateRemote=(mutate:(value:ReturnType<typeof remote>)=>void)=>{
       const value=remote();mutate(value);fs.writeFileSync(remotePath,JSON.stringify(value));
@@ -1830,8 +1925,8 @@ test('单账本 v3 组合回放：依赖、并行实现、独立审查、补充�
     const revisedPlan=file('combined-replan-101.md','L1 overflow scope and test boundary');
     const revisedChecks=file('combined-checks-replan.json',{scopeReason:'Overflow and initial behavior',
       commands:[{name:'overflow-smoke',argv:[process.execPath,'-e',
-        "const keys=Object.keys(process.env).filter(k=>k.startsWith('SPEC_DELIVERY_')||k.startsWith('DSH_')).sort();if(JSON.stringify(keys)!==JSON.stringify(['DSH_EXPLICIT','SPEC_DELIVERY_EXPLICIT']))process.exit(73)"],
-        env:{DSH_EXPLICIT:'approved',SPEC_DELIVERY_EXPLICIT:'approved'},timeoutSeconds:5}]});
+        "const keys=Object.keys(process.env).filter(k=>k.startsWith('SPEC_DELIVERY_')||k.startsWith('DSH_')).sort();if(JSON.stringify(keys)!==JSON.stringify(['DSH_APP_HINT','DSH_EXPLICIT','SPEC_DELIVERY_EXPLICIT'])||process.env.DSH_APP_HINT!=='override')process.exit(73)"],
+        env:{DSH_APP_HINT:'override',DSH_EXPLICIT:'approved',SPEC_DELIVERY_EXPLICIT:'approved'},timeoutSeconds:5}]});
     finish(replan,{complete:true,status:'planned',evidencePath:revisedPlan,
       data:{planPath:revisedPlan,checksPath:revisedChecks}});
     const recheck=by(next(),101,'plan-check');dispatch(recheck);

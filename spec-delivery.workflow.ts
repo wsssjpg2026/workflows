@@ -29,8 +29,9 @@ const recovering = (s: engine.State, j: engine.Job) => s.tickets.some(t => t.key
 const sha = (x: string | Buffer) => createHash('sha256').update(x).digest('hex');
 function testCommandEnv(explicit?:Record<string,string>) {
   const inherited={...process.env};
+  const controllerKeys=new Set(['DSH_HOME','DSH_SESSION_ID','DSH_ADAPTER_WORKER','DSH_PERMISSION_MODE']);
   for(const name of Object.keys(inherited))
-    if(name.startsWith('SPEC_DELIVERY_')||name.startsWith('DSH_'))delete inherited[name];
+    if(name.startsWith('SPEC_DELIVERY_')||controllerKeys.has(name))delete inherited[name];
   return {...inherited,...explicit};
 }
 function read<T>(file: string): T { return JSON.parse(fs.readFileSync(file, 'utf8')); }
@@ -1523,12 +1524,19 @@ type HostState = 'not_found' | 'running' | 'completed' | 'cancelled' | 'unknown'
 interface HostReply {
   token: string; jobId: string; targetHost: string; state: HostState;
   nativeId?: string; authoritative?: boolean; result?: unknown; resultFile?: string;
+  /** Optional for older adapters; when present it binds the exact file bytes consumed below. */
+  resultSha256?: string;
   /** Human-readable terminal text is never parsed as a receipt. */
   finalText?: string; continuationSupported?: boolean; startedAt?: string; completedAt?: string;
   cancelledAt?: string; usage?: engine.Json; usageScope?: 'session' | 'model_call';
   modelCallId?: string; provider?: string;
 }
 interface HostCall { ref: engine.HostEventRef; reply?: HostReply; error?: string }
+function verifyHostResultDigest(bytes:Buffer,digest:unknown) {
+  if(digest===undefined)return;
+  engine.ensure(typeof digest==='string'&&/^[0-9a-f]{64}$/.test(digest)&&sha(bytes)===digest,
+    '宿主结果文件与终态绑定 SHA-256 不一致');
+}
 /** The adapter is a trusted host process. Its raw reply is archived before it can change the ledger. */
 function callHost(statePath: string, d: engine.DispatchRecord, kind: engine.HostEventRef['kind']): HostCall {
   engine.ensure(sha(fs.readFileSync(safeFile(d.requestPath)))===d.requestDigest,
@@ -1582,7 +1590,7 @@ function appendHostUsage(instance:engine.HostInstanceRecord,raw:engine.Json,ref:
 }
 /** A bad or unbound host reply is still an instance/event in the journal. */
 function applyHostCall(statePath: string, jobId: string, call: HostCall): {
-  state: HostState | 'uncertain'; nativeId?: string; result?: unknown; resultFile?: string;
+  state: HostState | 'uncertain'; nativeId?: string; result?: unknown; resultFile?: string; resultSha256?: string;
   sourceHostEvent: string; error?: string
 } {
   const release = lock(statePath);
@@ -1642,7 +1650,8 @@ function applyHostCall(statePath: string, jobId: string, call: HostCall): {
     save(statePath, s);
     return error ? { state: 'uncertain', nativeId: reply?.nativeId, sourceHostEvent: call.ref.evidencePath, error } :
       { state: reply!.state, nativeId: reply!.nativeId, result: reply!.result,
-        resultFile: reply!.resultFile, sourceHostEvent: call.ref.evidencePath };
+        resultFile: reply!.resultFile, resultSha256: reply!.resultSha256,
+        sourceHostEvent: call.ref.evidencePath };
   } finally { release(); }
 }
 function dispatchRound(statePath: string, jobId: string, launch: boolean) {
@@ -1692,7 +1701,9 @@ function dispatchRound(statePath: string, jobId: string, launch: boolean) {
             engine.ensure(named.startsWith(output+path.sep) && !fs.lstatSync(named).isSymbolicLink() &&
               fs.realpathSync(named)===named && fs.statSync(named).isFile(),
               '宿主结果文件必须是当前 packet 输出目录中的普通文件');
-            raw=fs.readFileSync(named); source='host_file';
+            raw=fs.readFileSync(named);
+            verifyHostResultDigest(raw,outcome.resultSha256);
+            source='host_file';
           }
           const current=read<engine.State>(statePath).jobs.find(j=>j.id===jobId)!;
           const receipt = current.action==='repair-receipt'
@@ -1901,6 +1912,7 @@ function verifyContinuationSource(s:engine.State,d:engine.DispatchRecord,j:engin
       fs.realpathSync(named)===named && fs.statSync(named).isFile(),
       '续接结果文件必须位于当前 packet 输出目录');
     authoritative=fs.readFileSync(named);
+    verifyHostResultDigest(authoritative,reply.resultSha256);
   }
   engine.ensure(authoritative.equals(bytes),'修订原文与宿主续接的权威结果字节不符');
   return ref.evidencePath;

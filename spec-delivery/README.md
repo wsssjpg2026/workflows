@@ -1,18 +1,18 @@
 # Spec Delivery
 
-由 L1 主 agent 驱动的 TypeScript 工作流，交付当前 GitHub 仓库中**已经存在的 spec 和 sub-issues**。入口为 [spec-delivery.workflow.ts](../spec-delivery.workflow.ts)；执行者按 [roles.md](roles.md) 读取共同约束、自己的角色和回执格式。
+由任意合适的宿主主会话协调、真实 L1 会话决策的 TypeScript 工作流，交付当前 GitHub 仓库中**已经存在的 spec 和 sub-issues**。入口为 [spec-delivery.workflow.ts](../spec-delivery.workflow.ts)；执行者按 [roles.md](roles.md) 读取共同约束、自己的角色和回执格式。
 
 运行环境：Node.js 24+、Git、已授权的 `gh`，以及能执行命令、读写文件、选择指定模型并查询任务状态的 agent 宿主。核心维护依赖、队列、资源与证据门禁；模型由宿主真实调用。退出主会话不会自行唤醒后台模型。
 
 ## v0.3 过渡范围
 
-`version` 报告 `0.3.0`。新建运行写入协议 `3`，summary 继续输出独立的 `schemaVersion: 1`。协议 3 先复用现有软件交付阶段，并在账本的 `v3` 命名空间预留决策、技能调用和派发记录；空集合不代表这些能力已执行或取得证据。当前阶段仍使用下文的旧审查和宿主流程，分离式决策、可插拔技能与持久派发由后续工单逐项接入。此仓库的开发候选不会自动更新正式安装版。
+`version` 报告 `0.3.0`。新建运行写入协议 `3`，summary 继续输出独立的 `schemaVersion: 1`。协议 3 的 `v3.decisionRecords` 持久保存真实 L1 决策；技能调用与派发记录由后续工单接入。当前阶段仍使用下文的旧审查流程。此仓库的开发候选不会自动更新正式安装版。
 
 ## 启动只需五项
 
-在目标仓库中向实际使用 L1 的主 agent 说明：
+在目标仓库中向宿主主会话说明：
 
-> 读取并执行 `~/.agents/workflows/spec-delivery.workflow.ts`。完成 spec #编号，合并到目标分支。L1 使用模型一，L2 使用模型二，L3 使用模型三。其它安排由你决定。
+> 读取并执行 `~/.agents/workflows/spec-delivery.workflow.ts`。完成 spec #编号，合并到目标分支。L1 使用模型一，L2 使用模型二，L3 使用模型三。将需要判断的工作派给实际角色会话；其它安排由 L1 决定。
 
 宿主生成输入：
 
@@ -30,8 +30,8 @@
 
 命令统一为 `node <entry> <command> ...`；`help` 列出完整接口。以下文件均由宿主生成，用户无需逐步填写。
 
-1. `init <input.json>`：在目标仓库初始化，取得 `statePath` 和原始来源。已有运行返回原账本。
-2. `plan <state> <plan.json>`：L1 提交执行图、验收映射、能力检查与资源预算。类型见 [core.ts](core.ts) 的 `ExecutionPlan`。
+1. `init <input.json>`：在目标仓库初始化，取得 `statePath`、原始来源和 `decisionContext`。主会话身份能由宿主观测时记录，否则为 `unknown`。已有运行返回原账本。
+2. `plan <state> <plan.json>`：真实 L1 提交执行图、验收映射、能力检查与资源预算。计划包含 `init` 或 `plan-context <state>` 返回的 `inputVersion/sourceVersion`，以及原生 L1 会话的 `decisionNativeId`。来源或模型配置变化后，旧计划会被拒绝。
 3. `drive <state>`：收取已完成 actor 的结果，在有界步数内推进确定性命令，返回所有尚未派发 jobs 和 packet 路径。命令任务包含认领、验证、关闭与清理；主控不能只关注原生 agent 批次。
 4. 按 job 的 `model/fresh/contextKey` 派发，取得真实宿主身份后立即绑定。完成事件到达即推进下一次 `drive`，独立工单无需等待整个批次结束。
 5. 无可运行 job 时，查询在途任务或按退避等待 CI。明确阻断、等待人工、用户暂停或完成时返回相应状态，避免空轮询。
@@ -42,11 +42,15 @@
 
 ## 宿主适配与逐项回执
 
-**ZCode**：先读取本机 `dynamic-workflows` 技能。`zcode <state>` 为已预留的同模型 jobs 生成原生脚本、`CreateWorkflow` 参数和 `binding` 模板。实际调用后，把返回的 `runId` 加入模板并调用 `bind-batch <state> <binding.json>`。身份格式为 `{runId,model,jobs:[{jobId,actorName}]}`。响应不确定时先查询原生运行，不能重新启动同一批。
+**ZCode**：先读取本机 `dynamic-workflows` 技能。`zcode <state>` 为已预留的同模型 jobs 生成原生脚本、`CreateWorkflow` 参数和 `binding` 模板。实际调用后，把返回的 `runId` 加入模板并调用 `bind-batch <state> <binding.json>`。身份格式为 `{runId,jobs:[{jobId,actorName}]}`。CLI 以 `{runId}/{actorName}` 查询宿主观测。响应不确定时先查询原生运行，不能重新启动同一批。
 
 每个 actor 返回 `{resultJson,summary}`。生成脚本在该 actor 的 `ask` 完成后立即调用 `world.run` 执行 `stage`；宿主持久化结果、补入任务和模型身份、核对证据，再提交核心。actor 只负责语义结果和真实证据，不必写 `result.json` 或抄写模型 ID。先完成后绑定的结果会暂存，绑定时收取。`world.run` 日志回放不等于重新观察 GitHub。
 
-**其它支持指定模型的宿主（包括 Codex）**：对已返回的 job 调用真实 agent 工具，以 `bind <state> <jobId> <binding.json>` 记录 `{nativeId,model}`。任务真正完成后，由宿主把语义 Result 交给 `stage <state> <jobId> <result-json>`；这是 JSON 内容参数，应使用参数数组传递。旧的 `submit <state> <jobId> <result.json>` 仍可用，但需要完整 Result 身份。当前宿主无法选择指定模型或查询任务时明确阻断。
+**其它支持指定模型的宿主（包括 Codex）**：对已返回的 job 调用真实 agent 工具，以 `bind <state> <jobId> <binding.json>` 记录 `{nativeId}`。任务真正完成后，由宿主把语义 Result 交给 `stage <state> <jobId> <result-json>`；这是 JSON 内容参数，应使用参数数组传递。旧的 `submit <state> <jobId> <result.json>` 仍可用，但需要完整 Result 身份。当前宿主无法选择指定模型或查询任务时明确阻断。
+
+协议 3 的模型任务要求宿主设置绝对路径环境变量 `SPEC_DELIVERY_HOST_OBSERVER`，指向可信的原生会话查询适配器。CLI 以 `observe <nativeId> <jobId>` 调用它；适配器从宿主 API/原生事件返回 `{source:"native_host",observationId,jobId,nativeId,provider,model,observedAt}`。CLI 将原始响应追加归档到运行目录并验证 provider/model 与请求角色一致。`binding.json` 中自填 `model`、`source` 或证据路径没有证明力。路由 ID 可为 `provider/model`，例如配置 `deepseek-official/deepseek/deepseek-v4.1-flash` 对应观测 `provider=deepseek-official`、`model=deepseek/deepseek-v4.1-flash`。适配器的可信性和工具权限取决于宿主；无隔离能力时协议依赖宿主遵守角色边界，不宣称提示词形成强隔离。
+
+`observe-main <state> <native-id>` 可记录当前主会话观测；省略或查询失败时 `init/reconfigure/resume` 记为 `unknown`。主会话观测不能代替 L1 计划、计划复核或审计证据。每个 L1 决策记录输入版本、作用范围、候选版本、产物路径及指纹和原生会话；每票计划与计划复核必须来自两个不同的原生会话。改变输入或产物后旧决策不能进入下一门禁。
 
 同模型且宿主确实支持恢复上下文时使用 `contextKey`；跨模型、跨 ZCode run 或不可恢复时读持久化 handoff。fresh 始终使用新上下文。packet 只内联当前证据索引；有历史需求再按 `historyIndexPath` 读取，避免每轮复制所有旧结果。fresh 初审排除旧结论，完整 diff 和原始证据仍须读取。
 
@@ -110,9 +114,9 @@
 
 旧版运行（无 `protocol` 或协议 `2`）可以直接 `inspect/metrics/summary`，也可用 `bind/stage/collect/submit` 登记原租约已经完成的结果；新派发由版本门禁拒绝。继续派发前先对账并排空在途任务，再显式执行 `upgrade <state> <evidence.json>`，内容为 `{evidencePath}`。命令先把原账本逐字节备份到返回的 `backupPath`，再迁移到协议 `3`；保留原结果与已完成工单，未完成验证从队列重新获取证据，不混用旧版部分审查。`paused` 和 `waiting_human` 状态保持原样，退役运行不能升级或复活。查看历史运行无需迁移；未知协议会明确报错。
 
-`reconfigure <state> <models.json>` 在无在途任务时调整路由，文件为 `{models,capabilities,evidencePath}`；保留已完成任务的原模型与证据，仅新派发使用新模型。`retire <state> <reason.json>` 需要 `{reason,evidencePath}`，要求已停止所有任务；保留证据和未交付资源，常规调度无法复活它。
+`reconfigure <state> <models.json>` 在无在途任务时调整路由，文件为 `{models,capabilities,evidencePath,decisionNativeId,sourceVersion}`；真实 L1 重新确认资源和模型，旧工单计划与复核失效并进入重规划。主会话模型可以不同于新 L1；未取得当前主会话观测时记录为 `unknown`。`retire <state> <reason.json>` 需要 `{reason,evidencePath}`，要求已停止所有任务；保留证据和未交付资源，常规调度无法复活它。
 
-`resolve <state> <decisions.json>` 接收 L1 取得新事实后的 `[{ticket,evidencePath,handoffPath}]`，只解除无在途任务的局部阻断，回到认领或重规划。用户要求继续时使用 `resume <state>`；它不自动消除工单阻断或人工条件。
+`resolve <state> <decisions.json>` 接收 L1 取得新事实后的 `[{ticket,evidencePath,handoffPath,decisionNativeId,inputVersion,candidateVersion}]`，版本由只读 `decision-context <state>` 取得。CLI 查询真实 L1 会话，只解除无在途任务的局部阻断，回到认领或重规划。用户要求继续时使用 `resume <state>`；它不自动消除工单阻断或人工条件。
 
 ## 完成、指标与验证
 

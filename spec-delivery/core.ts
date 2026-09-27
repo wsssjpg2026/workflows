@@ -10,7 +10,7 @@ export const currentProtocol = 3;
  */
 export interface ProtocolV3 {
   executionPath: 'legacy-v02';
-  decisionRecords: Record<string, Json>[];
+  decisionRecords: L1DecisionRecord[];
   skillInvocations: Record<string, Json>[];
   dispatchRecords: Record<string, Json>[];
 }
@@ -18,7 +18,18 @@ export function initialProtocolV3(): ProtocolV3 {
   return { executionPath: 'legacy-v02', decisionRecords: [], skillInvocations: [], dispatchRecords: [] };
 }
 export interface Policy { agents: number; issues: number; tests: number; noProgress: number; rounds: number }
-export interface Capabilities { framework: string; mainModel: string; modelRouting: 'per_agent' | 'per_run'; models: string[] }
+export interface Capabilities { framework: string; mainModel?: string; modelRouting: 'per_agent' | 'per_run'; models: string[] }
+/** The host adapter's observation of a native session, never a model's self-description. */
+export interface NativeSession {
+  source: 'native_host'; observationId: string; jobId: string; nativeId: string; provider: string; model: string;
+  observedAt: string; evidencePath: string; evidenceDigest: string;
+}
+export interface L1DecisionRecord {
+  id: string; kind: 'execution-plan' | 'ticket-plan' | 'plan-check' | 'replan' | 'adjudication' | 'spec-audit' | 'resolve';
+  scope: string; inputVersion: string; sourceVersion?: string; candidateVersion: string; appliesToCandidateVersion?: string;
+  artifactPath: string; artifactFiles: string[]; artifactDigest: string;
+  session: NativeSession; at: string;
+}
 export interface Finding {
   id: string; description: string; evidence: string; confidence?: number; confirmed?: boolean; advisory?: boolean;
   identity?: { path: string; rule: string; trigger: string };
@@ -33,7 +44,10 @@ export interface TicketPlan {
   /** 仅验收归属转移；两端记录都必须存在，技术前置不能移。 */
   deferredDependencies?: { issue: number; target: number; kind: 'acceptance_only'; records: string[] }[];
 }
-export interface ExecutionPlan { capabilities: Capabilities; policy: Policy; tickets: TicketPlan[]; specCriteria: string[]; evidencePath: string }
+export interface ExecutionPlan { capabilities: Capabilities; policy: Policy; tickets: TicketPlan[]; specCriteria: string[]; evidencePath: string;
+  /** Versions are supplied by init/plan-context and rejected if sources or inputs changed. */
+  inputVersion?: string; sourceVersion?: string; decisionNativeId?: string;
+}
 export type Phase = 'claim' | 'plan' | 'plan_check' | 'implement' | 'queued' | 'self' | 'verify' | 'publish' | 'review' | 'fresh' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'done' | 'human' | 'blocked';
 export type Action = 'claim' | 'plan' | 'plan-check' | 'implement' | 'self-standards' | 'self-spec' | 'verify' | 'publish' | 'review-lens' | 'confirm' | 'adjudicate' | 'review-report' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'spec-audit' | 'spec-close';
 export interface Evidence { head: string; base: string; path: string }
@@ -64,6 +78,7 @@ export interface Job {
   tier: Tier; model: string; executor: 'agent' | 'main' | 'command'; fresh: boolean; contextKey: string;
   head: string; base: string; tests: number; status: 'leased' | 'running' | 'done' | 'cancelled';
   nativeId: string; result?: Result; finding?: Finding;
+  inputVersion?: string; candidateVersion?: string; session?: NativeSession; decisionArtifactDigest?: string; decisionArtifactFiles?: string[];
   timing?: { leasedAt: string; boundAt?: string; startedAt?: string; resultAt?: string; completedAt?: string; cancelledAt?: string };
   usage?: { inputTokens?: number; outputTokens?: number; cost?: number; currency?: string; modelMs?: number };
   dispute?: { previous: string; current: string };
@@ -77,6 +92,8 @@ export interface State {
   repo: { root: string; slug: string; host: string; defaultBranch: string };
   status: 'planning' | 'running' | 'waiting_human' | 'blocked' | 'complete' | 'paused' | 'retired';
   policy?: Policy; capabilities?: Capabilities; specCriteria: string[]; planEvidence: string;
+  planSourceVersion?: string; planArtifactPath?: string;
+  mainSession?: NativeSession | { source: 'unknown'; at: string };
   tickets: Ticket[]; jobs: Job[]; facts: LiveFacts; auditEpoch: number; specAudit?: Result;
   validationOwner?: string; queueSequence?: number;
   telemetry?: { ghInvocations: number; retries: number; observationMs: number };
@@ -86,6 +103,43 @@ export interface State {
 export const lenses = ['规范', '明显缺陷', 'Git 历史', '历史 PR 评论', '代码注释'];
 export function ensure(condition: unknown, message: string): asserts condition { if (!condition) throw new Error(message); }
 export function event(s: State, message: string) { s.revision++; s.events.push({ revision: s.revision, message, at: new Date().toISOString() }); }
+export function inputVersion(s: State) {
+  return createHash('sha256').update(JSON.stringify({ spec: s.spec, targetBranch: s.inputs.targetBranch,
+    models: { L1: s.inputs.models.L1, L2: s.inputs.models.L2, L3: s.inputs.models.L3 },
+    repo: s.repo.slug, protocol: s.protocol })).digest('hex');
+}
+export function candidateVersion(s: State, t?: Ticket) {
+  return createHash('sha256').update(JSON.stringify(t
+    ? { ticket: t.key, epoch: t.epoch, head: t.head, base: t.base }
+    : { spec: s.spec, auditEpoch: s.auditEpoch, base: s.facts.base })).digest('hex');
+}
+export function globalDecisionVersion(s: State) {
+  return createHash('sha256').update(JSON.stringify({ spec: s.spec, targetBranch: s.inputs.targetBranch,
+    repo: s.repo.slug })).digest('hex');
+}
+export function verifyNativeSession(s: State, session: NativeSession, nativeId: string, tier: Tier) {
+  ensure(session?.source === 'native_host' && !!session.observationId && !!session.jobId && !!session.evidencePath && !!session.evidenceDigest &&
+    !!session.nativeId && !!session.provider && !!session.model && Number.isFinite(Date.parse(session.observedAt)),
+    '缺少宿主原生会话观测；配置模型或 persona 不能证明实际角色');
+  ensure(session.nativeId === nativeId, '宿主原生会话身份与任务不符');
+  const configured = s.inputs.models[tier];
+  ensure((configured.includes('/') ? `${session.provider}/${session.model}` : session.model) === configured,
+    `实际 ${tier} provider/model 与配置不符`);
+}
+function currentDecision(s: State, kind: L1DecisionRecord['kind'], scope: string, version: string) {
+  return s.v3?.decisionRecords.findLast(d => d.kind === kind && d.scope === scope &&
+    d.inputVersion === inputVersion(s) && d.sourceVersion === s.planSourceVersion &&
+    (d.appliesToCandidateVersion || d.candidateVersion) === version);
+}
+export function recordL1Decision(s: State, record: L1DecisionRecord) {
+  ensure(s.protocol === currentProtocol && s.v3, '只在协议 3 登记 L1 决策');
+  verifyNativeSession(s, record.session, record.session.nativeId, 'L1');
+  ensure(record.inputVersion === inputVersion(s) && record.sourceVersion === s.planSourceVersion &&
+    !!record.artifactPath && record.artifactFiles.length > 0 && !!record.artifactDigest,
+    'L1 决策的输入版本或产物不完整');
+  ensure(!s.v3.decisionRecords.some(d => d.id === record.id), 'L1 决策 ID 重复');
+  s.v3.decisionRecords.push(record);
+}
 export function freshEvidence(t: Ticket, key: keyof Ticket['evidence']) {
   const e = t.evidence[key]; return !!e && e.head === t.head && e.base === t.base && !!e.path;
 }
@@ -133,7 +187,6 @@ export function buildTicket(p: TicketPlan, base: string, closeout = false): Tick
 }
 export function applyPlan(s: State, p: ExecutionPlan, discovered: { number: number; state: string; blockedBy: { repo: string; number: number; state: string }[] }[]) {
   ensure(s.status === 'planning', '本轮执行计划已经确认；修改计划需先停止受影响任务');
-  ensure(p.capabilities.mainModel === s.inputs.models.L1, '主 agent 实际模型必须与 L1 相同，不能用角色名称代替');
   ensure(['per_agent', 'per_run'].includes(p.capabilities.modelRouting), '宿主缺少明确的模型路由能力');
   for (const m of Object.values(s.inputs.models)) ensure(p.capabilities.models.includes(m), `宿主未确认模型可用：${m}`);
   for (const k of ['agents', 'issues', 'tests', 'noProgress', 'rounds'] as const) ensure(Number.isSafeInteger(p.policy[k]) && p.policy[k] > 0, `L1 的资源策略 ${k} 必须是正整数`);
@@ -277,6 +330,8 @@ function candidates(s: State): Candidate[] {
 }
 export function reserve(s: State): Job[] {
   ensure(s.status === 'running' && s.policy, '只有运行中的已规划 workflow 可以派发');
+  if (s.protocol === currentProtocol && s.planEvidence)
+    ensure(currentDecision(s, 'execution-plan', '$spec', globalDecisionVersion(s)), 'L1 执行图或资源决策缺失或已过期');
   const created: Job[] = [];
   const list = candidates(s);
   for (const c of list) {
@@ -296,20 +351,32 @@ export function reserve(s: State): Job[] {
     // 所有合并、关闭以及 spec 终结共用一个提交通道。
     if (['merge', 'close', 'spec-close'].includes(c.action) && active.some(j => ['merge', 'close', 'spec-close'].includes(j.action))) continue;
     const tier = tierFor(c.action);
+    if (s.protocol === currentProtocol && c.action === 'implement')
+      ensure(c.t && currentDecision(s, 'plan-check', c.t.key, candidateVersion(s, c.t)),
+        `#${c.t?.number} 缺少当前输入与候选的独立 L1 计划复核`);
     const fresh = c.t?.phase === 'fresh' || ['plan', 'plan-check', 'accept', 'replan', 'spec-audit', 'adjudicate'].includes(c.action);
     const continuity = ['implement', 'publish'].includes(c.action) ? 'author' : ['review-lens', 'confirm', 'review-report'].includes(c.action) ? `review-${part}` : c.action;
     const j: Job = { id, ticket: key, epoch, action: c.action, part, tier, model: s.inputs.models[tier], executor, fresh,
       contextKey: `${s.id}:${key}:${continuity}${fresh ? `:fresh-${epoch}` : ''}`, head: c.t?.head || '', base: c.t?.base || s.facts.base,
-      tests: hasTests(c.action), status: 'leased', nativeId: '', finding: c.finding, dispute: c.dispute, timing: { leasedAt: new Date().toISOString() } };
+      tests: hasTests(c.action), status: 'leased', nativeId: '', finding: c.finding, dispute: c.dispute,
+      inputVersion: inputVersion(s), candidateVersion: candidateVersion(s, c.t), timing: { leasedAt: new Date().toISOString() } };
     s.jobs.push(j); created.push(j);
   }
   if (created.length) event(s, `已预留 ${created.length} 个任务，含所有显式审查 actors`);
   return created;
 }
-export function bind(s: State, id: string, ref: { nativeId: string; model: string }) {
+export function bind(s: State, id: string, ref: { nativeId: string; model?: string; session?: NativeSession }) {
   ensure(s.status === 'running', '当前 workflow 未运行，不能派发新任务');
   const j = s.jobs.find(j => j.id === id); ensure(j && busy(j), '任务不是待执行状态');
-  ensure(ref.model === j.model && !!ref.nativeId, '实际派发模型或宿主任务身份不匹配');
+  ensure(!!ref.nativeId, '缺少宿主原生任务身份');
+  if (s.protocol === currentProtocol && j.executor === 'agent') {
+    ensure(ref.session, '模型任务需要宿主原生会话观测，不能使用配置模型或 persona 冒充');
+    verifyNativeSession(s, ref.session, ref.nativeId, j.tier);
+    ensure(ref.session.jobId === j.id, '宿主观测不是当前任务的原生会话');
+    ensure(j.model === s.inputs.models[j.tier], '已派发任务的模型请求与当前配置不符');
+    if (j.session) ensure(JSON.stringify(j.session) === JSON.stringify(ref.session), '同一租约的会话观测不能被替换');
+    j.session = ref.session;
+  } else ensure(ref.model === j.model, '实际派发模型与任务不符');
   ensure(!j.nativeId || j.nativeId === ref.nativeId, '同一租约不能重复绑定另一任务');
   j.nativeId = ref.nativeId; j.status = 'running';
   j.timing ??= { leasedAt: '' }; j.timing.boundAt ??= new Date().toISOString();
@@ -322,6 +389,20 @@ export function submit(s: State, id: string, r: Result) {
   if (j.status === 'done') { ensure(JSON.stringify(j.result) === JSON.stringify(r), '重复回执内容不一致'); return; }
   ensure(busy(j) && j.nativeId, '先绑定实际任务，才能提交结果');
   ensure(r.model === j.model && !!r.evidencePath, '回执必须包含实际模型及证据路径');
+  if (s.protocol === currentProtocol && j.executor === 'agent') {
+    ensure(j.session, '缺少真实原生会话身份，不能采用模型任务结果');
+    verifyNativeSession(s, j.session, j.nativeId, j.tier);
+    ensure(j.inputVersion === inputVersion(s), '输入模型或目标已改变，旧角色结果过期');
+    ensure(j.candidateVersion === candidateVersion(s, j.ticket === '$spec' ? undefined : ticket(s, j.ticket)),
+      '决策或结果所绑定的候选版本已改变');
+    if (j.action === 'plan-check') {
+      const t = ticket(s, j.ticket), version = candidateVersion(s, t);
+      const planned = currentDecision(s, 'ticket-plan', t.key, version) || currentDecision(s, 'replan', t.key, version);
+      ensure(planned, '当前工单计划缺少已验证的 L1 决策');
+      ensure(planned.session.nativeId !== j.session.nativeId && planned.session.observationId !== j.session.observationId,
+        '工单计划复核必须由独立 L1 原生会话完成');
+    }
+  }
   const allowed: Record<Action, string[]> = {
     claim: ['claimed'], plan: ['planned'], 'plan-check': ['pass', 'changes'], implement: ['implemented', 'replan'],
     'self-standards': ['reviewed'], 'self-spec': ['reviewed'], verify: ['pass', 'fail'], publish: ['published'],
@@ -408,7 +489,7 @@ export function submit(s: State, id: string, r: Result) {
         else if (!live || !ciAllowed(live, r)) { t.phase = 'blocked'; t.reason = 'waiting_ci'; }
         else t.phase = 'merge';
       } else if (r.status === 'gap') {
-        ensure(data.planPath, '验收缺口必须附 L2 补充计划'); t.planPath = String(data.planPath); problem(s, t, String(data.reason || '验收缺口'), 'plan_check');
+        ensure(data.planPath, '验收缺口必须附 L2 补充计划'); t.planPath = String(data.planPath); problem(s, t, String(data.reason || '验收缺口'), 'replan');
       } else if (r.status === 'conflict') { problem(s, t, '需要集成目标分支', 'integrate'); }
       else if (r.status === 'waiting_ci') { t.phase = 'blocked'; t.reason = 'waiting_ci'; }
       else { t.phase = 'blocked'; t.reason = String(data.reason || r.status); }
@@ -443,6 +524,18 @@ export function submit(s: State, id: string, r: Result) {
       ensure(s.specAudit?.status === 'complete' && s.specAudit.base === s.facts.base && j.base === s.facts.base, 'spec 验收已过期，需要新 L1 重新验收');
       ensure(s.facts.issueStates[String(s.spec)] === 'CLOSED', 'spec 尚未关闭'); s.status = 'complete';
       for (const x of s.tickets) if (x.closeout && x.worktree && !x.cleaned) { x.phase = 'cleanup'; s.status = 'running'; } break;
+  }
+  if (s.protocol === currentProtocol && j.executor === 'agent' && j.tier === 'L1' && r.complete) {
+    const kind = ({ plan: 'ticket-plan', 'plan-check': 'plan-check', replan: 'replan', adjudicate: 'adjudication', 'spec-audit': 'spec-audit' } as Partial<Record<Action, L1DecisionRecord['kind']>>)[j.action];
+    if (kind && (j.action !== 'plan-check' || r.status === 'pass')) {
+      ensure(j.session && j.decisionArtifactDigest && j.decisionArtifactFiles?.length, 'L1 决策缺少原生会话或决策产物指纹');
+      recordL1Decision(s, { id: j.id, kind, scope: t?.key || '$spec', inputVersion: inputVersion(s),
+        sourceVersion: s.planSourceVersion,
+        candidateVersion: j.candidateVersion!, appliesToCandidateVersion: candidateVersion(s, t),
+        artifactPath: r.evidencePath, artifactFiles: j.decisionArtifactFiles,
+        artifactDigest: j.decisionArtifactDigest,
+        session: j.session, at: new Date().toISOString() });
+    }
   }
   if (paused) s.status = 'paused';
   event(s, `${j.ticket} · ${j.action} → ${r.status}`);

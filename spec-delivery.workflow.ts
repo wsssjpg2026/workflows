@@ -1,5 +1,5 @@
 /**
- * spec-delivery — 通用 TypeScript workflow，供当前仓库中的 L1 主 agent 驱动。
+ * spec-delivery — 通用 TypeScript workflow，由宿主主会话转发，真实 L1 会话决策。
  * 用户输入仅 spec、targetBranch、models.L1/L2/L3。
  * 参考 dynamic-workflows 的显式 actors、类型化结果、有界循环与证据门禁。
  * 这是 portable host 协议入口，不是 ZCode 原生 facade 脚本；zcode 命令生成原生批次。
@@ -35,6 +35,54 @@ function command(root: string, exe: string, argv: string[]) {
 }
 function git(root: string, ...argv: string[]) { return command(root, 'git', argv); }
 function safeFile(file: string) { engine.ensure(file && fs.statSync(file).isFile(), `工件不存在：${file}`); return file; }
+function sourceVersion(parent: gh.IssueFact, children: gh.IssueFact[]) {
+  const normalized = (issue: gh.IssueFact) => ({ number: issue.number, title: issue.title, body: issue.body, url: issue.url,
+    blockedBy: issue.blockedBy.map(b => `${b.repo}#${b.number}`).sort(),
+    comments: issue.comments.filter(c => !c.body.includes('<!-- spec-delivery:'))
+      .map(c => ({ url: c.url, body: c.body })).sort((a, b) => a.url.localeCompare(b.url)) });
+  return sha(JSON.stringify({ parent: normalized(parent), children: children.map(normalized).sort((a, b) => a.number - b.number) }));
+}
+function nativeSession(statePath: string, nativeId: string, jobId: string): engine.NativeSession {
+  const observer = process.env.SPEC_DELIVERY_HOST_OBSERVER;
+  engine.ensure(observer && path.isAbsolute(observer) && fs.statSync(observer).isFile(),
+    '宿主未提供可信原生会话查询适配器 SPEC_DELIVERY_HOST_OBSERVER');
+  const output = command(path.dirname(statePath), observer, ['observe', nativeId, jobId]);
+  const raw = JSON.parse(output) as engine.NativeSession;
+  engine.ensure(raw?.source === 'native_host' && raw.jobId === jobId && !!raw.observationId &&
+    raw.nativeId === nativeId && !!raw.provider && !!raw.model && Number.isFinite(Date.parse(raw.observedAt)),
+    '宿主适配器未返回当前原生会话的可核对观测');
+  const evidenceDigest = sha(output);
+  const directory = path.join(path.dirname(statePath), 'host-observations');
+  fs.mkdirSync(directory, { recursive: true });
+  const evidencePath = path.join(directory, `${sha(jobId + ':' + nativeId).slice(0, 20)}-${evidenceDigest.slice(0, 20)}.json`);
+  if (!fs.existsSync(evidencePath)) fs.writeFileSync(evidencePath, output + '\n', { flag: 'wx', mode: 0o444 });
+  else engine.ensure(fs.readFileSync(evidencePath, 'utf8').trimEnd() === output, '原生会话观测归档发生冲突');
+  return { source: 'native_host', observationId: raw.observationId, jobId, nativeId: raw.nativeId,
+    provider: raw.provider, model: raw.model, observedAt: raw.observedAt, evidencePath, evidenceDigest };
+}
+function verifySessionArtifact(session: engine.NativeSession) {
+  engine.ensure(sha(fs.readFileSync(safeFile(session.evidencePath), 'utf8').trimEnd()) === session.evidenceDigest,
+    '宿主原生会话观测归档已改变');
+}
+function artifactFingerprint(files: string[]) {
+  const unique = [...new Set(files.map(file => path.resolve(file)))];
+  return { files: unique, digest: sha(JSON.stringify(unique.map(file => ({ file, digest: sha(fs.readFileSync(safeFile(file))) })))) };
+}
+function decisionArtifacts(s: engine.State, j: engine.Job, r: engine.Result) {
+  const t = s.tickets.find(t => t.key === j.ticket);
+  const files = [r.evidencePath];
+  if (['plan', 'replan'].includes(j.action)) files.push(String(r.data?.planPath || ''), String(r.data?.checksPath || ''));
+  if (j.action === 'plan-check') files.push(t?.planPath || '', String(r.data?.checksPath || t?.checksPath || ''));
+  return artifactFingerprint(files);
+}
+function ensureDecisionArtifacts(s: engine.State, t: engine.Ticket, kind: engine.L1DecisionRecord['kind'], current = true) {
+  if (s.protocol !== engine.currentProtocol || !s.planEvidence) return;
+  const record = s.v3?.decisionRecords.findLast(d => d.kind === kind && d.scope === t.key &&
+    d.inputVersion === engine.inputVersion(s) && d.sourceVersion === s.planSourceVersion &&
+    (!current || (d.appliesToCandidateVersion || d.candidateVersion) === engine.candidateVersion(s, t)));
+  engine.ensure(record && artifactFingerprint(record.artifactFiles).digest === record.artifactDigest,
+    `#${t.number} 的 ${kind} 决策产物已过期或被修改`);
+}
 function localHead(t: engine.Ticket) { return git(t.worktree, 'rev-parse', 'HEAD'); }
 function clean(t: engine.Ticket) { return git(t.worktree, 'status', '--porcelain') === ''; }
 function supportedLedger(s: engine.State) {
@@ -208,13 +256,19 @@ export function initialize(inputs: engine.Inputs, cwd = process.cwd()) {
   const base = gh.targetHead(repo, inputs.targetBranch);
   excludeRuntime(repo.root);
   const s: engine.State = { schema: 1, protocol: engine.currentProtocol, v3: engine.initialProtocolV3(), id: randomUUID(), revision: 0, inputs, spec, repo, status: 'planning', tickets: [], jobs: [],
-    specCriteria: [], planEvidence: '', auditEpoch: 1, events: [],
+    specCriteria: [], planEvidence: '', auditEpoch: 1, events: [], mainSession: { source: 'unknown', at: new Date().toISOString() },
     facts: { base, issueStates: Object.fromEntries([parent, ...children].map(i => [String(i.number), i.state])), prs: {}, at: new Date().toISOString() } };
-  engine.event(s, '读取当前仓库和既有 spec/sub-issues；等待 L1 主 agent 制定执行安排');
+  if (process.env.SPEC_DELIVERY_MAIN_NATIVE_ID) {
+    try { s.mainSession = nativeSession(file, process.env.SPEC_DELIVERY_MAIN_NATIVE_ID, '$main'); }
+    catch { s.mainSession = { source: 'unknown', at: new Date().toISOString() }; }
+  }
+  engine.event(s, '读取当前仓库和既有 spec/sub-issues；等待真实 L1 会话制定执行安排');
   fs.mkdirSync(path.dirname(file), { recursive: true }); const release = lock(file);
   try { engine.ensure(!fs.existsSync(file), '另一个主控已启动这个 spec'); save(file, s); } finally { release(); }
   const snapshot = path.join(path.dirname(file), 'initial-sources.json'); write(snapshot, { parent, children });
-  return { statePath: file, sourcesPath: snapshot, rolesPath, next: 'L1 主 agent 读取来源、判断人工边界、选择资源预算，生成 ExecutionPlan 后调用 plan',
+  return { statePath: file, sourcesPath: snapshot, rolesPath,
+    decisionContext: { inputVersion: engine.inputVersion(s), sourceVersion: sourceVersion(parent, children) },
+    next: '宿主转发给真实 L1 会话；L1 读取来源并生成 ExecutionPlan 后调用 plan',
     resources: { cpus: os.availableParallelism(), freeMemoryBytes: os.freemem(), loadAverage: os.loadavg() } };
 }
 export function packet(s: engine.State, j: engine.Job, statePath: string) {
@@ -233,6 +287,7 @@ export function packet(s: engine.State, j: engine.Job, statePath: string) {
   const objective = j.fresh && ['review-lens', 'confirm'].includes(j.action)
     ? { tests: t?.evidence.tests, visual: t?.evidence.visual } : t?.evidence || {};
   return { jobId: j.id, action: j.action, tier: j.tier, model: j.model, executor: j.executor, fresh: j.fresh, contextKey: j.contextKey,
+    inputVersion: j.inputVersion || '', candidateVersion: j.candidateVersion || '',
     repo: s.repo, spec: s.spec, issue: t?.number || s.spec, targetBranch: s.inputs.targetBranch,
     branch: t?.branch || '', worktree: t?.worktree || '', pr: t?.pr || 0, expectedHead: j.head, expectedBase: j.base,
     criteria: t?.criteria || s.specCriteria, visualRequired: t?.visual || false, closeout: t?.closeout || false,
@@ -261,6 +316,15 @@ function validateResult(s: engine.State, j: engine.Job, r: engine.Result) {
   safeFile(r.evidencePath);
   if (r.handoffPath) safeFile(r.handoffPath);
   const t = s.tickets.find(t => t.key === j.ticket); if (!t || !r.complete) return;
+  if (j.action === 'plan-check' && s.planEvidence) {
+    const planned = s.v3?.decisionRecords.findLast(d => ['ticket-plan', 'replan'].includes(d.kind) &&
+      d.scope === t.key && d.inputVersion === engine.inputVersion(s) && d.sourceVersion === s.planSourceVersion &&
+      (d.appliesToCandidateVersion || d.candidateVersion) === engine.candidateVersion(s, t));
+    engine.ensure(planned && artifactFingerprint(planned.artifactFiles).digest === planned.artifactDigest,
+      `#${t.number} 的 L1 计划产物已过期或被修改`);
+  }
+  if (j.action === 'implement') ensureDecisionArtifacts(s, t, 'plan-check');
+  if (j.action === 'verify') ensureDecisionArtifacts(s, t, 'plan-check', false);
   if (j.action === 'claim') {
     const data = r.data || {}, worktree = path.resolve(String(data.worktree || ''));
     const ownedRoot = path.join(s.repo.root, '.agents', 'worktrees') + path.sep;
@@ -292,6 +356,7 @@ function validateResult(s: engine.State, j: engine.Job, r: engine.Result) {
 function verify(s: engine.State, j: engine.Job, statePath: string): engine.Result {
   const t = engine.ticket(s, j.ticket);
   engine.ensure(j.action === 'verify' && active(j), '该 job 不是验证任务');
+  ensureDecisionArtifacts(s, t, 'plan-check', false);
   engine.ensure(localHead(t) === j.head && clean(t), '验证前候选必须匹配且干净');
   const manifestBytes = fs.readFileSync(t.checksPath, 'utf8');
   const manifest = JSON.parse(manifestBytes) as { scopeReason: string; commands: { name: string; argv: string[]; env?: Record<string, string>; timeoutSeconds: number }[] };
@@ -484,8 +549,13 @@ export function consumeStaged(statePath: string, ids?: string[]) {
       try {
         const r = normalizeResult(s, j, read(resultPaths(statePath, j.id).result));
         const trial = structuredClone(s), job = trial.jobs.find(x => x.id === j.id)!;
+        if (trial.protocol === engine.currentProtocol) { engine.ensure(job.session, '模型任务缺少原生会话观测'); verifySessionArtifact(job.session); }
         engine.ensure(!job.testExecution,'测试进程未完成，不能提交任务');
         job.timing ??= {leasedAt:''}; job.timing.resultAt=read<{at:string}>(resultPaths(statePath,j.id).ready).at;
+        if (trial.protocol === engine.currentProtocol && job.tier === 'L1') {
+          const artifact = decisionArtifacts(trial, job, r);
+          job.decisionArtifactDigest = artifact.digest; job.decisionArtifactFiles = artifact.files;
+        }
         validateResult(trial, job, r); engine.submit(trial, job.id, r); s = trial; submitted.push(j.id);
       } catch (error) { rejected.push({jobId:j.id,error:(error as Error).message}); }
     }
@@ -508,7 +578,7 @@ export function stageResult(statePath: string, id: string, value: unknown) {
   } finally { release(); }
   return { jobId:id, resultPath:resultPaths(statePath,id).result, ...consumeStaged(statePath,[id]) };
 }
-export function bindBatch(statePath: string, binding: {runId:string; model:string; jobs:{jobId:string; actorName:string}[]}) {
+export function bindBatch(statePath: string, binding: {runId:string; model?:string; jobs:{jobId:string; actorName:string}[]}) {
   const release = lock(statePath);
   try {
     const s = read<engine.State>(statePath); allowCompletion(s);
@@ -516,9 +586,21 @@ export function bindBatch(statePath: string, binding: {runId:string; model:strin
     for (const item of binding.jobs) {
       engine.ensure(item.actorName, '需要原生 actor 的稳定名称');
       const j = s.jobs.find(j=>j.id===item.jobId), nativeId=`${binding.runId}/${item.actorName}`;
-      engine.ensure(j && j.executor==='agent' && j.model===binding.model, '批次实际模型与任务不符');
-      if (j.status==='done') engine.ensure(j.nativeId===nativeId, '已完成任务的身份不能被替换');
-      else engine.bind(s,j.id,{nativeId,model:binding.model});
+      engine.ensure(j && j.executor==='agent', '批次任务不属于模型 actor');
+      if (j.status === 'done') {
+        engine.ensure(j.nativeId === nativeId, '已完成任务的身份不能被替换');
+        if (j.session) verifySessionArtifact(j.session);
+        continue;
+      }
+      if (j.nativeId && (s.protocol !== engine.currentProtocol || j.session)) {
+        engine.ensure(j.nativeId === nativeId, '同一租约不能重复绑定另一任务');
+        if (j.session) verifySessionArtifact(j.session);
+        continue;
+      }
+      const session = s.protocol === engine.currentProtocol ? nativeSession(statePath, nativeId, j.id) : undefined;
+      if (session) engine.ensure(session.nativeId === nativeId, '原生批次/actor 身份与宿主观测不符');
+      else engine.ensure(j.model === binding.model, '批次实际模型与任务不符');
+      engine.bind(s,j.id,{nativeId,model:binding.model,session});
     }
     save(statePath,s);
   } finally { release(); }
@@ -570,7 +652,7 @@ export async function main(argv: string[]): Promise<unknown> {
   const [op, file, extra, fourth] = argv;
   if(op==='version')return {workflow:'spec-delivery',version:workflowVersion};
   if (!op || op === 'help') return { workflow: 'spec-delivery', input: ['spec', 'targetBranch', 'models.L1', 'models.L2', 'models.L3'],
-    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan <state> <plan.json>', 'drive <state>', 'next <state>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'stage <state> <jobId> <result-json>', 'collect <state>', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'test <state> <jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'metrics <state>', 'resume <state>', 'zcode <state>'] };
+    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan-context <state>', 'decision-context <state>', 'plan <state> <plan.json>', 'observe-main <state> <native-id>', 'drive <state>', 'next <state>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'stage <state> <jobId> <result-json>', 'collect <state>', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'test <state> <jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'metrics <state>', 'resume <state>', 'zcode <state>'] };
   engine.ensure(file, '缺少输入文件/状态路径');
   // summary 在 lock() 之前返回：只验证可读协议，不创建/等待/恢复/删除状态锁，也不进入写路径。
   if (op === 'summary') return summarizeLedger(path.resolve(file));
@@ -579,6 +661,16 @@ export async function main(argv: string[]): Promise<unknown> {
   if (op === 'inspect' || op === 'metrics') {
     const state = read<engine.State>(path.resolve(file)); supportedLedger(state);
     return op === 'inspect' ? { ...state, rolesPath } : metrics(state);
+  }
+  if (op === 'plan-context') {
+    const s = read<engine.State>(path.resolve(file)); requireProtocol(s);
+    engine.ensure(s.status === 'planning', '只在规划前读取来源版本');
+    return { inputVersion: engine.inputVersion(s), sourceVersion: sourceVersion(gh.issue(s.repo, s.spec), gh.subIssues(s.repo, s.spec)) };
+  }
+  if (op === 'decision-context') {
+    const s = read<engine.State>(path.resolve(file)); requireProtocol(s);
+    return { inputVersion: engine.inputVersion(s), sourceVersion: s.planSourceVersion || null,
+      tickets: s.tickets.map(t => ({ ticket: t.key, phase: t.phase, candidateVersion: engine.candidateVersion(s, t) })) };
   }
   if (op === 'execute') { engine.ensure(extra, '需要 command jobId'); return executeCommand(path.resolve(file), extra); }
   if (op === 'test') {engine.ensure(extra && fourth,'需要 jobId 与测试请求文件');return runTest(path.resolve(file),extra,read(fourth));}
@@ -643,28 +735,81 @@ export async function main(argv: string[]): Promise<unknown> {
     }
     if (op === 'plan') {
       engine.ensure(extra, '需要 L1 自行生成的 plan.json');
-      s.facts = observe(s); const sources = gh.subIssues(s.repo, s.spec);
-      const p = read<engine.ExecutionPlan>(extra); safeFile(p.evidencePath); engine.applyPlan(s, p, sources);
+      s.facts = observe(s); const parent = gh.issue(s.repo, s.spec), sources = gh.subIssues(s.repo, s.spec);
+      const p = read<engine.ExecutionPlan & { decisionNativeId?: string }>(extra); safeFile(p.evidencePath);
+      engine.ensure(p.inputVersion === engine.inputVersion(s) && p.sourceVersion === sourceVersion(parent, sources),
+        'L1 执行计划的输入或 spec/sub-issue 来源版本已过期');
+      engine.ensure(p.decisionNativeId, '执行图与资源策略需要真实 L1 原生会话');
+      const session = nativeSession(statePath, p.decisionNativeId, '$spec:execution-plan');
+      engine.verifyNativeSession(s, session, p.decisionNativeId, 'L1'); verifySessionArtifact(session);
+      engine.applyPlan(s, p, sources);
+      s.planSourceVersion = p.sourceVersion; s.planArtifactPath = path.resolve(extra);
+      const artifact = artifactFingerprint([extra, p.evidencePath]);
+      engine.recordL1Decision(s, { id: `execution-plan:${s.revision}`, kind: 'execution-plan', scope: '$spec',
+        inputVersion: engine.inputVersion(s), sourceVersion: p.sourceVersion, candidateVersion: engine.globalDecisionVersion(s),
+        artifactPath: path.resolve(extra), artifactFiles: artifact.files, artifactDigest: artifact.digest, session, at: new Date().toISOString() });
     } else if (op === 'next') {
       engine.reconcileFacts(s, observe(s));
       if (s.status !== 'running') { save(statePath, s); return { status: s.status, next: 'inspect 中的状态需要 L1 处理；用户暂停时保持暂停' }; }
+      if (s.planEvidence) {
+        const global = s.v3?.decisionRecords.findLast(d => d.kind === 'execution-plan' && d.scope === '$spec' &&
+          d.inputVersion === engine.inputVersion(s) && d.sourceVersion === s.planSourceVersion &&
+          d.candidateVersion === engine.globalDecisionVersion(s));
+        engine.ensure(global && artifactFingerprint(global.artifactFiles).digest === global.artifactDigest,
+          'L1 执行图或资源策略产物已过期或被修改');
+      }
       const js = engine.reserve(s).filter(j => {
         if (claimLease(s, j, statePath)) return true;
         const t = engine.ticket(s, j.ticket); t.phase = 'blocked'; t.reason = '工单由另一个运行持有'; j.status = 'cancelled'; return false;
       });
-      const packets = s.jobs.filter(j=>j.status==='leased' && !j.nativeId).map(j => { const p = packet(s, j, statePath); const file = path.join(path.dirname(statePath), 'packets', sha(j.id).slice(0, 20) + '.json'); write(file, p); return { ...j, packetPath: file }; });
+      const packets = s.jobs.filter(j=>j.status==='leased' && !j.nativeId).map(j => {
+        if (j.action === 'implement') ensureDecisionArtifacts(s, engine.ticket(s, j.ticket), 'plan-check');
+        const p = packet(s, j, statePath); const file = path.join(path.dirname(statePath), 'packets', sha(j.id).slice(0, 20) + '.json'); write(file, p); return { ...j, packetPath: file };
+      });
       save(statePath, s);
-      return { status: s.status, jobs: packets, outstanding: s.jobs.filter(active).map(j => ({id:j.id, nativeId:j.nativeId, status:j.status})), instruction: 'L1 按实际模型派发；没有新任务时等待在途任务或处理明确阻塞，不循环空轮询' };
+      return { status: s.status, jobs: packets, outstanding: s.jobs.filter(active).map(j => ({id:j.id, nativeId:j.nativeId, status:j.status})), instruction: '宿主按角色路由到真实模型并查询原生身份；没有新任务时等待在途任务或处理明确阻塞' };
     } else if (op === 'bind') {
-      engine.ensure(extra && fourth, '需要 jobId 与宿主 binding.json'); engine.bind(s, extra, read(fourth));
+      engine.ensure(extra && fourth, '需要 jobId 与宿主 binding.json');
+      const ref = read<{ nativeId: string; model?: string }>(fourth);
+      const j = s.jobs.find(j => j.id === extra); engine.ensure(j, '未知任务');
+      if (j.nativeId) engine.ensure(j.nativeId === ref.nativeId, '同一租约不能重复绑定另一任务');
+      const session = s.protocol === engine.currentProtocol && j.executor === 'agent'
+        ? j.session && j.nativeId === ref.nativeId ? j.session : nativeSession(statePath, ref.nativeId, j.id)
+        : undefined;
+      if (session) verifySessionArtifact(session);
+      engine.bind(s, extra, { ...ref, session });
+    } else if (op === 'observe-main') {
+      engine.ensure(extra, '需要主会话的原生身份');
+      const session = nativeSession(statePath, extra, '$main'); verifySessionArtifact(session);
+      s.mainSession = session; engine.event(s, '记录当前宿主主会话观测身份；不作为 L1 决策证明');
     } else if (op === 'reconfigure') {
       engine.ensure(extra && !s.jobs.some(active) && !['complete','retired'].includes(s.status),'先确认在途任务终止；不能改写已终结运行');
-      const config=read<{models:engine.Inputs['models'];capabilities:engine.Capabilities;evidencePath:string}>(extra);
-      safeFile(config.evidencePath);engine.ensure(config.capabilities.mainModel===config.models.L1,'实际主会话必须符合新 L1');
+      const config=read<{models:engine.Inputs['models'];capabilities:engine.Capabilities;evidencePath:string;decisionNativeId:string;sourceVersion?:string}>(extra);
+      safeFile(config.evidencePath);
+      if (s.planSourceVersion) engine.ensure(config.sourceVersion === s.planSourceVersion &&
+        config.sourceVersion === sourceVersion(gh.issue(s.repo, s.spec), gh.subIssues(s.repo, s.spec)),
+        '重新配置时 spec/sub-issue 来源已改变；需要新的 L1 执行图');
       engine.ensure(['per_agent','per_run'].includes(config.capabilities.modelRouting),'宿主必须支持指定模型路由');
       for(const tier of ['L1','L2','L3'] as const)engine.ensure(config.models[tier] && config.capabilities.models.includes(config.models[tier]),'宿主没有确认新模型可用');
       s.inputs.models=config.models;s.capabilities=config.capabilities;
-      engine.event(s,'模型路由已重新配置；保留完成结果，仅下一次派发使用新模型');
+      engine.ensure(config.decisionNativeId, '重新配置资源和模型需要真实 L1 会话');
+      const session = nativeSession(statePath, config.decisionNativeId, '$spec:execution-plan');
+      engine.verifyNativeSession(s, session, config.decisionNativeId, 'L1'); verifySessionArtifact(session);
+      const artifact = artifactFingerprint([extra, config.evidencePath, ...(s.planArtifactPath ? [s.planArtifactPath] : [])]);
+      engine.recordL1Decision(s, { id: `reconfigure:${s.revision}:${randomUUID()}`, kind: 'execution-plan', scope: '$spec',
+        inputVersion: engine.inputVersion(s), sourceVersion: s.planSourceVersion, candidateVersion: engine.globalDecisionVersion(s),
+        artifactPath: path.resolve(extra), artifactFiles: artifact.files, artifactDigest: artifact.digest, session, at: new Date().toISOString() });
+      // Existing ticket plans and checks were approved for the previous role routing.
+      for (const t of s.tickets) if (!['done', 'human', 'blocked', 'close', 'cleanup'].includes(t.phase)) {
+        t.epoch++; t.evidence = {}; t.phase = t.worktree ? 'replan' : 'claim';
+        t.reason = '模型路由改变；需真实 L1 更新工单计划和独立复核';
+      }
+      s.validationOwner = undefined;
+      s.mainSession = { source: 'unknown', at: new Date().toISOString() };
+      if (process.env.SPEC_DELIVERY_MAIN_NATIVE_ID) {
+        try { s.mainSession = nativeSession(statePath, process.env.SPEC_DELIVERY_MAIN_NATIVE_ID, '$main'); } catch { /* 无法观察时保持未知。 */ }
+      }
+      engine.event(s,'模型路由由真实 L1 重新配置；旧工单决策失效，保留完成结果');
     } else if (op === 'retire') {
       engine.ensure(extra && !s.jobs.some(active),'退役前必须对账并停止在途执行者');
       const r=read<{evidencePath:string;reason:string}>(extra);safeFile(r.evidencePath);engine.ensure(r.reason,'需要退役原因');
@@ -681,7 +826,14 @@ export async function main(argv: string[]): Promise<unknown> {
     } else if (op === 'submit') {
       engine.ensure(extra && fourth, '需要 jobId 与结果 JSON');
       const j = s.jobs.find(j => j.id === extra); engine.ensure(j, '未知 job'); const r = read<engine.Result>(fourth);
-      if (j.status !== 'done') {engine.ensure(!j.testExecution,'测试进程未完成');s.facts = observe(s,[j]); validateResult(s, j, r); }
+      if (j.status !== 'done') {
+        engine.ensure(!j.testExecution,'测试进程未完成');
+        if (s.protocol === engine.currentProtocol && j.executor === 'agent') {
+          engine.ensure(j.session, '缺少原生会话观测'); verifySessionArtifact(j.session);
+          if (j.tier === 'L1') { const artifact = decisionArtifacts(s, j, r); j.decisionArtifactDigest = artifact.digest; j.decisionArtifactFiles = artifact.files; }
+        }
+        s.facts = observe(s,[j]); validateResult(s, j, r);
+      }
       engine.submit(s, extra, r);
       archiveResult(statePath,j);
     } else if (op === 'reconcile') {
@@ -714,18 +866,39 @@ export async function main(argv: string[]): Promise<unknown> {
       engine.event(s, '实时核对宿主、GitHub 和候选；没有将 journal 回放当作新验证');
     } else if (op === 'resolve') {
       engine.ensure(extra, '需要 L1 根据已取得事实生成的解除阻塞决定');
-      const decisions = read<{ticket:string; evidencePath:string; handoffPath:string}[]>(extra);
+      const decisions = read<{ticket:string; evidencePath:string; handoffPath:string;
+        decisionNativeId?:string; inputVersion?:string; candidateVersion?:string}[]>(extra);
       s.facts = observe(s);
       for (const d of decisions) {
         const t = engine.ticket(s, d.ticket); safeFile(d.evidencePath); safeFile(d.handoffPath);
         engine.ensure(t.phase === 'blocked' && !s.jobs.some(j => j.ticket === t.key && active(j)), '只解除没有在途任务的阻塞工单');
+        let session: engine.NativeSession | undefined;
+        const originalCandidate = engine.candidateVersion(s, t);
+        if (s.protocol === engine.currentProtocol) {
+          engine.ensure(d.inputVersion === engine.inputVersion(s) && d.candidateVersion === originalCandidate,
+            '解除阻塞决定的输入或候选版本已过期');
+          engine.ensure(d.decisionNativeId, '解除阻塞需要真实 L1 原生会话');
+          session = nativeSession(statePath, d.decisionNativeId, `$resolve:${t.key}:${t.epoch}`);
+          engine.verifyNativeSession(s, session, d.decisionNativeId, 'L1'); verifySessionArtifact(session);
+        }
         t.handoffPath = d.handoffPath; t.phase = t.worktree ? 'replan' : 'claim'; t.epoch++; t.reason = '';
+        if (session) {
+          const artifact = artifactFingerprint([d.evidencePath, d.handoffPath]);
+          engine.recordL1Decision(s, { id: `resolve:${t.key}:${t.epoch}:${randomUUID()}`, kind: 'resolve', scope: t.key,
+            inputVersion: engine.inputVersion(s), sourceVersion: s.planSourceVersion,
+            candidateVersion: originalCandidate, appliesToCandidateVersion: engine.candidateVersion(s, t),
+            artifactPath: path.resolve(d.evidencePath), artifactFiles: artifact.files, artifactDigest: artifact.digest,
+            session, at: new Date().toISOString() });
+        }
       }
       if (s.status !== 'paused') s.status = 'running'; engine.event(s, 'L1 用已取得的新事实解除局部阻塞；重新规划而非跳过验证');
       s.specAudit = undefined; s.auditEpoch++;
     } else if (op === 'resume') {
       engine.ensure(!s.jobs.some(active), '恢复前先对账或停止已有任务'); engine.reconcileFacts(s, observe(s));
       engine.ensure(s.status !== 'complete', '本 workflow 已完成'); s.status = 'running'; s.specAudit = undefined; s.auditEpoch++;
+      s.mainSession = { source: 'unknown', at: new Date().toISOString() };
+      const mainId = extra || process.env.SPEC_DELIVERY_MAIN_NATIVE_ID;
+      if (mainId) try { s.mainSession = nativeSession(statePath, mainId, '$main'); } catch { /* 当前主会话不可观测。 */ }
       engine.event(s, 'L1 根据用户继续指令恢复执行；未自动清除工单阻塞');
     } else throw new Error(`未知命令 ${op}`);
     save(statePath, s); return { statePath, status: s.status, revision: s.revision };

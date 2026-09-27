@@ -20,16 +20,26 @@ function setup() {
   const t=e.buildTicket({number:101,kind:'software',dependencies:[],criteria:['done'],visual:false},head);t.phase='plan';t.head=head;t.branch='task';t.worktree=wt;s.tickets.push(t);
   const j=e.reserve(s)[0];fs.writeFileSync(statePath,JSON.stringify(s));
   fs.mkdirSync(path.join(root,'bin'));const log=path.join(run,'gh.log');
+  const sessions=path.join(run,'native-sessions.json');
+  const observe=(nativeId:string,jobId:string,model:string,provider='fixture')=>{
+    const all=fs.existsSync(sessions)?JSON.parse(fs.readFileSync(sessions,'utf8')):{};
+    all[nativeId]={source:'native_host',observationId:`observed-${nativeId}`,jobId,nativeId,provider,model,observedAt:'2026-09-27T00:00:00.000Z'};
+    fs.writeFileSync(sessions,JSON.stringify(all));
+  };
+  const observer=path.join(root,'bin','observer');
+  fs.writeFileSync(observer,`#!/usr/bin/env node\nconst fs=require('fs');const all=JSON.parse(fs.readFileSync(${JSON.stringify(sessions)},'utf8'));const [op,id,job]=process.argv.slice(2);const session=all[id];if(op!=='observe'||!session||session.jobId!==job)process.exit(2);console.log(JSON.stringify(session));\n`);
+  fs.chmodSync(observer,0o755);
   fs.writeFileSync(path.join(root,'bin','gh'),`#!/usr/bin/env node\nconst fs=require('fs');fs.appendFileSync(${JSON.stringify(log)},'call\\n');console.log(JSON.stringify({data:{repository:{target:{target:{oid:'${head}'}},i100:{number:100,state:'OPEN'},i101:{number:101,state:'OPEN'}}}}));\n`);fs.chmodSync(path.join(root,'bin','gh'),0o755);
   fs.writeFileSync(path.join(root,'evidence.md'),'actual evidence');fs.writeFileSync(path.join(root,'plan.json'),'{}');
-  const env={...process.env,PATH:path.join(root,'bin')+path.delimiter+process.env.PATH};
+  const env={...process.env,PATH:path.join(root,'bin')+path.delimiter+process.env.PATH,SPEC_DELIVERY_HOST_OBSERVER:observer};
   const call=(...args:string[])=>spawnSync(process.execPath,[entry,...args],{cwd:root,env,encoding:'utf8'});
-  return {root,run,head,s,t,j,statePath,log,call};
+  return {root,run,head,s,t,j,statePath,log,call,observe};
 }
 test('真实 CLI 批次绑定收取已有结果，只查询一次易变事实并可重复调用',()=>{
   const x=setup();try {
     stageResult(x.statePath,x.j.id,{complete:true,status:'planned',evidencePath:'evidence.md',data:{planPath:'plan.json',checksPath:'plan.json'}});
     const binding=path.join(x.run,'binding.json');fs.writeFileSync(binding,JSON.stringify({runId:'actual-native-run',model:'large',jobs:[{jobId:x.j.id,actorName:'planner'}]}));
+    x.observe('actual-native-run/planner',x.j.id,'large');
     const result=x.call('bind-batch',x.statePath,binding);assert.equal(result.status,0,result.stderr);assert.equal(JSON.parse(result.stdout).submitted.length,1);
     assert.equal(fs.readFileSync(x.log,'utf8').trim().split('\n').length,1);
     const again=x.call('bind-batch',x.statePath,binding);assert.equal(again.status,0,again.stderr);assert.equal(JSON.parse(again.stdout).submitted.length,0);
@@ -57,7 +67,9 @@ test('临时测试配额保留失败证据并释放，模型切换保留已经�
     const request=path.join(x.run,'experiment.json');fs.writeFileSync(request,JSON.stringify({argv:[process.execPath,'-e','process.exit(2)'],timeoutSeconds:5,reason:'red test'}));
     const run=x.call('test',x.statePath,x.j.id,request);assert.equal(run.status,0,run.stderr);const receipt=JSON.parse(run.stdout);assert.equal(receipt.exitCode,2);assert.ok(fs.existsSync(receipt.evidencePath));
     const s=JSON.parse(fs.readFileSync(x.statePath,'utf8'));assert.equal(s.jobs[0].tests,0);assert.equal(s.jobs[0].testExecution,undefined);
-    s.jobs[0].status='done';fs.writeFileSync(x.statePath,JSON.stringify(s));const config=path.join(x.run,'model.json');fs.writeFileSync(config,JSON.stringify({models:{L1:'new',L2:'middle',L3:'small'},capabilities:{framework:'fixture',mainModel:'new',modelRouting:'per_run',models:['new','middle','small']},evidencePath:path.join(x.root,'evidence.md')}));
+    s.jobs[0].status='done';fs.writeFileSync(x.statePath,JSON.stringify(s));const config=path.join(x.run,'model.json');
+    x.observe('new-l1-reconfigure','$spec:execution-plan','new');
+    fs.writeFileSync(config,JSON.stringify({models:{L1:'new',L2:'middle',L3:'small'},capabilities:{framework:'fixture',mainModel:'other-host',modelRouting:'per_run',models:['new','middle','small']},evidencePath:path.join(x.root,'evidence.md'),decisionNativeId:'new-l1-reconfigure'}));
     const switched=x.call('reconfigure',x.statePath,config);assert.equal(switched.status,0,switched.stderr);const saved=JSON.parse(fs.readFileSync(x.statePath,'utf8'));assert.equal(saved.inputs.models.L1,'new');assert.equal(saved.jobs[0].model,'large');
   } finally {fs.rmSync(x.root,{recursive:true,force:true});}
 });

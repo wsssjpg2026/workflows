@@ -80,6 +80,13 @@ function refreshAuthorReviews(s: engine.State) {
     const fresh=t.authorReview.head===t.head && t.authorReview.base===t.base &&
       t.authorReview.sources.fingerprint===authorReviewSources(s,t,t.head,t.base).fingerprint;
     if(fresh) continue;
+    // A revised plan must still pass its independent plan-check and implementation.
+    // The old proof is kept in the invocation journal; it is no longer current.
+    if(['claim','plan','plan_check','implement','integrate','replan'].includes(t.phase)) {
+      t.authorReview=undefined;delete t.evidence.self;
+      engine.event(s,`#${t.number} 修复阶段的旧作者自检失效；继续当前计划与实现`);
+      continue;
+    }
     if(s.jobs.some(j=>j.ticket===t.key && (j.status==='leased'||j.status==='running'))) {
       t.phase='blocked';t.reason='作者自检来源已变化；先对账在途任务';
     } else {
@@ -824,7 +831,7 @@ export function initialize(inputs: engine.Inputs, cwd = process.cwd()) {
   const base = gh.targetHead(repo, inputs.targetBranch);
   excludeRuntime(repo.root);
   const v3 = engine.initialProtocolV3();
-  v3.skillBindings = skills.defaultSkillBindings();
+  v3.skillBindings = skills.defaultSkillBindings(skills.configuredSkillRoot());
   const s: engine.State = { schema: 1, protocol: engine.currentProtocol, v3, id: randomUUID(), revision: 0, inputs, spec, repo, status: 'planning', tickets: [], jobs: [],
     specCriteria: [], planEvidence: '', auditEpoch: 1, events: [], mainSession: { source: 'unknown', at: new Date().toISOString() },
     facts: { base, issueStates: Object.fromEntries([parent, ...children].map(i => [String(i.number), i.state])), prs: {}, at: new Date().toISOString() } };
@@ -1347,7 +1354,10 @@ function publishPr(statePath:string,jobId:string,request:{title:string;bodyPath:
   const commentMarker=`<!-- spec-delivery:${s.id}:${t.key}:published:${intent.operationId} -->`;
   const prBody=`${prMarker}\n\n${body.trimEnd()}\n`;
   const commentBody=`${commentMarker}\n\n${completion.trimEnd()}\n`;
-  let number=gh.pullRequestWithMarker(s.repo,t.branch,s.inputs.targetBranch,prMarker);
+  // A repaired candidate keeps its original PR. GitHub advances that PR's head when
+  // the issue branch is pushed; a new publish intent posts a new completion comment.
+  const reusedPr=t.pr>0;
+  let number=reusedPr?t.pr:gh.pullRequestWithMarker(s.repo,t.branch,s.inputs.targetBranch,prMarker);
   if(!number) {
     const attempt=path.join(path.dirname(statePath),'actions',`${sha(j.id).slice(0,20)}.pr-create.attempt.json`);
     engine.ensure(!fs.existsSync(attempt),'PR 创建曾发出但远端尚未确认；保留操作意图，不能盲目重发');
@@ -1356,7 +1366,7 @@ function publishPr(statePath:string,jobId:string,request:{title:string;bodyPath:
       baseRef:s.inputs.targetBranch,body:prBody});}
     catch(error){number=gh.pullRequestWithMarker(s.repo,t.branch,s.inputs.targetBranch,prMarker);if(!number)throw error;}
   }
-  engine.ensure(gh.pullRequestWithMarker(s.repo,t.branch,s.inputs.targetBranch,prMarker)===number,
+  if(!reusedPr)engine.ensure(gh.pullRequestWithMarker(s.repo,t.branch,s.inputs.targetBranch,prMarker)===number,
     '创建后未能按固定操作标记核对远端 PR');
   const pr=gh.pr(s.repo,number);
   engine.ensure(pr.state==='OPEN'&&!pr.draft&&pr.head===t.head&&pr.base===t.base&&
@@ -2398,7 +2408,7 @@ export async function main(argv: string[]): Promise<unknown> {
       }
       if(s.status!=='complete'){s.specAudit=undefined;s.auditEpoch++;}
       s.validationOwner=undefined;s.protocol=engine.currentProtocol;s.v3=engine.initialProtocolV3();
-      s.v3.skillBindings=skills.defaultSkillBindings();
+      s.v3.skillBindings=skills.defaultSkillBindings(skills.configuredSkillRoot());
       engine.event(s,`迁移为统一运行协议 3；原账本备份 SHA-256 ${migration.backupSha256}：${migration.backupPath}；保留全部原结果和已完成工单。对账依据：${proof.evidencePath}`);
       save(statePath,s);return {statePath,status:s.status,upgraded:true,backupPath:migration.backupPath,
         backupSha256:migration.backupSha256,invalidatedTickets:migration.invalidatedTickets};

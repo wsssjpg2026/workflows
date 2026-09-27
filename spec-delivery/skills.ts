@@ -14,11 +14,28 @@ const defaultNames: Record<SkillCapability, string> = {
   prReview: 'code-review-from-claude', handoff: 'handoff',
 };
 export const skillCapabilities = capabilities;
+/** A materialized candidate must use its own skill packages, never the caller's HOME. */
+export function configuredSkillRoot(): string | undefined {
+  const configured=process.env.SPEC_DELIVERY_SKILL_ROOT;
+  const installRoot=path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const candidate=fs.existsSync(path.join(installRoot,'candidate-manifest.json'));
+  if(candidate)ensure(configured, '隔离候选需要 SPEC_DELIVERY_SKILL_ROOT 指向本候选的 skills 目录');
+  if(!configured)return undefined;
+  ensure(path.isAbsolute(configured), 'SPEC_DELIVERY_SKILL_ROOT 必须是绝对路径');
+  let root: string;
+  try { root=fs.realpathSync(configured); }
+  catch { throw new Error(`技能安装根目录不可读取：${configured}`); }
+  ensure(fs.statSync(root).isDirectory(), '技能安装根目录不是目录');
+  if(candidate)ensure(root===fs.realpathSync(path.join(installRoot,'skills')),
+    '隔离候选只能使用自身安装的 skills 目录');
+  return root;
+}
 export function defaultSkillPaths(root?: string): Record<SkillCapability, string> {
-  const sourceRoot=root || path.join(os.homedir(), '.agents', 'skills');
+  const installed=root===undefined?configuredSkillRoot():root;
+  const sourceRoot=installed || path.join(os.homedir(), '.agents', 'skills');
   const paths=Object.fromEntries(capabilities.map(capability =>
     [capability, path.join(sourceRoot, defaultNames[capability], 'SKILL.md')])) as Record<SkillCapability, string>;
-  if (root === undefined) {
+  if (installed === undefined) {
     paths.authorReview=path.join(path.dirname(fileURLToPath(import.meta.url)),
       'review-skills','code-review','SKILL.md');
     paths.prReview=path.join(path.dirname(fileURLToPath(import.meta.url)),

@@ -6,7 +6,9 @@
 
 ## v0.3 过渡范围
 
-`version` 报告 `0.3.0`。新建运行写入协议 `3`，summary 继续输出独立的 `schemaVersion: 1`。协议 3 的 `v3.decisionRecords`、`skillInvocations`、`skillChildren` 和 `dispatchRecords` 分别持久保存 L1 决策、技能调用、技能子任务及宿主派发。当前阶段仍使用下文的旧审查流程。此仓库的开发候选不会自动更新正式安装版。
+`version` 报告 `0.3.0`。新建运行写入协议 `3`，summary 继续输出独立的 `schemaVersion: 1`。协议 3 的 `v3.decisionRecords`、`skillInvocations`、`skillChildren` 和 `dispatchRecords` 分别持久保存 L1 决策、技能调用、技能子任务及宿主派发。新运行由绑定的作者自检与 PR 审查技能执行专业判断，经 `dispatch`/`drive`/`collect` 取得宿主终态；旧审查动作只供历史运行结清。此仓库的开发候选不会自动更新正式安装版。
+
+隔离候选的固定提交物化、五技能包清单、验证命令、切换与回退以及宿主能力等级见 [CANDIDATE.md](CANDIDATE.md)。物化候选运行时必须设置 `SPEC_DELIVERY_SKILL_ROOT=<安装目录>/skills`；缺失或指向其它目录会拒绝初始化，不能回退到用户全局技能。候选本身不会覆盖正式安装。
 
 ## 启动只需五项
 

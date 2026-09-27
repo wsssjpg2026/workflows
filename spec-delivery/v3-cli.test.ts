@@ -8,6 +8,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { normalizeResult, resultPaths } from './host.ts';
 import { rawSourcesForJob } from './raw-sources.ts';
+import * as skills from './skills.ts';
 import * as core from './core.ts';
 
 const entry = fileURLToPath(new URL('../spec-delivery.workflow.ts', import.meta.url));
@@ -436,6 +437,67 @@ if(zipped.status!==0)process.exit(2);
     assert.equal(state.v3.decisionRecords[0].session.nativeId,launched.nativeId);
     assert.equal(state.v3.decisionRecords[0].session.model,'large');
     assert.equal(state.v3.decisionRecords[0].artifactPath,collected.planPath);
+  }finally{fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('安装技能根固定五包；全局变化不影响初始化或停稳后的旧账本升级',()=>{
+  const x=fixture();
+  try{
+    const candidateMode=fs.existsSync(path.join(path.dirname(entry),'candidate-manifest.json'));
+    const root=candidateMode?path.join(path.dirname(entry),'skills'):
+      path.join(x.temp,'isolated-install','skills');
+    if(!candidateMode)fs.cpSync(path.join(x.temp,'.agents','skills'),root,{recursive:true});
+    x.env.SPEC_DELIVERY_SKILL_ROOT=root;
+    const started=x.call('init',x.inputPath);assert.equal(started.status,0,started.stderr);
+    const statePath=JSON.parse(started.stdout).statePath as string;
+    const saved=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.deepEqual(Object.keys(saved.inputs).sort(),['models','spec','targetBranch']);
+    assert.ok(saved.v3.skillBindings.every((b:{sourcePath:string})=>b.sourcePath.startsWith(root+path.sep)));
+    const before=saved.v3.skillBindings.map((b:{fingerprint:string})=>b.fingerprint);
+    fs.writeFileSync(path.join(x.temp,'.agents','skills','implement','SKILL.md'),'changed global copy\n');
+    assert.deepEqual(saved.v3.skillBindings.map((b:core.SkillBinding)=>skills.verifySkillBinding(b).fingerprint),before);
+    saved.protocol=2;delete saved.v3;fs.writeFileSync(statePath,JSON.stringify(saved));
+    const hostState=path.join(x.temp,'migration-host.json');
+    fs.writeFileSync(hostState,JSON.stringify({processTree:'stopped',externalActions:'settled'}));
+    const observer=path.join(x.temp,'migration-observer');
+    fs.writeFileSync(observer,`#!/usr/bin/env node
+const fs=require('fs');const [operation]=process.argv.slice(2);
+if(operation!=='quiescence')process.exit(2);
+const request=JSON.parse(fs.readFileSync(0,'utf8'));
+const host=JSON.parse(fs.readFileSync(${JSON.stringify(hostState)},'utf8'));
+console.log(JSON.stringify({source:'native_host',schemaVersion:1,challenge:request.challenge,
+  runId:request.runId,inventorySha256:request.inventorySha256,ledgerSha256:request.ledgerSha256,
+  observedAt:new Date().toISOString(),actors:[],dispatches:[],instances:[],processes:[],
+  processTree:{state:host.processTree,unknownChildren:0,observationId:'host-process-tree'},
+  externalActions:{state:host.externalActions,unknown:0,observationId:'host-actions'}}));
+`);
+    fs.chmodSync(observer,0o755);x.env.SPEC_DELIVERY_MIGRATION_OBSERVER=observer;
+    const contextResult=x.call('migration-context',statePath);
+    assert.equal(contextResult.status,0,contextResult.stderr);
+    const context=JSON.parse(contextResult.stdout);
+    const proof=path.join(x.temp,'upgrade.json');
+    fs.writeFileSync(proof,JSON.stringify({schemaVersion:1,expectedRevision:context.revision,
+      inventorySha256:context.inventorySha256,ledgerSha256:context.ledgerSha256,
+      evidencePath:x.planEvidence,observedAt:new Date().toISOString(),statusIntent:'preserve',
+      processTreeStopped:true,externalActionsSettled:true}));
+    const upgraded=x.call('upgrade',statePath,proof);assert.equal(upgraded.status,0,upgraded.stderr);
+    const migrated=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.ok(migrated.v3.skillBindings.every((b:{sourcePath:string})=>b.sourcePath.startsWith(root+path.sep)));
+  }finally{fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('显式安装技能根缺包时拒绝 init，不读取可用的全局技能',()=>{
+  const x=fixture();
+  try{
+    const candidateMode=fs.existsSync(path.join(path.dirname(entry),'candidate-manifest.json'));
+    const root=path.join(x.temp,'incomplete-install','skills');fs.mkdirSync(root,{recursive:true});
+    fs.cpSync(path.join(x.temp,'.agents','skills','implement'),path.join(root,'implement'),{recursive:true});
+    x.env.SPEC_DELIVERY_SKILL_ROOT=root;
+    const result=x.call('init',x.inputPath);
+    assert.notEqual(result.status,0);
+    assert.match(result.stderr,candidateMode?/隔离候选只能使用自身安装的 skills 目录/:
+      /diagnosis 技能来源不可读取/);
+    assert.equal(fs.existsSync(path.join(x.root,'.agents','workflow-runs')),false);
   }finally{fs.rmSync(x.temp,{recursive:true,force:true});}
 });
 
@@ -1601,6 +1663,272 @@ else if(op==='result'){
     assert.equal(core.mergeGate(after,after.tickets[0]),false,'裁决没有代替 L2 验收和 CI');
     assert.equal(after.tickets[0].evidence.accept,undefined);
   } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('单账本 v3 组合回放：依赖、并行实现、独立审查、补充计划与交付',()=>{
+  const x=fixture(true);
+  try {
+    const remotePath=path.join(x.temp,'combined-remote.json');
+    fs.writeFileSync(remotePath,JSON.stringify({repo:x.root,bare:path.join(x.temp,'origin.git'),
+      base:x.head,issues:{100:'OPEN',101:'OPEN',102:'OPEN',103:'OPEN'},
+      prs:{},comments:{},nextPr:201,checkByHead:{},trees:{}}));
+    const hostPath=path.join(x.temp,'combined-host.json');
+    fs.writeFileSync(hostPath,JSON.stringify({actors:{},starts:0}));
+    for(const [fixtureName,targetName] of [
+      ['combined-gh.mjs','gh'],['combined-host.mjs','combined-host'],
+      ['combined-skill-observer.mjs','combined-skill-observer']]) {
+      const target=path.join(x.temp,'bin',targetName);
+      fs.copyFileSync(new URL(`./test-fixtures/${fixtureName}`,import.meta.url),target);
+      fs.chmodSync(target,0o755);
+    }
+    Object.assign(x.env,{SPEC_DELIVERY_COMBINED_REMOTE:remotePath,
+      SPEC_DELIVERY_COMBINED_HOST_DB:hostPath,SPEC_DELIVERY_COMBINED_SESSIONS:x.sessions,
+      SPEC_DELIVERY_HOST_ADAPTER:path.join(x.temp,'bin','combined-host'),
+      SPEC_DELIVERY_SKILL_OBSERVER:path.join(x.temp,'bin','combined-skill-observer')});
+    const remote=()=>JSON.parse(fs.readFileSync(remotePath,'utf8'));
+    const updateRemote=(mutate:(value:ReturnType<typeof remote>)=>void)=>{
+      const value=remote();mutate(value);fs.writeFileSync(remotePath,JSON.stringify(value));
+    };
+    const call=(...args:string[])=>{
+      const result=x.directCall(...args);assert.equal(result.status,0,`${args.join(' ')}: ${result.stderr}`);
+      return JSON.parse(result.stdout);
+    };
+    const file=(name:string,value:unknown)=>{
+      const result=path.join(x.temp,name);fs.writeFileSync(result,typeof value==='string'?value:JSON.stringify(value));
+      return result;
+    };
+    const global=JSON.parse(fs.readFileSync(x.planPath,'utf8'));
+    global.policy={agents:8,issues:3,tests:1,noProgress:4,rounds:6};
+    global.tickets=[101,102,103].map(number=>({number,kind:'software',
+      dependencies:number===103?[101,102]:[],criteria:[`criterion-${number}`],visual:false}));
+    global.specCriteria=['all-software-delivered'];
+    const initialized=call('init',x.inputPath),statePath=initialized.statePath as string;
+    x.env.SPEC_DELIVERY_COMBINED_STATE=statePath;
+    Object.assign(global,initialized.decisionContext,{decisionNativeId:'combined-global-plan'});
+    fs.writeFileSync(x.planPath,JSON.stringify(global));
+    x.observe('combined-global-plan','$spec:execution-plan','large');
+    call('plan',statePath,x.planPath);
+    const initialLedger=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    call('migrate-skills',statePath,file('combined-review-binding.json',{
+      expectedRevision:initialLedger.revision,evidencePath:x.planEvidence,
+      replacements:{prReview:path.join(x.temp,'.agents','skills','code-review-from-claude','SKILL.md')}}));
+    const state=()=>JSON.parse(fs.readFileSync(statePath,'utf8')) as core.State;
+    const next=()=>call('next',statePath).jobs as core.Job[];
+    const actor=(job:core.Job)=>{
+      const dispatch=state().v3!.dispatchRecords.find(value=>value.jobId===job.id)!;
+      const db=JSON.parse(fs.readFileSync(hostPath,'utf8'));
+      return {db,dispatch,row:db.actors[dispatch.token]};
+    };
+    const dispatch=(job:core.Job)=>{
+      const result=call('dispatch',statePath,job.id);
+      assert.equal(result.status,'running',JSON.stringify(result));
+      assert.ok(actor(job).row);
+    };
+    const finish=(job:core.Job,result:Record<string,unknown>)=>{
+      const current=actor(job);
+      assert.ok(current.row,`No native actor for ${job.id}`);
+      current.row.state='completed';current.row.completedAt='2026-09-27T00:00:01.000Z';
+      current.row.result=result;
+      fs.writeFileSync(hostPath,JSON.stringify(current.db));
+      const collected=call('collect',statePath,job.id);
+      assert.equal(state().jobs.find(value=>value.id===job.id)?.status,'done',JSON.stringify(collected));
+    };
+    const by=(jobs:core.Job[],number:number,action:string)=>{
+      const job=jobs.find(value=>value.ticket===String(number)&&value.action===action);
+      assert.ok(job,`Missing ${number}/${action}: ${jobs.map(value=>`${value.ticket}/${value.action}`)}`);
+      return job;
+    };
+    const claims=next();assert.deepEqual(claims.map(value=>Number(value.ticket)).sort(),[101,102]);
+    for(const job of claims)call('execute',statePath,job.id);
+    const plans=next();assert.deepEqual(plans.map(value=>Number(value.ticket)).sort(),[101,102]);
+    const checks=file('combined-checks.json',{scopeReason:'Run the actual worktree test command',
+      commands:[{name:'fixture-smoke',argv:[process.execPath,'-e','process.exit(0)'],timeoutSeconds:5}]});
+    for(const job of plans){
+      dispatch(job);
+      const number=Number(job.ticket),planPath=file(`combined-plan-${number}.md`,`Plan #${number} from L1`);
+      finish(job,{complete:true,status:'planned',evidencePath:planPath,
+        data:{planPath,checksPath:checks}});
+    }
+    const checksToRun=next();assert.deepEqual(checksToRun.map(value=>Number(value.ticket)).sort(),[101,102]);
+    for(const job of checksToRun){
+      dispatch(job);
+      finish(job,{complete:true,status:'pass',evidencePath:file(`combined-check-${job.ticket}.md`,'L1 independently verified plan')});
+    }
+    const implementations=next();
+    assert.deepEqual(implementations.map(value=>Number(value.ticket)).sort(),[101,102]);
+    assert.equal(state().tickets.find(value=>value.number===103)?.phase,'claim');
+    for(const job of implementations)dispatch(job);
+    assert.equal(state().jobs.filter(value=>value.action==='implement'&&value.status==='running').length,2);
+    const skill=(job:core.Job,capability:core.SkillCapability,
+      name:string,status:'pass'|'changes_required'='pass',blocking=false)=>{
+      const request=file(`combined-${name}-request.json`,{capability});
+      const started=call('skill-start',statePath,job.id,request);
+      assert.equal(started.mode,'source_execution');
+      const raw=file(`combined-${name}-raw.md`,`${name}: complete original skill output\n`);
+      const outcome=file(`combined-${name}-outcome.json`,
+        {status,blocking,rawOutputPath:raw,evidencePaths:[raw]});
+      const finished=call('skill-finish',statePath,started.invocationId,outcome);
+      return {invocationId:started.invocationId,rawPath:finished.result.rawOutputPath as string};
+    };
+    const commit=(number:number,suffix:string)=>{
+      const ticket=state().tickets.find(value=>value.number===number)!;
+      fs.appendFileSync(path.join(ticket.worktree,'source.txt'),`${suffix}\n`);
+      git(ticket.worktree,'add','source.txt');git(ticket.worktree,'commit','-m',suffix);
+      return git(ticket.worktree,'rev-parse','HEAD');
+    };
+    const first=by(implementations,101,'implement');
+    const checkpointHead=commit(101,'committed checkpoint before replan');
+    const checkpointSkill=skill(first,'implementation','checkpoint-implementation','changes_required',true);
+    const checkpointHandoff=skill(first,'handoff','checkpoint-handoff');
+    finish(first,{complete:true,status:'replan',head:checkpointHead,base:first.base,
+      evidencePath:checkpointSkill.rawPath,handoffPath:checkpointHandoff.rawPath,
+      data:{reason:'Committed checkpoint needs an overflow acceptance plan',
+        skillInvocationIds:[checkpointSkill.invocationId,checkpointHandoff.invocationId]}});
+    assert.equal(state().tickets.find(value=>value.number===101)?.phase,'replan');
+    assert.equal(git(state().tickets.find(value=>value.number===101)!.worktree,'rev-parse','HEAD'),checkpointHead);
+    const replan=by(next(),101,'replan');dispatch(replan);
+    const revisedPlan=file('combined-replan-101.md','L1 overflow scope and test boundary');
+    const revisedChecks=file('combined-checks-replan.json',{scopeReason:'Overflow and initial behavior',
+      commands:[{name:'overflow-smoke',argv:[process.execPath,'-e','process.exit(0)'],timeoutSeconds:5}]});
+    finish(replan,{complete:true,status:'planned',evidencePath:revisedPlan,
+      data:{planPath:revisedPlan,checksPath:revisedChecks}});
+    const recheck=by(next(),101,'plan-check');dispatch(recheck);
+    finish(recheck,{complete:true,status:'pass',evidencePath:file('combined-recheck-101.md','Independent L1 plan review')});
+    const repaired=by(next(),101,'implement');dispatch(repaired);
+    const repairedHead=commit(101,'implemented after checkpoint');
+    const implementation=call('skill-start',statePath,repaired.id,
+      file('combined-implementation-request.json',{capability:'implementation'}));
+    const implementationRaw=file('combined-repaired-implementation-raw.md','Implemented and reviewed candidate\n');
+    const childRequest=file('combined-author-child.json',{children:[{key:'author-check',
+      instruction:'Review the committed candidate against spec and repository standards',
+      tier:'L3',required:true,independent:true,skillCapability:'authorReview',head:repairedHead}]});
+    call('skill-delegate',statePath,implementation.invocationId,childRequest);
+    const child=next().find(value=>value.action==='skill-child'&&value.parentInvocationId===implementation.invocationId);
+    assert.ok(child);dispatch(child);
+    const author=skill(child,'authorReview','embedded-author-review');
+    finish(child,{complete:true,status:'completed',evidencePath:author.rawPath,
+      data:{skillInvocationIds:[author.invocationId]}});
+    assert.equal(call('skill-continue',statePath,implementation.invocationId).waiting,false);
+    const implementationOutcome=call('skill-finish',statePath,implementation.invocationId,
+      file('combined-parent-outcome.json',{status:'pass',blocking:false,
+        rawOutputPath:implementationRaw,evidencePaths:[implementationRaw]}));
+    assert.equal(implementationOutcome.status,'pass');
+    const handoff=skill(repaired,'handoff','repaired-handoff');
+    finish(repaired,{complete:true,status:'implemented',head:repairedHead,base:repaired.base,
+      evidencePath:implementationRaw,handoffPath:handoff.rawPath,
+      data:{skillInvocationIds:[implementation.invocationId,handoff.invocationId]}});
+    assert.equal(state().tickets.find(value=>value.number===101)?.authorReview?.head,repairedHead);
+    assert.equal(state().jobs.find(value=>value.ticket==='102'&&value.action==='implement')?.status,'running');
+    const verification=by(next(),101,'verify');
+    call('execute',statePath,verification.id);
+    assert.equal(state().tickets.find(value=>value.number===101)?.phase,'publish');
+    const publishedJob=by(next(),101,'publish');dispatch(publishedJob);
+    const primary=state().tickets.find(value=>value.number===101)!;
+    git(primary.worktree,'push',path.join(x.temp,'origin.git'),`HEAD:refs/heads/${primary.branch}`);
+    updateRemote(value=>{
+      value.checkByHead[repairedHead]='pass';
+      value.trees[repairedHead]=git(primary.worktree,'rev-parse','HEAD^{tree}');
+    });
+    const publishRequest=file('combined-publish-request.json',
+      {title:'Complete task 101',bodyPath:file('combined-pr-body.md','Reviewed implementation'),
+        completionPath:file('combined-completion.md','Checks and author review passed')});
+    const publishResult=call('publish-pr',statePath,publishedJob.id,publishRequest);
+    finish(publishedJob,publishResult);
+    assert.equal(state().tickets.find(value=>value.number===101)?.phase,'review');
+    const reviewRound=(phase:'review'|'fresh',blocking:boolean)=>{
+      const job=by(next(),101,'pr-review');
+      assert.equal(job.fresh,phase==='fresh');dispatch(job);
+      const bound=skill(job,'prReview',`combined-${phase}-pr-review`,
+        blocking?'changes_required':'pass',blocking);
+      finish(job,{complete:true,status:'reviewed',evidencePath:bound.rawPath,
+        data:{skillInvocationIds:[bound.invocationId]}});
+      const report=by(next(),101,'review-report');call('execute',statePath,report.id);
+      return bound;
+    };
+    const regular=reviewRound('review',false);
+    const fresh=reviewRound('fresh',true);
+    assert.notEqual(regular.invocationId,fresh.invocationId);
+    const dispute=state().v3!.reviewDisagreements!.at(-1)!;
+    assert.equal(state().tickets.find(value=>value.number===101)?.phase,'fresh');
+    const adjudication=by(next(),101,'adjudicate');
+    assert.equal(adjudication.contextIntent?.kind,'independent');dispatch(adjudication);
+    const rationale='Fresh report found a factual concern already covered by the current tested behavior';
+    const decision={disagreementId:dispute.id,regularInvocationId:dispute.regularInvocationId,
+      freshInvocationId:dispute.freshInvocationId,skillFingerprint:dispute.skillFingerprint,
+      blocking:false,rationale,skillRuleRefs:['SKILL.md'],head:dispute.head,base:dispute.base,
+      candidateVersion:dispute.candidateVersion};
+    const decisionPath=file('combined-adjudication.json',decision);
+    finish(adjudication,{complete:true,status:'resolved',evidencePath:decisionPath,data:decision});
+    assert.equal(state().tickets.find(value=>value.number===101)?.phase,'accept');
+    const acceptance=by(next(),101,'accept');dispatch(acceptance);
+    const gapPlan=file('combined-acceptance-gap-plan.md','L2 missing overflow example');
+    const gapEvidence=file('combined-acceptance-gap.md','L2 observed missing criterion-101 overflow example');
+    finish(acceptance,{complete:true,status:'gap',evidencePath:gapEvidence,
+      data:{missingCriteria:['criterion-101'],planPath:gapPlan,
+        reason:'Overflow behavior needs a second observable example'}});
+    assert.equal(state().tickets.find(value=>value.number===101)?.phase,'replan');
+    const gapReplan=by(next(),101,'replan');dispatch(gapReplan);
+    const gapChecks=file('combined-gap-checks.json',{scopeReason:'Test original and missing overflow example',
+      commands:[{name:'gap-smoke',argv:[process.execPath,'-e','process.exit(0)'],timeoutSeconds:5}]});
+    const gapApprovedPlan=file('combined-gap-approved-plan.md','L1 approves the L2 missing criterion and test boundary');
+    finish(gapReplan,{complete:true,status:'planned',evidencePath:gapApprovedPlan,
+      data:{planPath:gapApprovedPlan,checksPath:gapChecks,gapEvidencePath:gapEvidence,
+        scopeDecision:'Add the missing overflow example for criterion-101',
+        testBoundary:'Exercise both the original and overflow example with the fixture command'}});
+    const gapCheck=by(next(),101,'plan-check');dispatch(gapCheck);
+    finish(gapCheck,{complete:true,status:'pass',evidencePath:file('combined-gap-plan-check.md','Independent L1 recheck')});
+    const gapImplement=by(next(),101,'implement');dispatch(gapImplement);
+    const finalHead=commit(101,'implement missing acceptance behavior');
+    const diagnosis=skill(gapImplement,'diagnosis','gap-diagnosis');
+    const finalHandoff=skill(gapImplement,'handoff','gap-handoff');
+    finish(gapImplement,{complete:true,status:'implemented',head:finalHead,base:gapImplement.base,
+      evidencePath:diagnosis.rawPath,handoffPath:finalHandoff.rawPath,
+      data:{skillInvocationIds:[diagnosis.invocationId,finalHandoff.invocationId]}});
+    assert.equal(state().tickets.find(value=>value.number===101)?.phase,'self');
+    const finalAuthorJob=by(next(),101,'author-review');dispatch(finalAuthorJob);
+    const finalAuthor=skill(finalAuthorJob,'authorReview','gap-author-review');
+    finish(finalAuthorJob,{complete:true,status:'reviewed',evidencePath:finalAuthor.rawPath,
+      data:{skillInvocationIds:[finalAuthor.invocationId]}});
+    const finalVerify=by(next(),101,'verify');call('execute',statePath,finalVerify.id);
+    const finalTicket=state().tickets.find(value=>value.number===101)!;
+    git(finalTicket.worktree,'push',path.join(x.temp,'origin.git'),`HEAD:refs/heads/${finalTicket.branch}`);
+    updateRemote(value=>{
+      value.prs[201].head=finalHead;
+      value.checkByHead[finalHead]='pass';
+      value.trees[finalHead]=git(finalTicket.worktree,'rev-parse','HEAD^{tree}');
+    });
+    const republish=by(next(),101,'publish');dispatch(republish);
+    const republishResult=call('publish-pr',statePath,republish.id,
+      file('combined-republish-request.json',{title:'Complete revised task 101',
+        bodyPath:file('combined-republish-body.md','Revised implementation'),
+        completionPath:file('combined-republish-completion.md','Gap fixed and retested')}));
+    assert.equal(republishResult.data.pr,201,'修复候选复用现有 PR 身份');
+    finish(republish,republishResult);
+    reviewRound('review',false);reviewRound('fresh',false);
+    const finalAccept=by(next(),101,'accept');dispatch(finalAccept);
+    finish(finalAccept,{complete:true,status:'ready',evidencePath:file('combined-final-accept.md','L2 accepts revised criterion'),
+      data:{satisfiedCriteria:['criterion-101']}});
+    assert.equal(state().tickets.find(value=>value.number===101)?.phase,'merge');
+    const merger=by(next(),101,'merge');dispatch(merger);
+    const mergedResult=call('merge-pr',statePath,merger.id,
+      file('combined-merge-request.json',{strategy:'merge'}));
+    finish(merger,mergedResult);
+    assert.equal(remote().prs[201].state,'MERGED');
+    const close=by(next(),101,'close');call('execute',statePath,close.id);
+    assert.equal(remote().issues[101],'CLOSED');
+    const cleaned=by(next(),101,'cleanup');call('execute',statePath,cleaned.id);
+    assert.equal(state().tickets.find(value=>value.number===101)?.phase,'done');
+    assert.equal(state().tickets.find(value=>value.number===101)?.cleaned,true);
+    assert.equal(fs.existsSync(finalTicket.worktree),false);
+    assert.equal(remote().prs[201].mergedHead,finalHead);
+    assert.equal(remote().nextPr,202,'修复候选须复用原 PR，不另创 PR');
+    assert.equal(remote().issues[100],'OPEN','依赖未交付时父 spec 不能关闭');
+    assert.equal(state().tickets.find(value=>value.number===103)?.phase,'claim',
+      '103 仍受未完成的 102 原生前置阻塞');
+  } finally {
+    if(process.env.SPEC_DELIVERY_KEEP_COMBINED)console.error(`Combined replay fixture: ${x.temp}`);
+    else fs.rmSync(x.temp,{recursive:true,force:true});
+  }
 });
 
 test('离线 metrics 保留两种 provider 原文和未知费用，重复观测不重计并可同口径比较', () => {

@@ -14,6 +14,10 @@ function setup() {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'workflow-cli-'));git(root,'init','-b','main');git(root,'config','user.email','test@example.invalid');git(root,'config','user.name','Workflow Test');
   fs.writeFileSync(path.join(root,'source'),'base');git(root,'add','source');git(root,'commit','-m','base');const head=git(root,'rev-parse','HEAD');
   fs.mkdirSync(path.join(root,'.agents','worktrees'),{recursive:true});const wt=path.join(root,'.agents','worktrees','task');git(root,'worktree','add','-b','task',wt,head);
+  for (const name of ['implement','diagnosing-bugs','code-review','code-review-from-claude','handoff']) {
+    const directory=path.join(root,'.agents','skills',name);fs.mkdirSync(directory,{recursive:true});
+    fs.writeFileSync(path.join(directory,'SKILL.md'),`---\nname: ${name}\n---\n\nExecute ${name} in the CLI fixture.\n`);
+  }
   fs.appendFileSync(path.join(root,'.git','info','exclude'),'\n/.agents/\n/bin/\n/evidence.md\n/plan.json\n');
   const run=path.join(root,'.agents','workflow-runs','test');fs.mkdirSync(run,{recursive:true});const statePath=path.join(run,'state.json');
   const s:e.State={schema:1,protocol:3,v3:e.initialProtocolV3(),id:'cli-fixture',revision:0,inputs:{spec:100,targetBranch:'main',models:{L1:'large',L2:'middle',L3:'small'}},spec:100,repo:{root,slug:'example/test',host:'github.com',defaultBranch:'main'},status:'running',policy:{agents:8,issues:3,tests:1,noProgress:3,rounds:4},tickets:[],jobs:[],specCriteria:['done'],planEvidence:'',auditEpoch:1,events:[],facts:{base:head,issueStates:{100:'OPEN',101:'OPEN'},prs:{},at:''}};
@@ -31,7 +35,7 @@ function setup() {
   fs.chmodSync(observer,0o755);
   fs.writeFileSync(path.join(root,'bin','gh'),`#!/usr/bin/env node\nconst fs=require('fs');fs.appendFileSync(${JSON.stringify(log)},'call\\n');console.log(JSON.stringify({data:{repository:{target:{target:{oid:'${head}'}},i100:{number:100,state:'OPEN'},i101:{number:101,state:'OPEN'}}}}));\n`);fs.chmodSync(path.join(root,'bin','gh'),0o755);
   fs.writeFileSync(path.join(root,'evidence.md'),'actual evidence');fs.writeFileSync(path.join(root,'plan.json'),'{}');
-  const env={...process.env,PATH:path.join(root,'bin')+path.delimiter+process.env.PATH,SPEC_DELIVERY_HOST_OBSERVER:observer};
+  const env={...process.env,HOME:root,PATH:path.join(root,'bin')+path.delimiter+process.env.PATH,SPEC_DELIVERY_HOST_OBSERVER:observer};
   const call=(...args:string[])=>spawnSync(process.execPath,[entry,...args],{cwd:root,env,encoding:'utf8'});
   return {root,run,head,s,t,j,statePath,log,call,observe};
 }

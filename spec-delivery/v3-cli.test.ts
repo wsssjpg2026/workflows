@@ -12,6 +12,10 @@ const inputs = { spec: 100, targetBranch: 'main', models: { L1: 'large', L2: 'mi
 
 function fixture() {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-v3-cli-'));
+  for (const name of ['implement', 'diagnosing-bugs', 'code-review', 'code-review-from-claude', 'handoff']) {
+    const directory = path.join(temp, '.agents', 'skills', name); fs.mkdirSync(directory, { recursive: true });
+    fs.writeFileSync(path.join(directory, 'SKILL.md'), `---\nname: ${name}\n---\n\nExecute ${name} in this fixture.\n`);
+  }
   const root = path.join(temp, 'repo'), bare = path.join(temp, 'origin.git');
   fs.mkdirSync(root); git(temp, 'init', '--bare', bare); git(root, 'init', '-b', 'main');
   git(root, 'config', 'user.email', 'test@example.invalid'); git(root, 'config', 'user.name', 'Workflow Test');
@@ -50,7 +54,7 @@ else { console.error('unexpected gh '+a.join(' ')); process.exit(2); }
   const observer = path.join(bin, 'native-observer');
   fs.writeFileSync(observer, `#!/usr/bin/env node\nconst fs=require('fs');const all=JSON.parse(fs.readFileSync(${JSON.stringify(sessions)},'utf8'));const [op,id,job]=process.argv.slice(2);const found=all[id];if(op!=='observe'||!found||found.jobId!==job)process.exit(2);console.log(JSON.stringify(found));\n`);
   fs.chmodSync(observer, 0o755);
-  const env = { ...process.env, PATH: bin + path.delimiter + process.env.PATH, SPEC_DELIVERY_HOST_OBSERVER: observer };
+  const env = { ...process.env, HOME: temp, PATH: bin + path.delimiter + process.env.PATH, SPEC_DELIVERY_HOST_OBSERVER: observer };
   const call = (...args: string[]) => spawnSync(process.execPath, [entry, ...args], { cwd: root, env, encoding: 'utf8' });
   const inputPath = path.join(temp, 'input.json'); fs.writeFileSync(inputPath, JSON.stringify(inputs));
   const planEvidence = path.join(temp, 'plan-evidence.md'); fs.writeFileSync(planEvidence, 'L1 plan evidence\n');
@@ -102,7 +106,12 @@ test('v3 公开 CLI 从五项输入初始化、规划、认领并登记一次 ag
     const initial = JSON.parse(fs.readFileSync(statePath, 'utf8'));
     assert.equal(initial.protocol, 3);
     assert.equal(initial.mainSession.source, 'unknown');
-    assert.deepEqual(initial.v3, { executionPath: 'legacy-v02', decisionRecords: [], skillInvocations: [], dispatchRecords: [] });
+    assert.equal(initial.v3.executionPath, 'legacy-v02');
+    assert.deepEqual(initial.v3.decisionRecords, []);
+    assert.deepEqual(initial.v3.skillInvocations, []);
+    assert.deepEqual(initial.v3.dispatchRecords, []);
+    assert.deepEqual(initial.v3.skillBindings.map((binding: {capability:string})=>binding.capability),
+      ['implementation','diagnosis','authorReview','prReview','handoff']);
     assert.deepEqual(Object.keys(initial.inputs).sort(), ['models', 'spec', 'targetBranch']);
     assert.equal(initial.repo.root, x.root);
     assert.equal(initial.facts.base, x.head);

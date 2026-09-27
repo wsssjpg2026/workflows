@@ -4,14 +4,33 @@ export type Tier = 'L1' | 'L2' | 'L3';
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export interface Inputs { spec: number | string; targetBranch: string; models: Record<Tier, string> }
 export const currentProtocol = 3;
-/**
- * v3 的持久扩展点。现阶段仍执行 v0.2 软件交付阶段；这些空集合只是以后
- * 决策、技能调用和派发记录的独立命名空间，不构成已取得执行证据。
- */
+export type SkillCapability = 'implementation' | 'diagnosis' | 'authorReview' | 'prReview' | 'handoff';
+export type SkillMode = 'native_explicit' | 'source_execution';
+export type SkillStatus = 'pass' | 'changes_required' | 'incomplete' | 'skipped';
+export interface SkillFile { path: string; relativePath: string; sha256: string }
+export interface SkillBinding {
+  capability: SkillCapability; name: string; sourcePath: string; files: SkillFile[];
+  fingerprint: string; pinnedAt: string;
+}
+export interface SkillResult {
+  status: SkillStatus; blocking: boolean; rawOutputPath: string; rawOutputSha256: string;
+  originalOutputPath?: string; evidencePaths: string[]; evidenceSha256: string[]; originalEvidencePaths: string[];
+  hostReceiptPath: string; hostReceiptSha256: string; originalHostReceiptPath: string; completedAt: string;
+}
+export interface SkillInvocation {
+  id: string; jobId: string; capability: SkillCapability; bindingFingerprint: string;
+  mode: SkillMode; nativeEntry?: string; session: NativeSession;
+  candidateVersion: string; head: string; base: string; startedAt: string;
+  sourceArchivePath: string; hostCapabilityPath?: string; hostCapabilitySha256?: string; result?: SkillResult;
+}
+/** v3 持久账本；旧固定审查调度仍由后续迁移票替换。 */
 export interface ProtocolV3 {
   executionPath: 'legacy-v02';
   decisionRecords: L1DecisionRecord[];
-  skillInvocations: Record<string, Json>[];
+  skillBindings?: SkillBinding[];
+  skillInvocations: SkillInvocation[];
+  skillMigrations?: { at: string; evidencePath: string;
+    changes: { capability: SkillCapability; previousFingerprint: string; nextFingerprint: string }[] }[];
   dispatchRecords: Record<string, Json>[];
 }
 export function initialProtocolV3(): ProtocolV3 {
@@ -454,6 +473,32 @@ export function bind(s: State, id: string, ref: { nativeId: string; model?: stri
   j.timing ??= { leasedAt: '' }; j.timing.boundAt ??= new Date().toISOString();
   event(s, `已绑定 ${j.action} 的原生任务`);
 }
+function validateSkillLinks(s: State, j: Job, r: Result) {
+  if (s.protocol !== currentProtocol || !s.v3?.skillBindings) return;
+  const ids = r.data?.skillInvocationIds;
+  ensure(ids === undefined || Array.isArray(ids) && ids.every(x => typeof x === 'string'), '技能调用引用必须是 ID 数组');
+  const linked = (ids || []).map(id => {
+    const invocation = s.v3!.skillInvocations.find(x => x.id === id);
+    ensure(invocation && invocation.jobId === j.id && invocation.session.nativeId === j.nativeId &&
+      invocation.candidateVersion === j.candidateVersion, '技能调用不是当前 actor 或候选');
+    ensure(invocation.result, '技能调用缺少真实完成回执');
+    ensure(s.v3!.skillBindings!.some(b => b.capability === invocation.capability && b.fingerprint === invocation.bindingFingerprint),
+      '技能调用版本与当前绑定不符');
+    return invocation;
+  });
+  if (j.action !== 'implement') return;
+  const professional = linked.filter(x => x.capability === 'implementation' || x.capability === 'diagnosis');
+  if (!r.complete) return;
+  ensure(professional.length === 1, '实现阶段必须引用一次实际 implement 或 diagnosing-bugs 技能调用');
+  ensure(['pass', 'changes_required'].includes(professional[0].result!.status), '实现技能未完成或跳过，不能签发完整结果');
+  if (r.status === 'implemented') {
+    ensure(professional[0].result!.status === 'pass' && !professional[0].result!.blocking,
+      '实现技能未明确通过，不能签发已实现候选');
+    const handoff = linked.find(x => x.capability === 'handoff');
+    ensure(handoff?.result?.status === 'pass' && !handoff.result.blocking && !!r.handoffPath,
+      '实现后的交接须实际调用已绑定 handoff 并归档原文');
+  }
+}
 export function submit(s: State, id: string, r: Result) {
   ensure(s.status !== 'retired', '已退役运行不能接收执行结果');
   const paused = s.status === 'paused';
@@ -461,6 +506,7 @@ export function submit(s: State, id: string, r: Result) {
   if (j.status === 'done') { ensure(JSON.stringify(j.result) === JSON.stringify(r), '重复回执内容不一致'); return; }
   ensure(busy(j) && j.nativeId, '先绑定实际任务，才能提交结果');
   ensure(r.model === j.model && !!r.evidencePath, '回执必须包含实际模型及证据路径');
+  validateSkillLinks(s, j, r);
   if (s.protocol === currentProtocol && j.executor === 'agent') {
     ensure(j.session, '缺少真实原生会话身份，不能采用模型任务结果');
     verifyNativeSession(s, j.session, j.nativeId, j.tier);

@@ -42,6 +42,18 @@
 
 ## 宿主适配与逐项回执
 
+### 已绑定技能的显式调用
+
+新运行在 `init` 时固定 `implementation`、`diagnosis`、`authorReview`、`prReview`、`handoff` 五项默认绑定。状态中的 `v3.skillBindings` 记录每个 `SKILL.md` 的实际路径、原文和包内资源的 SHA-256 指纹；这不是新增用户输入。已绑定阶段获得显式调用授权，`disable-model-invocation` 不会被解释为要求用户再手动触发。原始 implement/handoff 文件只读，交接技能仍按原要求先写 OS 临时目录，再由宿主逐字归档。
+
+宿主先为 actor 登记可核验的原生会话，再调用 `skill-start <state> <jobId> <request.json>`。请求只需 `{capability}`；CLI 通过绝对路径环境变量 `SPEC_DELIVERY_SKILL_OBSERVER` 指向宿主可信查询适配器，以 `capabilities <capability> <jobId>` 取得实际注册入口和源码执行能力。响应为 `{source:"native_host",jobId,capability,capabilities:{nativeExplicit?,sourceExecution?}}`，其中原生注册包含 `{entry,sourcePath,fingerprint}`。匹配绑定路径与指纹的原生注册存在时，返回 `native_explicit` 和入口名；否则只有宿主允许读入原技能及资源时返回 `source_execution` 和持久 `sourceArchivePath`。返回 `alreadyStarted:true` 时先查询原调用，不能重启。真正缺少两种入口时命令指出缺口；工作流不更改宿主全局技能策略。
+
+宿主**实际完成调用**后保存原始产物、专业证据，以及 JSON 宿主回执 `{source:"native_host",invocationId,jobId,nativeId,observationId,mode,bindingFingerprint,terminal:true,nativeEntry?}`；适配器以 `result <invocationId> <jobId>` 返回该回执；CLI 归档宿主响应后调用 `skill-finish <state> <invocationId> <outcome.json>`。源码执行回执另列出逐文件 `{relativePath,sha256}` 的 `loadedFiles`。外围 outcome 为 `{status:"pass"|"changes_required"|"incomplete"|"skipped",blocking,rawOutputPath?,evidencePaths?}`。技能无需原生输出 workflow JSON；状态/阻断判断由执行者提供，适配层只核对身份、原始文件、完整性及版本。空白或缺失产物不能形成 pass；实现 job 的外层 Result 用 `data.skillInvocationIds` 关联 implement/diagnosis 与 handoff 的已完成调用，handoff 归档内容必须与原文相同。
+
+TypeScript 宿主也可使用 `spec-delivery/skills.ts` 的 `invokeBoundSkill`：适配器提供 `capabilities` 与 `invokeNative` / `executeSource` 实际入口；函数先持久登记调用，再执行相应入口、校验宿主回执并收取结果。单次调用不自行派生子 agent；技能内部委派由后续通用子任务协议接管。
+
+维护者可在所有在途 job 对账结束后运行 `migrate-skills <state> <migration.json>`，文件含 `{expectedRevision,evidencePath,replacements:{capability:"/absolute/path/SKILL.md"}}`。它显式重新固定被替换技能及依赖，也能为早期缺少绑定的 v3 运行补齐默认来源；受影响候选的自检/审查/验收证据失效，旧调用与原始产物仍可审计。运行中发现指纹漂移会拒绝调用或采纳结果，不自动迁移。
+
 **ZCode**：先读取本机 `dynamic-workflows` 技能。`zcode <state>` 为已预留的同模型 jobs 生成原生脚本、`CreateWorkflow` 参数和 `binding` 模板。实际调用后，把返回的 `runId` 加入模板并调用 `bind-batch <state> <binding.json>`。身份格式为 `{runId,jobs:[{jobId,actorName}]}`。CLI 以 `{runId}/{actorName}` 查询宿主观测。响应不确定时先查询原生运行，不能重新启动同一批。
 
 每个 actor 返回 `{resultJson,summary}`。生成脚本在该 actor 的 `ask` 完成后立即调用 `world.run` 执行 `stage`；宿主持久化结果、补入任务和模型身份、核对证据，再提交核心。actor 只负责语义结果和真实证据，不必写 `result.json` 或抄写模型 ID。先完成后绑定的结果会暂存，绑定时收取。`world.run` 日志回放不等于重新观察 GitHub。

@@ -55,6 +55,7 @@ export interface ProtocolV3 {
   skillMigrations?: { at: string; evidencePath: string;
     changes: { capability: SkillCapability; previousFingerprint: string; nextFingerprint: string }[] }[];
   dispatchRecords: DispatchRecord[];
+  detachedInstances?: DetachedHostInstance[];
   receiptRecords?: ReceiptRecord[];
   recoveryRecords?: RecoveryRecord[];
 }
@@ -84,13 +85,20 @@ export interface HandoffReference {
   verificationDigest: string; verifiedBy: NativeSession; at: string;
   invocationId?: string; unavailableEvidencePath?: string; unknowns?: string[];
 }
-export interface HostEventRef { kind: 'start' | 'query' | 'collect' | 'cancel' | 'capabilities' | 'error'; evidencePath: string; digest: string; at: string }
+export interface HostEventRef { kind: 'start' | 'query' | 'collect' | 'cancel' | 'capabilities' | 'error'; evidencePath: string; digest: string; at: string; invokedAt?: string }
+export interface HostUsageObservation {
+  id: string; at: string; sourcePath: string; sourceSha256: string; raw: Json;
+  scope: 'session' | 'model_call' | 'unknown'; modelCallId?: string; sourceIndex?: number;
+  supportingEvidencePath?: string;
+}
 export interface HostInstanceRecord {
   key: string; nativeId: string | null; state: 'requested' | 'running' | 'completed' | 'cancelled' | 'unknown';
   session?: NativeSession; firstSeenAt: string; lastSeenAt: string; events: HostEventRef[];
   startedAt?: string; completedAt?: string; cancelledAt?: string; rawUsage?: Json; bindingError?: string;
+  usageObservations?: HostUsageObservation[]; observedProvider?: string;
   continuationSupported?: boolean;
 }
+export interface DetachedHostInstance extends HostInstanceRecord { targetHost: string }
 export type ReceiptSource = 'stage' | 'host_structured' | 'host_file' | 'repair';
 export interface ReceiptRevision {
   id: string; previousId?: string; source: ReceiptSource; rawPath: string; rawSha256: string;
@@ -233,6 +241,9 @@ export interface State {
   tickets: Ticket[]; jobs: Job[]; facts: LiveFacts; auditEpoch: number; specAudit?: Result;
   validationOwner?: string; queueSequence?: number;
   telemetry?: { ghInvocations: number; retries: number; observationMs: number };
+  waitIntervals?: { id: string; kind: 'recovery' | 'external'; scope: string; startedAt: string;
+    endedAt?: string; evidencePath: string; evidenceDigest: string;
+    closedEvidencePath?: string; closedEvidenceDigest?: string; reason: string }[];
   retired?: { at: string; evidencePath: string; reason: string };
   events: { revision: number; message: string; at?: string }[];
 }

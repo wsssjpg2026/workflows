@@ -125,7 +125,7 @@ fresh 首轮 packet 只传原始 spec/issue 链接、候选 head/base/worktree�
 | --- | --- |
 | `summary <state>` | 离线只读摘要：工单与任务计数、运行状态，适合快速查看和归档快照 |
 | `inspect <state>` | 完整账本：全部工单、jobs、事件、facts 等内部细节，用于诊断与对账 |
-| `metrics <state>` | 运行指标：阶段数量、候选失效、队列与观测指标，用于复盘调度表现 |
+| `metrics <state>` | 运行指标及真实宿主实例对账：阶段、派发、用量与时间边界 |
 
 用法：`node spec-delivery.workflow.ts summary <state.json>`。入口为 [spec-delivery.workflow.ts](../spec-delivery.workflow.ts)，输出一个 JSON 对象，主要字段：
 
@@ -175,6 +175,12 @@ fresh 首轮 packet 只传原始 spec/issue 链接、候选 head/base/worktree�
 
 PR 合并并且关联 issue 关闭后清理登记的本地/远程分支和 worktree；保留未提交、未推送或仍被使用的工作。父 spec 由独立 L1 审计。软件缺口走相同收尾循环；必须人工的验收留下可操作交接，既有人工单和父 spec 保持打开。
 
-`metrics <state>` 输出阶段数量、候选失效、队列和观测指标。`record-host <state> <observations.json>` 可追加真实宿主的 `{jobId,nativeId,evidencePath,startedAt?,usage?}`。未取得的模型时间、token、费用为未知；绑定时间不能充当模型开始时间，`ghInvocations` 不是 HTTP 请求数。
+`metrics <state>` 在原有阶段指标外输出 `reconciliation`，逐个列出实际宿主实例，包括完成、取消、纠错前后的旧身份、未绑定的身份，以及关联 job 的失败事件和原始回执修订。计数分别标明 job、派发 attempt、原生实例、已观测模型调用、命令 job 和 GitHub CLI 调用；模型调用总数、主会话用量及命令用量没有宿主观测时为 `null` 或标记未覆盖。`ghInvocations` 是 CLI 调用次数，不是 HTTP 分页请求数。
+
+宿主适配器可在 `start/query/collect/cancel` 回复中附带 `usage`、`usageScope`（`session` 或 `model_call`）、`modelCallId` 和 `provider`。原始回复保存在 `host-events/`，对账结果的每条 `usageObservations` 都有原始路径和 SHA-256。`record-host <state> <observations.json>` 也可追加 `{jobId?,nativeId,targetHost?,dispatchToken?,evidencePath,state?,startedAt?,completedAt?,cancelledAt?,provider?,usage?,usageScope?,modelCallId?}`；输入文件按原字节归档到 `host-usage/`。未绑定的已派发实例须引用相应 token 与原始宿主事件；完全独立的实例须提供 `targetHost`，并让 `evidencePath` 指向包含 `{source:"native_host",nativeId,targetHost}` 的宿主身份记录。重复提交相同观测不会重复记账。
+
+`selectedUsage` 默认只采用每个实例最新的会话累计快照；没有累计快照时才采用不同 `modelCallId` 的逐调用观测。其它原始观测仍可查看。归一化的每个字段附原始字段路径；按 provider 和原始字段分别汇总，缓存读取、缓存写入及 reasoning 是子项，不再与输入、输出或 total 相加。只有原文带明确币种的费用进入 `explicitCostByCurrency`；其它费用、缺失字段、纯模型耗时均保持未知，不补零或推算跨 provider 通用口径。
+
+时间项分别列出排队、启动、执行、完成到收取、恢复以及外部等待；只有两端边界都有可信时间时才得到毫秒数。`record-wait <state> <observation.json>` 可追加显式恢复或外部等待区间：`{expectedRevision,id,kind:"recovery"|"external",scope,startedAt,endedAt?,evidencePath,reason}`；同一 ID 可再提交一次 `endedAt` 关闭区间。并行实例的累计时长不代表墙钟节省。`metrics-compare <before-state> <after-state>` 离线比较同名可观测计数，须由调用者确认两个运行工作量相同。`metrics`、`metrics-compare` 和 `summary` 都只读状态文件，不调用宿主或 GitHub，也不修改租约和原始证据。
 
 本地验证入口为 `npm test`。覆盖状态转换、并行队列、逐项回执、恢复、配额和隔离 Git 工作区；GitHub 故障通过外部接口模拟。批量查询另已用真实测试仓库只读验证。生成脚本的本地 facade 控制流测试不等于 ZCode 原生编译/provider 端到端通过；新版真实运行耗时仍需下一次 ZCode 测量，不能预先宣称从 7 小时 34 分钟降到某个数值。

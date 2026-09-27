@@ -14,6 +14,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import * as engine from './spec-delivery/core.ts';
 import * as gh from './spec-delivery/github.ts';
 import { normalizeResult, resultPaths, metrics } from './spec-delivery/host.ts';
+import { compareMetrics } from './spec-delivery/metrics.ts';
 import * as skills from './spec-delivery/skills.ts';
 import { summarize } from './spec-delivery/summary.ts';
 export * from './spec-delivery/core.ts';
@@ -23,7 +24,7 @@ export const workflowVersion = '0.3.0';
 const rolesPath = path.join(home, 'spec-delivery', 'roles.md');
 const active = (j: engine.Job) => j.status === 'leased' || j.status === 'running';
 const recovering = (s: engine.State, j: engine.Job) => s.tickets.some(t => t.key === j.ticket && t.phase === 'recovery');
-const sha = (x: string) => createHash('sha256').update(x).digest('hex');
+const sha = (x: string | Buffer) => createHash('sha256').update(x).digest('hex');
 function read<T>(file: string): T { return JSON.parse(fs.readFileSync(file, 'utf8')); }
 function write(file: string, value: unknown) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -1121,7 +1122,8 @@ interface HostReply {
   nativeId?: string; authoritative?: boolean; result?: unknown; resultFile?: string;
   /** Human-readable terminal text is never parsed as a receipt. */
   finalText?: string; continuationSupported?: boolean; startedAt?: string; completedAt?: string;
-  cancelledAt?: string; usage?: engine.Json;
+  cancelledAt?: string; usage?: engine.Json; usageScope?: 'session' | 'model_call';
+  modelCallId?: string; provider?: string;
 }
 interface HostCall { ref: engine.HostEventRef; reply?: HostReply; error?: string }
 /** The adapter is a trusted host process. Its raw reply is archived before it can change the ledger. */
@@ -1131,17 +1133,18 @@ function callHost(statePath: string, d: engine.DispatchRecord, kind: engine.Host
   const adapter = process.env.SPEC_DELIVERY_HOST_ADAPTER;
   engine.ensure(adapter && path.isAbsolute(adapter) && fs.statSync(adapter).isFile(),
     '宿主未提供可信派发适配器 SPEC_DELIVERY_HOST_ADAPTER');
+  const invokedAt = new Date().toISOString();
   const run = spawnSync(adapter, [kind, d.requestPath], { cwd: path.dirname(statePath), encoding: 'utf8',
     maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
   const at = new Date().toISOString();
-  const raw = { kind, requestPath: d.requestPath, at, exitCode: run.status, signal: run.signal,
+  const raw = { kind, requestPath: d.requestPath, invokedAt, at, exitCode: run.status, signal: run.signal,
     stdout: run.stdout || '', stderr: run.stderr || '', spawnError: run.error?.message || null };
   const bytes = JSON.stringify(raw, null, 2) + '\n', digest = sha(bytes);
   const evidencePath = path.join(path.dirname(statePath), 'host-events', sha(d.token).slice(0, 20), `${at.replace(/[:.]/g, '-')}-${randomUUID()}.json`);
   fs.mkdirSync(path.dirname(evidencePath), { recursive: true });
   const fd = fs.openSync(evidencePath, 'wx', 0o444);
   try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  const ref = { kind, evidencePath, digest, at };
+  const ref = { kind, evidencePath, digest, at, invokedAt };
   if (run.status !== 0) return { ref, error: `宿主 ${kind} 未确认：${run.error?.message || run.stderr || run.status}` };
   try { return { ref, reply: JSON.parse(run.stdout) as HostReply }; }
   catch { return { ref, error: `宿主 ${kind} 响应不是 JSON` }; }
@@ -1157,6 +1160,22 @@ function journalBoundSession(s: engine.State, j: engine.Job) {
     digest:sha(fs.readFileSync(j.session.evidencePath)),at:j.session.observedAt};
   if(!instance.events.some(x=>x.evidencePath===observationRef.evidencePath))instance.events.push(observationRef);
   d.nativeId = j.nativeId; d.status = j.status === 'done' ? 'completed' : 'running'; d.updatedAt = at;
+}
+function appendHostUsage(instance:engine.HostInstanceRecord,raw:engine.Json,ref:{
+  sourcePath:string;sourceSha256:string;at:string;scope?:'session'|'model_call';modelCallId?:string;
+  sourceIndex?:number;supportingEvidencePath?:string
+}) {
+  const scope:engine.HostUsageObservation['scope']=ref.scope===undefined?'session':
+    ref.scope==='model_call' && !(typeof ref.modelCallId==='string'&&!!ref.modelCallId.trim())?'unknown':
+    ref.scope==='session'||ref.scope==='model_call'?ref.scope:'unknown';
+  const id=sha(JSON.stringify([instance.key,ref.sourcePath,ref.sourceSha256,scope,
+    ref.modelCallId||'',ref.sourceIndex??null,sha(JSON.stringify(raw))]));
+  instance.usageObservations??=[];
+  if(!instance.usageObservations.some(x=>x.id===id))instance.usageObservations.push({
+    id,at:ref.at,sourcePath:ref.sourcePath,sourceSha256:ref.sourceSha256,
+    raw,scope,modelCallId:ref.modelCallId,sourceIndex:ref.sourceIndex,
+    supportingEvidencePath:ref.supportingEvidencePath});
+  instance.rawUsage=raw;
 }
 /** A bad or unbound host reply is still an instance/event in the journal. */
 function applyHostCall(statePath: string, jobId: string, call: HostCall): {
@@ -1175,7 +1194,10 @@ function applyHostCall(statePath: string, jobId: string, call: HostCall): {
     if (!instance) { instance = { key, nativeId: reply?.nativeId || null, state: 'unknown',
       firstSeenAt: call.ref.at, lastSeenAt: call.ref.at, events: [] }; d.instances.push(instance); }
     instance.events.push(call.ref); instance.lastSeenAt = call.ref.at;
-    if (reply?.usage !== undefined) instance.rawUsage = reply.usage;
+    if (reply?.usage !== undefined) appendHostUsage(instance,reply.usage,{
+      sourcePath:call.ref.evidencePath,sourceSha256:call.ref.digest,at:call.ref.at,
+      scope:reply.usageScope,modelCallId:reply.modelCallId});
+    if (reply?.provider) instance.observedProvider=reply.provider;
     if (typeof reply?.continuationSupported === 'boolean') instance.continuationSupported = reply.continuationSupported;
     for(const field of ['startedAt','completedAt','cancelledAt'] as const) if(reply?.[field]) {
       if(Number.isFinite(Date.parse(reply[field]!))) instance[field] ||= reply[field];
@@ -1198,9 +1220,10 @@ function applyHostCall(statePath: string, jobId: string, call: HostCall): {
       try {
         const session = j.session && j.nativeId === reply.nativeId ? j.session : nativeSession(statePath, reply.nativeId!, j.id);
         verifySessionArtifact(session);
+        instance.session = session;
         if (j.status === 'leased' || j.status === 'running') engine.bind(s, j.id, { nativeId: reply.nativeId!, session });
         else engine.ensure(j.nativeId === reply.nativeId, '已完成任务的宿主身份不能改变');
-        instance.session = session; d.nativeId = reply.nativeId;
+        d.nativeId = reply.nativeId;
         if (reply.startedAt && Number.isFinite(Date.parse(reply.startedAt))) {
           j.timing ??= { leasedAt: '' }; j.timing.startedAt ??= reply.startedAt;
         }
@@ -1875,7 +1898,7 @@ export async function main(argv: string[]): Promise<unknown> {
   const [op, file, extra, fourth] = argv;
   if(op==='version')return {workflow:'spec-delivery',version:workflowVersion};
   if (!op || op === 'help') return { workflow: 'spec-delivery', input: ['spec', 'targetBranch', 'models.L1', 'models.L2', 'models.L3'],
-    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan-context <state>', 'decision-context <state>', 'plan <state> <plan.json>', 'observe-main <state> <native-id>', 'drive <state>', 'next <state>', 'dispatch <state> <jobId>', 'dispatch-cancel <state> <decision.json>', 'recover-result <state> <decision.json>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'context-handoff <state> <jobId> <verification.json>', 'context-reconstruct <state> <jobId> <reconstruction.json>', 'skill-start <state> <jobId> <host-capabilities.json>', 'skill-delegate <state> <invocationId> <children.json>', 'skill-continue <state> <invocationId>', 'skill-retry <state> <invocationId> <keys.json>', 'skill-resume <state> <invocationId> <resume.json>', 'skill-finish <state> <invocationId> <outcome.json>', 'migrate-skills <state> <migration.json>', 'stage <state> <jobId> <result-json>', 'stage-raw <state> <jobId> <raw-file>', 'collect <state> [jobId]', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'test <state> <jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'recover-workspace <state> <ticket> <decision.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'metrics <state>', 'resume <state>', 'zcode <state>'] };
+    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan-context <state>', 'decision-context <state>', 'plan <state> <plan.json>', 'observe-main <state> <native-id>', 'drive <state>', 'next <state>', 'dispatch <state> <jobId>', 'dispatch-cancel <state> <decision.json>', 'recover-result <state> <decision.json>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'context-handoff <state> <jobId> <verification.json>', 'context-reconstruct <state> <jobId> <reconstruction.json>', 'skill-start <state> <jobId> <host-capabilities.json>', 'skill-delegate <state> <invocationId> <children.json>', 'skill-continue <state> <invocationId>', 'skill-retry <state> <invocationId> <keys.json>', 'skill-resume <state> <invocationId> <resume.json>', 'skill-finish <state> <invocationId> <outcome.json>', 'migrate-skills <state> <migration.json>', 'stage <state> <jobId> <result-json>', 'stage-raw <state> <jobId> <raw-file>', 'collect <state> [jobId]', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'test <state> <jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'recover-workspace <state> <ticket> <decision.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'record-wait <state> <observation.json>', 'metrics <state>', 'metrics-compare <before-state> <after-state>', 'resume <state>', 'zcode <state>'] };
   engine.ensure(file, '缺少输入文件/状态路径');
   // summary 在 lock() 之前返回：只验证可读协议，不创建/等待/恢复/删除状态锁，也不进入写路径。
   if (op === 'summary') return summarizeLedger(path.resolve(file));
@@ -1884,6 +1907,12 @@ export async function main(argv: string[]): Promise<unknown> {
   if (op === 'inspect' || op === 'metrics') {
     const state = read<engine.State>(path.resolve(file)); supportedLedger(state);
     return op === 'inspect' ? { ...state, rolesPath } : metrics(state);
+  }
+  if (op === 'metrics-compare') {
+    engine.ensure(extra,'需要前后两个状态文件');
+    const before=read<engine.State>(path.resolve(file)),after=read<engine.State>(path.resolve(extra));
+    supportedLedger(before);supportedLedger(after);
+    return compareMetrics(before,after);
   }
   if (op === 'plan-context') {
     const s = read<engine.State>(path.resolve(file)); requireProtocol(s);
@@ -2226,31 +2255,110 @@ export async function main(argv: string[]): Promise<unknown> {
       s.retired={...r,at:new Date().toISOString()};s.status='retired';engine.event(s,'运行已退役，保留原始证据和未交付资源');
     } else if (op === 'record-host') {
       engine.ensure(extra,'需要真实宿主观测文件');
-      const records=read<{jobId:string;nativeId:string;evidencePath:string;startedAt?:string;usage?:engine.Job['usage'];dispatchToken?:string;state?:engine.HostInstanceRecord['state']}[]>(extra);
-      for(const r of records) {
-        const j=s.jobs.find(j=>j.id===r.jobId); engine.ensure(j && !!r.nativeId, '宿主任务不存在'); safeFile(r.evidencePath);
-        const d=s.v3?.dispatchRecords.find(x=>x.jobId===r.jobId);
-        engine.ensure(j.nativeId===r.nativeId || (!!d && r.dispatchToken===d.token &&
-          d.instances.some(i=>i.nativeId===r.nativeId && i.events.some(e=>e.evidencePath===r.evidencePath))),
-          '未绑定实例须引用已归档的宿主事件；身份或派发 token 不符');
-        if(r.startedAt)engine.ensure(Number.isFinite(Date.parse(r.startedAt)),'开始时间无效');
-        if(r.usage)for(const [k,v] of Object.entries(r.usage))if(k!=='currency')engine.ensure(typeof v==='number' && Number.isFinite(v) && v>=0,'用量必须来自非负真实观测');
+      const sourceBytes=fs.readFileSync(safeFile(extra)),sourceSha256=sha(sourceBytes);
+      const records=JSON.parse(sourceBytes.toString('utf8')) as {jobId?:string;nativeId:string;targetHost?:string;
+        evidencePath:string;startedAt?:string;completedAt?:string;cancelledAt?:string;
+        usage?:engine.Json;usageScope?:'session'|'model_call';modelCallId?:string;
+        provider?:string;model?:string;dispatchToken?:string;state?:engine.HostInstanceRecord['state']}[];
+      engine.ensure(Array.isArray(records),'宿主观测须为数组');
+      const archived=path.join(path.dirname(statePath),'host-usage',`${sourceSha256}.json`);
+      fs.mkdirSync(path.dirname(archived),{recursive:true});
+      if(!fs.existsSync(archived)) {
+        const fd=fs.openSync(archived,'wx',0o444);
+        try {fs.writeFileSync(fd,sourceBytes);fs.fsyncSync(fd);} finally {fs.closeSync(fd);}
+      } else engine.ensure(sha(fs.readFileSync(archived))===sourceSha256,'宿主原始用量归档已改变');
+      for(const [sourceIndex,r] of records.entries()) {
+        engine.ensure(typeof r.nativeId==='string' && !!r.nativeId,'宿主观测缺少原生实例 ID');
+        engine.ensure(r.targetHost===undefined||typeof r.targetHost==='string'&&!!r.targetHost,
+          '宿主目标无效');
+        engine.ensure(r.provider===undefined||typeof r.provider==='string','宿主 provider 无效');
+        engine.ensure(!r.state||['requested','running','completed','cancelled','unknown'].includes(r.state),
+          '宿主实例状态无效');
+        safeFile(r.evidencePath);
+        const j=r.jobId?s.jobs.find(j=>j.id===r.jobId):undefined;
+        engine.ensure(!r.jobId||j,'宿主任务不存在');
+        const dispatches=j?s.v3?.dispatchRecords.filter(x=>x.jobId===j.id)||[]:[];
+        const d=r.dispatchToken?dispatches.find(x=>x.token===r.dispatchToken):dispatches.at(-1);
+        engine.ensure(!r.dispatchToken||d,'宿主观测的派发 token 不存在');
+        let instance:engine.HostInstanceRecord;
+        if(j) {
+          engine.ensure(j.nativeId===r.nativeId || (!!d && r.dispatchToken===d.token &&
+            d.instances.some(i=>i.nativeId===r.nativeId && i.events.some(e=>e.evidencePath===r.evidencePath))),
+            '未绑定实例须引用已归档的宿主事件；身份或派发 token 不符');
+          engine.ensure(!r.targetHost || !d || r.targetHost===d.targetHost,'宿主目标与派发不符');
+        } else if(!j) {
+          engine.ensure(s.v3 && r.targetHost,'无 job 的实际实例须声明目标宿主');
+          const proof=read<{source:string;nativeId:string;targetHost:string}>(r.evidencePath);
+          engine.ensure(proof.source==='native_host' && proof.nativeId===r.nativeId &&
+            proof.targetHost===r.targetHost,'独立实例缺少宿主原始身份记录');
+        }
+        for(const stamp of [r.startedAt,r.completedAt,r.cancelledAt])
+          if(stamp)engine.ensure(Number.isFinite(Date.parse(stamp)),'宿主时间无效');
         if(d) {
-          const at=new Date().toISOString(); let instance=d.instances.find(x=>x.nativeId===r.nativeId);
-          if(!instance){instance={key:`native:${r.nativeId}`,nativeId:r.nativeId,state:r.state||'unknown',firstSeenAt:at,lastSeenAt:at,events:[]};d.instances.push(instance);}
+          const at=new Date().toISOString(); let found=d.instances.find(x=>x.nativeId===r.nativeId);
+          if(!found){found={key:`native:${r.nativeId}`,nativeId:r.nativeId,state:r.state||'unknown',firstSeenAt:at,lastSeenAt:at,events:[]};d.instances.push(found);}
+          instance=found;
           instance.lastSeenAt=at; if(r.state)instance.state=r.state;
           const digest=sha(fs.readFileSync(r.evidencePath));const ref:engine.HostEventRef={kind:'query',evidencePath:r.evidencePath,digest,at};
           if(!instance.events.some(x=>x.evidencePath===ref.evidencePath&&x.digest===ref.digest))instance.events.push(ref);
           if(!d.events.some(x=>x.evidencePath===ref.evidencePath&&x.digest===ref.digest))d.events.push(ref);
-          if(r.startedAt)instance.startedAt ||= r.startedAt;
-          if(r.usage)instance.rawUsage=r.usage as engine.Json;
+        } else if(s.v3) {
+          s.v3.detachedInstances??=[];
+          const targetHost=r.targetHost||s.capabilities?.framework||'unknown';
+          let found=s.v3.detachedInstances.find(x=>x.targetHost===targetHost&&x.nativeId===r.nativeId);
+          if(!found){const at=new Date().toISOString();found={key:`native:${r.nativeId}`,nativeId:r.nativeId,
+            targetHost,state:r.state||'unknown',firstSeenAt:at,lastSeenAt:at,events:[]};
+            s.v3.detachedInstances.push(found);}
+          instance=found;
+          const at=new Date().toISOString(),digest=sha(fs.readFileSync(r.evidencePath));
+          instance.lastSeenAt=at;if(r.state)instance.state=r.state;
+          if(!instance.events.some(e=>e.evidencePath===r.evidencePath&&e.digest===digest))
+            instance.events.push({kind:'query',evidencePath:r.evidencePath,digest,at});
+        } else {
+          // Protocol 2 had no instance journal; retain its bound-job observation behavior.
+          engine.ensure(j && j.nativeId===r.nativeId,'旧协议只能登记已绑定任务');
+          const at=new Date().toISOString();
+          instance={key:`legacy:${r.nativeId}`,nativeId:r.nativeId,state:r.state||'unknown',
+            firstSeenAt:at,lastSeenAt:at,events:[]};
         }
-        if(j.nativeId===r.nativeId){
+        if(r.startedAt)instance.startedAt ||= r.startedAt;
+        if(r.completedAt)instance.completedAt ||= r.completedAt;
+        if(r.cancelledAt)instance.cancelledAt ||= r.cancelledAt;
+        if(r.provider)instance.observedProvider=r.provider;
+        if(j?.session&&j.nativeId===r.nativeId)instance.session ||= j.session;
+        if(r.usage!==undefined)appendHostUsage(instance,r.usage,{sourcePath:archived,
+          sourceSha256,at:new Date().toISOString(),scope:r.usageScope,modelCallId:r.modelCallId,
+          sourceIndex,supportingEvidencePath:r.evidencePath});
+        if(j && j.nativeId===r.nativeId){
           if(r.startedAt){j.timing??={leasedAt:''};j.timing.startedAt=r.startedAt;}
-          if(r.usage)j.usage=r.usage;
+          if(r.usage && typeof r.usage==='object' && !Array.isArray(r.usage) &&
+            Object.keys(r.usage).every(k=>['inputTokens','outputTokens','cost','currency','modelMs'].includes(k)))
+            j.usage=r.usage as engine.Job['usage'];
         }
       }
-      engine.event(s,'记录宿主真实时间与用量；未提供的字段保持未知');
+      engine.event(s,'记录宿主原始时间与用量；未绑定或独立实例仍保留，未知字段保持未知');
+    } else if (op === 'record-wait') {
+      engine.ensure(extra,'需要带版本与证据的等待区间观测');
+      const r=read<{expectedRevision:number;id:string;kind:'recovery'|'external';scope:string;
+        startedAt:string;endedAt?:string;evidencePath:string;reason:string}>(extra);
+      engine.ensure(r.expectedRevision===s.revision,'等待区间观测版本已过期');
+      engine.ensure(r.id&&r.scope&&r.reason&&['recovery','external'].includes(r.kind),
+        '等待区间需要 ID、范围、原因和类型');
+      engine.ensure(Number.isFinite(Date.parse(r.startedAt))&&
+        (!r.endedAt||Number.isFinite(Date.parse(r.endedAt))&&Date.parse(r.endedAt)>=Date.parse(r.startedAt)),
+        '等待区间时间无效');
+      const evidenceDigest=sha(fs.readFileSync(safeFile(r.evidencePath)));
+      s.waitIntervals??=[];
+      const existing=s.waitIntervals.find(x=>x.id===r.id);
+      if(existing) {
+        engine.ensure(!existing.endedAt&&r.endedAt&&existing.kind===r.kind&&
+          existing.scope===r.scope&&existing.startedAt===r.startedAt,
+          '等待区间只能用同一 ID 与边界补记一次结束');
+        existing.endedAt=r.endedAt;existing.closedEvidencePath=r.evidencePath;
+        existing.closedEvidenceDigest=evidenceDigest;
+      } else s.waitIntervals.push({id:r.id,kind:r.kind,scope:r.scope,startedAt:r.startedAt,
+        endedAt:r.endedAt,evidencePath:r.evidencePath,evidenceDigest,reason:r.reason});
+      engine.event(s,`记录 ${r.kind} 等待区间 ${r.id}`);
     } else if (op === 'submit') {
       engine.ensure(extra && fourth, '需要 jobId 与结果 JSON');
       const j = s.jobs.find(j => j.id === extra); engine.ensure(j, '未知 job'); const r = read<engine.Result>(fourth);

@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { ensure, type Job, type Result, type State } from './core.ts';
+import { reconcileMetrics } from './metrics.ts';
 
 /** 模型只返回任务内容；实际模型只从已绑定的原生会话观测取得。 */
 export function normalizeResult(s: State, j: Job, value: unknown): Result {
@@ -56,5 +57,6 @@ export function metrics(s: State) {
       instances:d.instances.map(i => ({nativeId:i.nativeId,state:i.state,firstSeenAt:i.firstSeenAt,lastSeenAt:i.lastSeenAt,
         startedAt:i.startedAt || null,completedAt:i.completedAt || null,cancelledAt:i.cancelledAt || null,
         events:i.events.length,session:i.session || null,rawUsage:i.rawUsage ?? null,bindingError:i.bindingError || null}))})),
+    reconciliation:reconcileMetrics(s),
     note: 'null 表示未获取；命令任务不计作模型任务。绑定时间不是模型开始时间。ghInvocations 是 CLI 调用次数，不是 HTTP 分页请求数。' };
 }

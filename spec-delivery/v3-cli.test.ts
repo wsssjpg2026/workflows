@@ -103,8 +103,11 @@ const reply=(data)=>console.log(JSON.stringify({token:request.token,jobId:reques
 const actor=db.actors[request.token];
 if(op==='query') {
   if(db.mode==='unknown')reply({state:'unknown'});
-  else if(db.mode==='wrong-association'&&actor)reply({state:actor.state,nativeId:actor.nativeId,jobId:'different-job'});
-  else if(actor)reply({state:actor.state,nativeId:actor.nativeId,startedAt:actor.startedAt});
+  else if(db.mode==='wrong-association'&&actor)reply({state:actor.state,nativeId:actor.nativeId,jobId:'different-job',
+    usage:actor.usage,provider:actor.provider});
+  else if(actor)reply({state:actor.state,nativeId:actor.nativeId,startedAt:actor.startedAt,
+    completedAt:actor.completedAt,usage:actor.usage,usageScope:actor.usageScope,
+    modelCallId:actor.modelCallId,provider:actor.provider});
   else reply({state:'not_found',authoritative:true});
 } else if(op==='start') {
   db.attempts++;
@@ -114,7 +117,7 @@ if(op==='query') {
     db.actors[request.token]={state:'running',nativeId,startedAt:'2026-09-27T00:00:00.000Z'};db.starts++;
     const all=JSON.parse(fs.readFileSync(sessions,'utf8'));
     all[nativeId]={source:'native_host',observationId:'host-observed-'+request.token,jobId:request.jobId,
-      nativeId,provider:'fixture',model:request.requestedModel,
+      nativeId,provider:db.provider||'fixture',model:request.requestedModel,
       context:{contextId:nativeId,mode:'new',proofId:'context-'+request.token},observedAt:'2026-09-27T00:00:00.000Z'};
     fs.writeFileSync(sessions,JSON.stringify(all));
   }
@@ -124,10 +127,13 @@ if(op==='query') {
 } else if(op==='collect') {
   if(!actor||actor.state!=='completed')process.exit(84);
   reply({state:'completed',nativeId:actor.nativeId,result:actor.result,resultFile:actor.resultFile,
-    finalText:actor.finalText,continuationSupported:actor.continuationSupported});
+    finalText:actor.finalText,continuationSupported:actor.continuationSupported,
+    completedAt:actor.completedAt,usage:actor.usage,usageScope:actor.usageScope,
+    modelCallId:actor.modelCallId,provider:actor.provider});
 } else if(op==='cancel') {
   if(!actor)process.exit(86);
-  actor.state='cancelled';save();reply({state:'cancelled',nativeId:actor.nativeId,cancelledAt:'2026-09-27T00:00:02.000Z'});
+  actor.state='cancelled';save();reply({state:'cancelled',nativeId:actor.nativeId,cancelledAt:'2026-09-27T00:00:02.000Z',
+    usage:actor.usage,usageScope:actor.usageScope,modelCallId:actor.modelCallId,provider:actor.provider});
 } else process.exit(85);
 `);
   fs.chmodSync(adapter, 0o755); x.env.SPEC_DELIVERY_HOST_ADAPTER = adapter;
@@ -1025,6 +1031,10 @@ test('可靠续接的原 actor 修订须匹配后续宿主事件和原始字节'
     assert.equal(revised.sourceNativeId,'host-actor-'+token);
     assert.equal(final.jobs.find((j:{id:string})=>j.id===planning.id).status,'done');
     assert.equal(host.get().starts,1);
+    const instance=JSON.parse(x.call('metrics',statePath).stdout).reconciliation.instances
+      .find((i:{nativeId:string})=>i.nativeId==='host-actor-'+token);
+    assert.deepEqual(instance.receiptRevisions.map((r:{status:string})=>r.status),['rejected','accepted']);
+    assert.ok(instance.jobFailureEvents.some((f:{category:string})=>f.category==='receipt_validation'));
   } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
 });
 
@@ -1413,5 +1423,158 @@ else if(op==='result'){
     assert.equal(after.v3?.decisionRecords.at(-1)?.session.nativeId,'l1-review-adjudication');
     assert.equal(core.mergeGate(after,after.tickets[0]),false,'裁决没有代替 L2 验收和 CI');
     assert.equal(after.tickets[0].evidence.accept,undefined);
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('离线 metrics 保留两种 provider 原文和未知费用，重复观测不重计并可同口径比较', () => {
+  const x=fixture();
+  try {
+    const {statePath,planning}=planned(x),host=controlledHost(x);
+    host.set(db=>{db.provider='openai';});
+    assert.equal(JSON.parse(x.call('dispatch',statePath,planning.id).stdout).status,'running');
+    const token=JSON.parse(fs.readFileSync(statePath,'utf8')).v3.dispatchRecords[0].token;
+    const checks=path.join(x.temp,'metrics-checks.md');fs.writeFileSync(checks,'checked\n');
+    const openaiUsage={input_tokens:100,output_tokens:40,total_tokens:140,
+      input_tokens_details:{cached_tokens:25},output_tokens_details:{reasoning_tokens:15}};
+    host.set(db=>{db.actors[token].state='completed';db.actors[token].completedAt='2026-09-27T00:00:02.000Z';
+      db.actors[token].usage=openaiUsage;db.actors[token].provider='openai';
+      db.actors[token].result={complete:true,status:'planned',evidencePath:x.planEvidence,
+        data:{planPath:x.planPath,checksPath:checks}};});
+    assert.equal(x.call('collect',statePath,planning.id).status,0);
+    const orphanProof=path.join(x.temp,'orphan-host.json');
+    fs.writeFileSync(orphanProof,JSON.stringify({source:'native_host',nativeId:'orphan-anon',targetHost:'test'}));
+    const anthropicUsage={input_tokens:30,output_tokens:10,cache_read_input_tokens:20,
+      cache_creation_input_tokens:5,cost_usd:0.02};
+    const record=path.join(x.temp,'orphan-usage.json');
+    fs.writeFileSync(record,JSON.stringify([
+      {nativeId:'orphan-anon',targetHost:'test',evidencePath:orphanProof,provider:'anthropic',
+        state:'cancelled',usage:anthropicUsage},
+      {nativeId:'orphan-anon',targetHost:'test',evidencePath:orphanProof,provider:'anthropic',
+        state:'cancelled',usage:anthropicUsage,usageScope:'model_call',modelCallId:'call-A'},
+    ]));
+    assert.equal(x.call('record-host',statePath,record).status,0);
+    assert.equal(x.call('record-host',statePath,record).status,0);
+    const stateBytes=fs.readFileSync(statePath),ghBytes=fs.readFileSync(x.ghLog);
+    x.env.SPEC_DELIVERY_HOST_ADAPTER='/nonexistent/adapter';
+    const measured=x.call('metrics',statePath);assert.equal(measured.status,0,measured.stderr);
+    assert.deepEqual(fs.readFileSync(statePath),stateBytes);
+    assert.deepEqual(fs.readFileSync(x.ghLog),ghBytes);
+    const m=JSON.parse(measured.stdout).reconciliation;
+    assert.equal(m.scope.observedNativeInstanceCount,2);
+    assert.equal(m.scope.verifiedNativeSessionCount,1);
+    assert.equal(m.scope.observedModelCallCount,1);
+    assert.equal(m.scope.totalModelCallCount,null);
+    assert.equal(m.scope.coversMainSessionUsage,false);
+    assert.equal(m.scope.commandJobCount,0);
+    const original=m.instances.find((i:{nativeId:string})=>i.nativeId==='host-actor-'+token);
+    const orphan=m.instances.find((i:{nativeId:string})=>i.nativeId==='orphan-anon');
+    assert.equal(original.provider,'openai');
+    assert.equal(original.selectedUsage[0].normalized.inputTokens.value,100);
+    assert.equal(original.selectedUsage[0].normalized.cachedReadTokens.value,25);
+    assert.equal(original.selectedUsage[0].normalized.reasoningTokens.value,15);
+    assert.equal(original.selectedUsage[0].normalized.totalTokens.value,140);
+    assert.equal(original.selectedUsage[0].normalized.explicitCost.value,null);
+    assert.equal(original.timing.executionMs,2000);
+    assert.equal(orphan.usageObservations.length,2);
+    assert.equal(orphan.usageBasis,'latest_session_snapshot');
+    assert.deepEqual(orphan.unexplainedReasons.includes('no_final_job_binding'),true);
+    assert.equal(orphan.selectedUsage[0].normalized.cachedReadTokens.value,20);
+    assert.equal(orphan.selectedUsage[0].normalized.totalTokens.value,null);
+    assert.equal(orphan.selectedUsage[0].normalized.modelMs.value,null);
+    assert.equal(m.explicitCostByCurrency.find((c:{provider:string})=>c.provider==='anthropic').amount,0.02);
+    assert.equal(m.rawFieldTotals.find((f:{provider:string;path:string})=>
+      f.provider==='openai'&&f.path==='input_tokens').sum,100);
+    assert.equal(m.rawFieldTotals.find((f:{provider:string;path:string})=>
+      f.provider==='anthropic'&&f.path==='input_tokens').sum,30);
+    assert.ok(!m.rawFieldTotals.some((f:{path:string})=>f.path==='cost_usd'));
+    assert.ok(m.instancesMissingExplicitCost.includes(original.key));
+    const file=orphan.usageObservations[0].sourcePath;
+    assert.deepEqual(fs.readFileSync(file),fs.readFileSync(record));
+    const before=path.join(x.temp,'before-metrics.json');fs.writeFileSync(before,stateBytes);
+    const after=JSON.parse(stateBytes.toString());after.v3.detachedInstances=[];
+    const afterPath=path.join(x.temp,'after-metrics.json');fs.writeFileSync(afterPath,JSON.stringify(after));
+    const comparison=x.call('metrics-compare',before,afterPath);
+    assert.equal(comparison.status,0,comparison.stderr);
+    const compared=JSON.parse(comparison.stdout);
+    assert.equal(compared.delta.observedNativeInstanceCount,-1);
+    assert.equal(compared.sameRun,true);
+    assert.equal(compared.sameTicketSet,true);
+    assert.equal(compared.beforeMeasures.explicitCostByCurrency[0].amount,0.02);
+    assert.deepEqual(compared.afterMeasures.explicitCostByCurrency,[]);
+    assert.deepEqual(fs.readFileSync(statePath),stateBytes);
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('纠错前后的两个原生实例与取消用量都出现在同一离线对账中', () => {
+  const x=fixture();
+  try {
+    const {statePath,planning}=planned(x),host=controlledHost(x);
+    assert.equal(JSON.parse(x.call('dispatch',statePath,planning.id).stdout).status,'running');
+    const first=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const dispatch=first.v3.dispatchRecords[0],oldNative='host-actor-'+dispatch.token;
+    x.observe('corrected-actor',planning.id,'large');
+    host.set(db=>{db.actors[dispatch.token].nativeId='corrected-actor';});
+    assert.equal(JSON.parse(x.call('collect',statePath,planning.id).stdout).polled[0].status,'uncertain');
+    const decision=recoveryDecision(statePath,planning.id,'correct-binding',x.planEvidence,
+      {expectedNativeId:oldNative,nativeId:'corrected-actor',processTreeStopped:true});
+    assert.equal(x.call('recover-result',statePath,recoveryFile(x,decision)).status,0);
+    const oldEvent=dispatch.instances.find((i:{nativeId:string})=>i.nativeId===oldNative).events.at(-1).evidencePath;
+    const usageFile=path.join(x.temp,'cancelled-usage.json');
+    fs.writeFileSync(usageFile,JSON.stringify([{jobId:planning.id,nativeId:oldNative,
+      dispatchToken:dispatch.token,evidencePath:oldEvent,state:'cancelled',
+      usage:{prompt_tokens:75,completion_tokens:20,total_tokens:95,prompt_cache_hit_tokens:30}}]));
+    assert.equal(x.call('record-host',statePath,usageFile).status,0);
+    const metrics=x.call('metrics',statePath);assert.equal(metrics.status,0,metrics.stderr);
+    const m=JSON.parse(metrics.stdout).reconciliation;
+    assert.equal(m.scope.observedNativeInstanceCount,2);
+    const old=m.instances.find((i:{nativeId:string})=>i.nativeId===oldNative);
+    const current=m.instances.find((i:{nativeId:string})=>i.nativeId==='corrected-actor');
+    assert.equal(old.status,'cancelled');assert.deepEqual(old.boundJobIds,[]);
+    assert.ok(old.unexplainedReasons.includes('no_final_job_binding'));
+    assert.equal(old.selectedUsage[0].normalized.cachedReadTokens.value,30);
+    assert.deepEqual(current.boundJobIds,[planning.id]);
+    assert.equal(m.scope.dispatchAttemptCount,1);
+    assert.equal(m.scope.observedModelCallCount,0);
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('技能子任务的实际 usage、外部等待和未知时间边界分开统计', () => {
+  const x=fixture();
+  try {
+    const h=skillChildHarness(x),request=h.file('metrics-child.json',{children:[
+      {key:'analysis',tier:'L3',instruction:'Independent analysis'}]});
+    h.call('skill-delegate',h.statePath,h.parent.invocationId,request);
+    const child=h.call('next',h.statePath).jobs.find((j:{action:string})=>j.action==='skill-child');
+    assert.ok(child);
+    h.call('dispatch',h.statePath,child.id);
+    const d=JSON.parse(fs.readFileSync(h.statePath,'utf8')).v3.dispatchRecords.find((r:{jobId:string})=>r.jobId===child.id);
+    h.host.set(db=>{db.actors[d.token].usage={prompt_tokens:22,completion_tokens:8,
+      completion_tokens_details:{reasoning_tokens:3}};db.actors[d.token].provider='child-provider';});
+    h.complete(child.id);
+    const proof=path.join(x.temp,'external-wait.md');fs.writeFileSync(proof,'Waiting on external CI\n');
+    const current=JSON.parse(fs.readFileSync(h.statePath,'utf8'));
+    const start=h.file('wait-start.json',{expectedRevision:current.revision,id:'ci-wait-1',kind:'external',
+      scope:'101',startedAt:'2026-09-27T01:00:00.000Z',evidencePath:proof,reason:'CI pending'});
+    h.call('record-wait',h.statePath,start);
+    const open=h.call('metrics',h.statePath).reconciliation.durationSummary;
+    assert.equal(open.externalWaitMs.sumKnownMs,null);
+    const afterStart=JSON.parse(fs.readFileSync(h.statePath,'utf8'));
+    h.call('record-wait',h.statePath,h.file('wait-close.json',{expectedRevision:afterStart.revision,
+      id:'ci-wait-1',kind:'external',scope:'101',startedAt:'2026-09-27T01:00:00.000Z',
+      endedAt:'2026-09-27T01:01:00.000Z',evidencePath:proof,reason:'CI passed'}));
+    const afterClose=JSON.parse(fs.readFileSync(h.statePath,'utf8'));
+    h.call('record-wait',h.statePath,h.file('recovery-wait.json',{expectedRevision:afterClose.revision,
+      id:'repair-1',kind:'recovery',scope:child.id,startedAt:'2026-09-27T01:02:00.000Z',
+      endedAt:'2026-09-27T01:03:30.000Z',evidencePath:proof,reason:'receipt repair'}));
+    const report=h.call('metrics',h.statePath).reconciliation;
+    assert.equal(report.scope.skillChildRequestCount,1);
+    assert.equal(report.durationSummary.externalWaitMs.sumKnownMs,60000);
+    assert.equal(report.durationSummary.recoveryWaitMs.sumKnownMs,90000);
+    assert.equal(report.durationSummary.runWallMs,null);
+    const native=JSON.parse(fs.readFileSync(h.statePath,'utf8')).jobs.find((j:{id:string})=>j.id===child.id).nativeId;
+    const instance=report.instances.find((i:{nativeId:string})=>i.nativeId===native);
+    assert.equal(instance.selectedUsage[0].normalized.inputTokens.value,22);
+    assert.equal(instance.selectedUsage[0].normalized.reasoningTokens.value,3);
+    assert.equal(instance.timing.launchMs,null,'宿主没有真实启动边界时不能用绑定时间代替');
   } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
 });

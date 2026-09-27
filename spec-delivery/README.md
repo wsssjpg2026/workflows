@@ -52,9 +52,19 @@
 
 `collect <state>` 批量收取已完成、已绑定的暂存结果，并共享一次易变事实观测。检查返回的 `rejected[]`；被拒绝的原始结果会保留，不能覆盖成成功。主控核对错误、候选和原生终态后决定恢复或重派。`stage` 的存在须来自宿主完成事件，不能靠扫描 actor 自行写出的文件判定任务完成。
 
+写任务以 `implemented` 或 `replan` 结束时，必须交回真实已提交的 `head/base` 和 `handoffPath`；`replan` 还需 `data.reason`。核心登记新候选、撤销旧审查和验收证据，然后让 L1 在同一 SHA 上重规划。未推送的新提交保留在任务分支和 `refs/spec-delivery/recovery/…` 中；远端旧 PR head 不会覆盖它。只读规划回执若仍引用旧 SHA 会被拒绝。
+
+## Git 工作区恢复
+
+未提交 WIP、未解决冲突、无回执的新提交或候选来源不明会让对应工单进入 `recovery` 阶段。`inspect` 和 `next.recoveries` 提供原因、观测 SHA、recovery ref 与快照路径。快照保存 Git 状态、索引冲突阶段、二进制补丁以及未跟踪文件和冲突文件的原始副本；原 worktree 不会被 reset、stash 或删除。正在运行的 actor 或测试仍占用资源，须先查宿主并以 `reconcile` 登记停止及 `processTreeStopped:true` 证据。未知执行状态不能释放工作区。
+
+解决 WIP/冲突并提交之后，使用 `recover-workspace <state> <ticket> <decision.json>`。决定文件包含 `expectedRevision`、`expectedRecoveryHead`（可为 `null`）、`resolvedHead`、`resolvedBase`、`evidencePath`、`handoffPath` 和 `reason`。恢复 SHA 必须是干净的原任务分支 HEAD；若声明新的集成基线，它还必须是实时目标分支 SHA 且已包含于候选。若恢复提交不继承已保全提交，还需 `sourceEvidencePath` 核对来源。命令检查相关执行者和测试已停止，保留旧快照及新提交的 recovery ref，然后回到 `replan`；后续照常经过计划复核、实现与验证。运行处于 `paused` 时不会由此自动恢复派发。
+
 ## 测试与 GitHub 观测
 
 所有 agent 的测试/构建/重型核验通过 `test <state> <jobId> <request.json>` 执行，请求格式 `{argv,timeoutSeconds,env?,reason}`。cwd 为任务 worktree。测试配额按实际执行占用；不足时等待，不改用未登记的旁路命令。退出码、候选、日志和失败证据保留，完成后释放配额。最终 spec 审计的测试会临时建立冻结目标 SHA 的 detached worktree，完成后清理干净的审计目录；`candidateStable:false` 的结果不能用于验收。确定性 `verify` 直接使用核心预留的配额。该协议依赖宿主和角色遵守，无法限制框架外的任意 shell 进程。
+
+测试回执的 `candidate` 分别记录观察到的 `prHead`、`targetBase`、`localHead`、`testedHead`、`testedTree` 和适用时的 `integrationHead`。未提交工作参与测试时 `testedTree` 为 `null`，另记工作区内容指纹；不能把 Git HEAD 的树称为实际测试树。确定性 `verify` 对干净工作区记录真实 Git tree，候选变动则撤销旧测试证据。
 
 普通观测批量读取目标 SHA、issue 状态和 PR 候选；正文、评论、依赖由需要它们的角色读取。验收、合并和最终审计重新获取适用 CI，合并 actor 操作前调用 `guard <state> <jobId>`。只读瞬时网络故障有界重试，权限/不完整响应明确失败；外部写操作先查状态，不盲目重试。
 
@@ -78,7 +88,7 @@
 - `jobs`：`{active, leased, running}`；
 - `validationOwner`：当前持有验证队列的工单 key，没有则为 `null`。
 
-计数语义：`pending = total - done - human - blocked`，即不处于 `done`、`human`、`blocked` 的工单（认领、计划、计划复核、实现、排队、自检、验证、发布、审查、验收、集成、重规划、合并、关闭、清理等阶段）都计入 `pending`；`active = leased + running`，只统计当前持有租约或正在执行的 job，`done`、`cancelled` 等终态不计入。恒等式为 `tickets.total = done + human + blocked + pending`。
+计数语义：`pending = total - done - human - blocked`，即不处于 `done`、`human`、`blocked` 的工单（包括工作区 `recovery`、认领、计划、实现、验证和清理等阶段）都计入 `pending`；`active = leased + running`，只统计当前持有租约或正在执行的 job，`done`、`cancelled` 等终态不计入。恒等式为 `tickets.total = done + human + blocked + pending`。
 
 与 `inspect`/`metrics` 相同，`summary` 豁免版本门禁：没有 `upgrade` 的旧账本和已经 `retire` 的账本都可直接读取。它只读取状态文件并输出摘要，不创建、等待或恢复锁，不进入写路径，不调用 GitHub，也不改变状态、历史或租约。
 
@@ -104,9 +114,9 @@
 
 ## 中断、迁移与退役
 
-`inspect <state>` 查看账本。先查询原生执行者和子进程，再提交 `reconcile <state> <host-status.json>`：数组项为 `{jobId,nativeId,state,evidencePath,userStopped?}`，state 为 `running/stopped/lost/completed`。真实运行保留租约；完成则提交原结果；确认终止才取消。中断测试/命令需核对整个进程树，并提供 `processTreeStopped:true` 及证据；父进程消失本身不证明测试已停止。命令要恢复同一 job 时指定 `commandDisposition:"recover"`；选择 `"cancel"` 或省略则取消租约，保留已有结果、意图和资源，随后可退役或改模型。
+`inspect <state>` 查看账本。先查询原生执行者和子进程，再提交 `reconcile <state> <host-status.json>`：数组项为 `{jobId,nativeId,state,evidencePath,userStopped?,processTreeStopped?}`，state 为 `running/stopped/lost/completed`。真实运行保留租约；完成则提交原结果；确认终止才取消。中断任务 worktree 中的 agent、测试或命令时须核对整个进程树，并提供 `processTreeStopped:true` 及证据；父进程消失本身不证明工作已停止。命令要恢复同一 job 时指定 `commandDisposition:"recover"`；选择 `"cancel"` 或省略则取消租约，保留已有结果、意图和资源，随后可退役或改模型。
 
-确定性命令先保存结果再提交状态。同一 job 的命令进程已退出且结果存在时，`execute/drive` 使用原结果恢复；不会重跑已完成验证。认领使用预期基线 SHA 创建 branch/worktree，并用稳定评论标记对账。若命令退出但没有结果，`drive` 返回 `recoveryRequired`；L1 先确认其子进程和不确定远端动作，再用上述 recover 对账授权恢复。锁等待有界；锁的恢复者自身异常退出时，L1 核对 `.lock.recovery` 的持有者后恢复，不能删仍在使用的锁。
+确定性命令先保存结果再提交状态。同一 job 的命令进程已退出且结果存在时，`execute/drive` 使用原结果恢复；不会重跑已完成验证。认领使用预期基线 SHA 创建 branch/worktree，并用稳定评论标记对账。若命令退出但没有结果，`drive` 返回 `recoveryRequired`；L1 先确认其子进程和不确定远端动作，再用 `reconcile` 对账授权命令恢复。锁等待有界；锁的恢复者自身异常退出时，L1 核对 `.lock.recovery` 的持有者后恢复，不能删仍在使用的锁。
 
 旧版运行（无 `protocol` 或协议 `2`）可以直接 `inspect/metrics/summary`，也可用 `bind/stage/collect/submit` 登记原租约已经完成的结果；新派发由版本门禁拒绝。继续派发前先对账并排空在途任务，再显式执行 `upgrade <state> <evidence.json>`，内容为 `{evidencePath}`。命令先把原账本逐字节备份到返回的 `backupPath`，再迁移到协议 `3`；保留原结果与已完成工单，未完成验证从队列重新获取证据，不混用旧版部分审查。`paused` 和 `waiting_human` 状态保持原样，退役运行不能升级或复活。查看历史运行无需迁移；未知协议会明确报错。
 

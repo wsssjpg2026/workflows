@@ -199,7 +199,7 @@ CI按下列规则处理，无需逐次请求用户批准：
 | `claim` | `claimed` | `data:{branch,worktree,head,claimCommentUrl}`；worktree绝对路径，位于当前仓库`.agents/worktrees/` |
 | `plan`、`replan` | `planned` | `data:{planPath,checksPath}`；两者为已存在的计划与验证清单文件；随后由`plan-check`批准 |
 | `plan-check` | `pass`、`changes` | `changes`附`data.reason`；`pass`可用`data.checksPath`提交复核后的清单 |
-| `implement`、`integrate` | `implemented`、`replan` | `implemented`必须有新候选`head/base`与`handoffPath`；适用时`data.visualEvidence`；`replan`附`data.reason` |
+| `implement`、`integrate` | `implemented`、`replan` | 两种完成状态都必须有真实已提交候选`head/base`与`handoffPath`；`replan`另附`data.reason`，适用时`data.visualEvidence`；WIP/冲突由工作区恢复入口保全，不报作已验证候选 |
 | `self-standards`、`self-spec` | `reviewed` | 顶层`findings`必填，允许空数组；两个轴各自提交 |
 | `verify` | `pass`、`fail` | 由`execute`生成；失败时`data.failureSignature`及原始日志 |
 | `publish` | `published` | `data:{pr,commentUrl}`，pr为正整数；远端必须是当前候选的开放非draft PR |

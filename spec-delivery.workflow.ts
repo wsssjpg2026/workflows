@@ -21,6 +21,7 @@ const home = path.dirname(fileURLToPath(import.meta.url));
 export const workflowVersion = '0.3.0';
 const rolesPath = path.join(home, 'spec-delivery', 'roles.md');
 const active = (j: engine.Job) => j.status === 'leased' || j.status === 'running';
+const recovering = (s: engine.State, j: engine.Job) => s.tickets.some(t => t.key === j.ticket && t.phase === 'recovery');
 const sha = (x: string) => createHash('sha256').update(x).digest('hex');
 function read<T>(file: string): T { return JSON.parse(fs.readFileSync(file, 'utf8')); }
 function write(file: string, value: unknown) {
@@ -37,6 +38,167 @@ function git(root: string, ...argv: string[]) { return command(root, 'git', argv
 function safeFile(file: string) { engine.ensure(file && fs.statSync(file).isFile(), `工件不存在：${file}`); return file; }
 function localHead(t: engine.Ticket) { return git(t.worktree, 'rev-parse', 'HEAD'); }
 function clean(t: engine.Ticket) { return git(t.worktree, 'status', '--porcelain') === ''; }
+function gitRaw(root: string, ...argv: string[]) {
+  return execFileSync('git', argv, { cwd: root, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+}
+function worktreeFingerprint(root: string, status: string) {
+  const hash = createHash('sha256');
+  hash.update(status);
+  hash.update(gitRaw(root, 'diff', '--binary'));
+  hash.update(gitRaw(root, 'diff', '--cached', '--binary'));
+  for (const relative of gitRaw(root, 'ls-files', '--others', '--exclude-standard', '-z').split('\0').filter(Boolean).sort()) {
+    const file = path.resolve(root, relative);
+    engine.ensure(file.startsWith(path.resolve(root) + path.sep), 'Git 报告了工作区外的未跟踪路径');
+    const stat = fs.lstatSync(file);
+    hash.update(JSON.stringify({ relative, mode: stat.mode, type: stat.isSymbolicLink() ? 'link' : stat.isFile() ? 'file' : 'other' }));
+    if (stat.isSymbolicLink()) hash.update(fs.readlinkSync(file));
+    else if (stat.isFile()) hash.update(fs.readFileSync(file));
+  }
+  return hash.digest('hex');
+}
+function ancestor(root: string, earlier: string, later: string) {
+  const result = spawnSync('git', ['merge-base', '--is-ancestor', earlier, later], { cwd: root, stdio: 'ignore' });
+  return result.status === 0;
+}
+/** A real Git ref keeps a candidate reachable even if its branch is subsequently rewritten. */
+function preserveHead(s: engine.State, t: engine.Ticket, head: string) {
+  engine.ensure(/^[0-9a-f]{40,64}$/.test(head), '候选不是完整 Git commit SHA');
+  git(s.repo.root, 'cat-file', '-e', `${head}^{commit}`);
+  const ref = `refs/spec-delivery/recovery/${sha(s.id).slice(0, 12)}/${sha(t.key).slice(0, 12)}/${head}`;
+  const existing = git(s.repo.root, 'for-each-ref', '--format=%(objectname)', ref);
+  engine.ensure(!existing || existing === head, 'recovery ref 已指向另一提交');
+  if (!existing) git(s.repo.root, 'update-ref', ref, head);
+  return ref;
+}
+interface WorkspaceObservation {
+  head: string | null; branch: string | null; status: string; unmerged: string;
+  stagedDiff: string; worktreeDiff: string; untracked: string; error?: string;
+}
+function inspectWorktree(t: engine.Ticket): WorkspaceObservation {
+  try {
+    return {
+      head: git(t.worktree, 'rev-parse', 'HEAD'), branch: git(t.worktree, 'branch', '--show-current'),
+      status: gitRaw(t.worktree, 'status', '--porcelain=v1', '--untracked-files=all'),
+      unmerged: gitRaw(t.worktree, 'ls-files', '-u'),
+      stagedDiff: gitRaw(t.worktree, 'diff', '--cached', '--binary'),
+      worktreeDiff: gitRaw(t.worktree, 'diff', '--binary'),
+      untracked: gitRaw(t.worktree, 'ls-files', '--others', '--exclude-standard'),
+    };
+  } catch (error) {
+    return { head: null, branch: null, status: '', unmerged: '', stagedDiff: '', worktreeDiff: '', untracked: '', error: (error as Error).message };
+  }
+}
+function enterWorkspaceRecovery(s: engine.State, t: engine.Ticket, statePath: string, reason: string, sourceJobId?: string, observation = inspectWorktree(t)) {
+  if (t.phase === 'recovery') return t.recovery;
+  const kind: engine.WorkspaceRecovery['kind'] = observation.unmerged ? 'conflict' : observation.status ? 'wip' : 'unknown_candidate';
+  const directory = path.join(path.dirname(statePath), 'recovery', sha(t.key).slice(0, 16), randomUUID());
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, 'status.txt'), observation.status);
+  fs.writeFileSync(path.join(directory, 'unmerged-index.txt'), observation.unmerged);
+  fs.writeFileSync(path.join(directory, 'staged.patch'), observation.stagedDiff);
+  fs.writeFileSync(path.join(directory, 'worktree.patch'), observation.worktreeDiff);
+  fs.writeFileSync(path.join(directory, 'untracked.txt'), observation.untracked);
+  // A patch does not contain untracked files or the conflict-marker file as a
+  // standalone artifact. Copy those exact bytes while leaving the worktree intact.
+  const savedFiles = path.join(directory, 'saved-files');
+  if (!observation.error) {
+    const names = new Set([
+      ...gitRaw(t.worktree, 'ls-files', '--others', '--exclude-standard', '-z').split('\0').filter(Boolean),
+      ...gitRaw(t.worktree, 'diff', '--name-only', '--diff-filter=U', '-z').split('\0').filter(Boolean),
+    ]);
+    for (const relative of names) {
+      const source = path.resolve(t.worktree, relative), destination = path.resolve(savedFiles, relative);
+      engine.ensure(source.startsWith(path.resolve(t.worktree) + path.sep) && destination.startsWith(savedFiles + path.sep), 'Git 报告了工作区外的恢复文件');
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      fs.cpSync(source, destination, { recursive: true, dereference: false });
+    }
+  }
+  const observedRef = observation.head ? preserveHead(s, t, observation.head) : null;
+  if (t.head && t.head !== observation.head) preserveHead(s, t, t.head);
+  const snapshotPath = path.join(directory, 'snapshot.json');
+  const recovery: engine.WorkspaceRecovery = {
+    kind, reason: observation.error ? `${reason}；Git 观测失败：${observation.error}` : reason,
+    sourceJobId, activeJobIds: s.jobs.filter(j => j.ticket === t.key && active(j)).map(j => j.id),
+    expectedHead: t.head, observedHead: observation.head, base: t.base,
+    recoveryRef: observedRef, snapshotPath, at: new Date().toISOString(),
+  };
+  write(snapshotPath, { ...recovery, branch: observation.branch, worktree: t.worktree,
+    statusPath: path.join(directory, 'status.txt'), unmergedPath: path.join(directory, 'unmerged-index.txt'),
+    stagedPatchPath: path.join(directory, 'staged.patch'), worktreePatchPath: path.join(directory, 'worktree.patch'),
+    untrackedPath: path.join(directory, 'untracked.txt'), savedFilesPath: savedFiles });
+  t.recovery = recovery; t.phase = 'recovery'; t.reason = recovery.reason; t.epoch++; t.evidence = {};
+  s.specAudit = undefined; s.auditEpoch++;
+  engine.event(s, `${t.key} 工作区进入 ${kind} 恢复；已保留现有工作、冲突索引与候选引用`);
+  return recovery;
+}
+/** Only inspect idle worktrees. A running writer may legitimately have temporary WIP. */
+function inspectIdleWorkspaces(s: engine.State, facts: engine.LiveFacts, statePath: string) {
+  if (s.protocol !== engine.currentProtocol) return;
+  for (const t of s.tickets) {
+    if (!t.worktree || ['claim', 'done', 'human', 'close', 'cleanup', 'recovery'].includes(t.phase) || s.jobs.some(j => j.ticket === t.key && active(j))) continue;
+    const observed = inspectWorktree(t), pr = facts.prs[String(t.pr)];
+    if (observed.unmerged || observed.status || observed.error || observed.branch !== t.branch || observed.head !== t.head) {
+      enterWorkspaceRecovery(s, t, statePath,
+        observed.unmerged ? '工作区存在未解决合并冲突' : observed.status ? '工作区存在未提交工作' : '本地候选来源或任务分支与账本不一致', undefined, observed);
+      continue;
+    }
+    if (pr && pr.state === 'OPEN' && pr.head !== t.head &&
+      !(t.pendingPushHead === t.head && observed.head && ancestor(s.repo.root, pr.head, observed.head))) {
+      enterWorkspaceRecovery(s, t, statePath, '远端 PR 候选与本地候选分叉，需核对来源', undefined, observed);
+    }
+  }
+}
+function recoverOnRejectedResult(s: engine.State, j: engine.Job, statePath: string, error: Error) {
+  if (s.protocol !== engine.currentProtocol) return;
+  const t = s.tickets.find(t => t.key === j.ticket);
+  if (!t?.worktree || t.phase === 'recovery') return;
+  const observed = inspectWorktree(t);
+  if (observed.unmerged || observed.status || observed.error || observed.branch !== t.branch || observed.head !== t.head)
+    enterWorkspaceRecovery(s, t, statePath, `回执无法采用：${error.message}`, j.id, observed);
+}
+function recoverWorkspace(s: engine.State, statePath: string, key: string, decision: {
+  expectedRevision: number; expectedRecoveryHead: string | null; resolvedHead: string; resolvedBase: string;
+  evidencePath: string; handoffPath: string; reason: string; sourceEvidencePath?: string;
+}) {
+  engine.ensure(s.protocol === engine.currentProtocol, '工作区恢复只支持运行协议 3');
+  engine.ensure(['running', 'paused', 'blocked'].includes(s.status), '已完成或等待人工的运行不能恢复工作区派发');
+  const t = engine.ticket(s, key), recovery = t.recovery;
+  engine.ensure(t.phase === 'recovery' && recovery, '工单不在工作区恢复状态');
+  engine.ensure(decision.expectedRevision === s.revision && decision.expectedRecoveryHead === recovery.observedHead, '恢复决定已过期；重新 inspect 后生成决定');
+  engine.ensure(typeof decision.reason === 'string' && decision.reason.trim(), '恢复需要明确原因');
+  safeFile(decision.evidencePath); safeFile(decision.handoffPath);
+  for (const id of recovery.activeJobIds) {
+    const j = s.jobs.find(j => j.id === id);
+    engine.ensure(j && (j.status === 'done' || (j.status === 'cancelled' && j.stopConfirmation?.processTreeStopped === true)), `执行者 ${id} 尚未确认停止或完成`);
+  }
+  engine.ensure(!s.jobs.some(j => j.ticket === t.key && (active(j) || j.testExecution)), '相关执行者或测试进程仍可能运行，先 reconcile');
+  const observed = inspectWorktree(t);
+  engine.ensure(!observed.error && !observed.status && !observed.unmerged, '先保全并解决 WIP/冲突；恢复时工作区必须干净');
+  const ownedRoot = path.join(s.repo.root, '.agents', 'worktrees') + path.sep;
+  engine.ensure(path.resolve(t.worktree).startsWith(ownedRoot) &&
+    fs.realpathSync(t.worktree).startsWith(fs.realpathSync(path.join(s.repo.root, '.agents', 'worktrees')) + path.sep),
+    '恢复 worktree 必须仍在本仓库管理的 .agents/worktrees 下');
+  engine.ensure(observed.branch === t.branch && observed.head === decision.resolvedHead, '恢复候选必须是原任务分支的真实 HEAD');
+  engine.ensure(path.resolve(t.worktree, git(t.worktree, 'rev-parse', '--git-common-dir')) === path.resolve(s.repo.root, git(s.repo.root, 'rev-parse', '--git-common-dir')), '恢复 worktree 不属于当前仓库');
+  const origin = recovery.observedHead || recovery.expectedHead;
+  if (origin && !ancestor(s.repo.root, origin, decision.resolvedHead)) {
+    engine.ensure(decision.sourceEvidencePath, '候选不继承保全提交；需独立来源核对证据');
+    safeFile(decision.sourceEvidencePath);
+  }
+  engine.ensure(ancestor(s.repo.root, decision.resolvedBase, decision.resolvedHead), '恢复候选没有包含声明的目标基线');
+  if (decision.resolvedBase !== recovery.base) engine.ensure(decision.resolvedBase === s.facts.base, '新集成基线必须是实时目标分支 SHA');
+  const ref = preserveHead(s, t, decision.resolvedHead);
+  t.recoveryHistory ??= [];
+  t.recoveryHistory.push({ ...recovery, resolvedAt: new Date().toISOString(), resolvedHead: decision.resolvedHead,
+    resolutionPath: decision.evidencePath, sourceEvidencePath: decision.sourceEvidencePath });
+  t.recovery = undefined; t.recoveryRef = ref; t.head = decision.resolvedHead; t.base = decision.resolvedBase;
+  t.handoffPath = decision.handoffPath; t.pendingPushHead = decision.resolvedHead;
+  if (decision.resolvedBase !== recovery.base) t.integrationHead = decision.resolvedHead;
+  t.phase = 'replan'; t.reason = decision.reason; t.epoch++; t.evidence = {};
+  if (s.validationOwner === t.key) s.validationOwner = undefined;
+  engine.event(s, `${t.key} 根据 ${decision.evidencePath} 恢复已保全候选，交给 L1 重规划`);
+  return { ticket: t.key, head: t.head, base: t.base, recoveryRef: ref, phase: t.phase };
+}
 function supportedLedger(s: engine.State) {
   engine.ensure(s.schema === 1, '不支持的状态版本');
   engine.ensure(s.protocol === undefined || s.protocol === 2 || s.protocol === engine.currentProtocol,
@@ -238,7 +400,7 @@ export function packet(s: engine.State, j: engine.Job, statePath: string) {
     criteria: t?.criteria || s.specCriteria, visualRequired: t?.visual || false, closeout: t?.closeout || false,
     blockingReason: j.fresh && ['review-lens','confirm'].includes(j.action) ? '' : t?.reason || t?.lastProblem || '',
     planPath: j.fresh && j.action !== 'plan-check' ? '' : t?.planPath || '', checksPath: t?.checksPath || '',
-    handoffPath: j.fresh ? '' : authored ? t?.handoffPath || '' : t?.reviewHandoff || '',
+    handoffPath: j.fresh && j.action !== 'replan' ? '' : authored ? t?.handoffPath || '' : t?.reviewHandoff || '',
     sourceUrl: `https://${s.repo.host}/${s.repo.slug}/issues/${t?.number || s.spec}`,
     objectiveEvidence: objective, prior: relevant.slice(-20), historyIndexPath: j.fresh && j.action !== 'review-report' ? '' : priorPath, finding: j.finding || null,
     dispute: j.dispute ? Object.fromEntries(Object.entries(j.dispute).map(([key, id]) => [key, resultPaths(statePath, id).result])) : null,
@@ -261,6 +423,7 @@ function validateResult(s: engine.State, j: engine.Job, r: engine.Result) {
   safeFile(r.evidencePath);
   if (r.handoffPath) safeFile(r.handoffPath);
   const t = s.tickets.find(t => t.key === j.ticket); if (!t || !r.complete) return;
+  engine.ensure(t.phase !== 'recovery', '工作区尚在恢复，原任务回执不能签发新候选证据');
   if (j.action === 'claim') {
     const data = r.data || {}, worktree = path.resolve(String(data.worktree || ''));
     const ownedRoot = path.join(s.repo.root, '.agents', 'worktrees') + path.sep;
@@ -279,9 +442,17 @@ function validateResult(s: engine.State, j: engine.Job, r: engine.Result) {
   if (r.data?.visualEvidence) safeFile(String(r.data.visualEvidence));
   if (t.worktree && !['cleanup', 'merge', 'close'].includes(j.action)) {
     const actual = localHead(t);
+    if (!['implement', 'integrate'].includes(j.action)) engine.ensure(r.head === j.head, '过期候选 SHA：只读回执必须使用派发时的 head');
     engine.ensure(actual === (r.head || j.head), '本地候选 SHA 与回执不一致');
     if (!['implement', 'integrate'].includes(j.action)) engine.ensure(actual === j.head, '只读 actor 更改了候选；需要重新走实现与验证');
     engine.ensure(clean(t), 'worktree 有未提交变化，不能签发候选证据');
+    if (['implement', 'integrate'].includes(j.action) && ['implemented', 'replan'].includes(r.status)) {
+      engine.ensure(r.head && r.base && r.handoffPath, '写任务必须交接真实候选 head/base');
+      if (r.status === 'replan') engine.ensure(typeof r.data?.reason === 'string' && r.data.reason.trim(), '重规划必须说明原因');
+      engine.ensure(ancestor(s.repo.root, j.head, r.head), '新候选不继承原候选；先进入工作区恢复核对来源');
+      engine.ensure(ancestor(s.repo.root, r.base, r.head), '新候选没有包含声明的基线');
+      t.recoveryRef = preserveHead(s, t, r.head);
+    }
   }
   if (j.action === 'publish') {
     const pr = gh.pr(s.repo, Number(r.data?.pr));
@@ -297,6 +468,8 @@ function verify(s: engine.State, j: engine.Job, statePath: string): engine.Resul
   const manifest = JSON.parse(manifestBytes) as { scopeReason: string; commands: { name: string; argv: string[]; env?: Record<string, string>; timeoutSeconds: number }[] };
   engine.ensure(manifest.scopeReason && manifest.commands?.length, 'L1 验证清单缺少范围理由或真实命令');
   const directory = path.join(path.dirname(statePath), 'checks', sha(j.id).slice(0, 16)); fs.mkdirSync(directory, { recursive: true });
+  const testedTree = git(t.worktree, 'rev-parse', 'HEAD^{tree}');
+  const prHead = s.facts.prs[String(t.pr)]?.head || null;
   const rows: unknown[] = []; let passed = true;
   for (const [n, c] of manifest.commands.entries()) {
     engine.ensure(Array.isArray(c.argv) && c.argv.length && c.argv.every(a => typeof a === 'string') && Number.isFinite(c.timeoutSeconds) && c.timeoutSeconds > 0, '验证命令需要 argv 数组和有限超时');
@@ -311,9 +484,12 @@ function verify(s: engine.State, j: engine.Job, statePath: string): engine.Resul
   }
   passed = passed && localHead(t) === j.head && clean(t) && fs.readFileSync(t.checksPath, 'utf8') === manifestBytes;
   const evidencePath = path.join(directory, 'receipt.json');
-  write(evidencePath, { jobId: j.id, head: j.head, base: j.base, manifestSha256: sha(manifestBytes), scopeReason: manifest.scopeReason, passed, rows });
+  write(evidencePath, { jobId: j.id, candidate: { prHead, targetBase: s.facts.base,
+    localHead: j.head, testedHead: j.head, testedTree, integrationHead: t.integrationHead || null },
+    manifestSha256: sha(manifestBytes), scopeReason: manifest.scopeReason, passed, rows });
   return { model: j.model, complete: true, status: passed ? 'pass' : 'fail', head: j.head, base: j.base, evidencePath,
-    data: { failureSignature: passed ? '' : sha(JSON.stringify(rows.map((x: any) => [x.name, x.exitCode, x.signal]))) } };
+    data: { prHead, targetBase: s.facts.base, testedHead: j.head, testedTree,
+      failureSignature: passed ? '' : sha(JSON.stringify(rows.map((x: any) => [x.name, x.exitCode, x.signal]))) } };
 }
 function cleanup(s: engine.State, j: engine.Job, statePath: string): engine.Result {
   const t = engine.ticket(s, j.ticket), pr = gh.pr(s.repo, t.pr), issue = gh.issue(s.repo, t.number);
@@ -397,6 +573,7 @@ function executeCommand(statePath: string, id: string) {
     s = read<engine.State>(statePath); requireProtocol(s); engine.ensure(s.status === 'running', 'workflow 未运行；暂停后不能执行命令任务');
     const found = s.jobs.find(job => job.id === id);
     engine.ensure(found && (found.executor === 'command' || found.action === 'claim') && active(found), '任务不是可执行命令'); j = found;
+    engine.ensure(!recovering(s, j), '工作区正在恢复，禁止执行原命令任务');
     if(j.nativeId) {
       const pid=Number(j.nativeId.match(/^command:(\d+):/)?.[1]);
       engine.ensure(pid && !processAlive(pid), '原命令进程仍可能执行，不能重入');
@@ -436,7 +613,7 @@ function selectRemote(s: engine.State) {
   engine.ensure(candidates.length === 1, '没有唯一匹配当前仓库的 push remote；由 L1 核对 remote 后继续'); return candidates[0];
 }
 export function renderZcode(s: engine.State, statePath: string) {
-  const jobs = s.jobs.filter(j => j.status === 'leased' && j.executor === 'agent');
+  const jobs = s.jobs.filter(j => j.status === 'leased' && j.executor === 'agent' && !recovering(s, j));
   const result: unknown[] = [];
   for (const model of new Set(jobs.map(j => j.model))) {
     const allJobs = jobs.filter(j => j.model === model);
@@ -476,7 +653,8 @@ export function consumeStaged(statePath: string, ids?: string[]) {
   const release = lock(statePath);
   try {
     let s = read<engine.State>(statePath); allowCompletion(s);
-    const jobs = s.jobs.filter(j => active(j) && j.nativeId && j.executor === 'agent' && (!ids || ids.includes(j.id)) && fs.existsSync(resultPaths(statePath, j.id).ready));
+    const jobs = s.jobs.filter(j => active(j) && j.nativeId && j.executor === 'agent' &&
+      s.tickets.find(t => t.key === j.ticket)?.phase !== 'recovery' && (!ids || ids.includes(j.id)) && fs.existsSync(resultPaths(statePath, j.id).ready));
     if (!jobs.length) return { submitted: [], rejected: [] };
     s.facts = observe(s, jobs);
     const submitted: string[] = [], rejected: {jobId:string; error:string}[] = [];
@@ -487,7 +665,10 @@ export function consumeStaged(statePath: string, ids?: string[]) {
         engine.ensure(!job.testExecution,'测试进程未完成，不能提交任务');
         job.timing ??= {leasedAt:''}; job.timing.resultAt=read<{at:string}>(resultPaths(statePath,j.id).ready).at;
         validateResult(trial, job, r); engine.submit(trial, job.id, r); s = trial; submitted.push(j.id);
-      } catch (error) { rejected.push({jobId:j.id,error:(error as Error).message}); }
+      } catch (error) {
+        recoverOnRejectedResult(s, j, statePath, error as Error);
+        rejected.push({jobId:j.id,error:(error as Error).message});
+      }
     }
     save(statePath, s); return { submitted, rejected };
   } finally { release(); }
@@ -531,6 +712,8 @@ function runTest(statePath:string,id:string,request:{argv:string[];timeoutSecond
   try {
     const s=read<engine.State>(statePath), j=s.jobs.find(j=>j.id===id); requireProtocol(s);
     engine.ensure(s.status==='running' && j && j.executor==='agent' && active(j),'只能为在途 agent 任务申请测试');
+    engine.ensure(!recovering(s,j), '工作区正在恢复，不能启动新测试');
+    s.facts = observe(s, [j]);
     engine.ensure(!j.testExecution,'此任务已有测试进程或未对账的中断；先核对整个进程树，不自动回收配额');
     engine.ensure(j.tests || s.jobs.filter(active).reduce((n,x)=>n+x.tests,0)<s.policy!.tests,'测试配额暂不可用；等待测试完成后重试，不改用旁路执行');
     if(j.ticket==='$spec') {
@@ -549,10 +732,22 @@ function runTest(statePath:string,id:string,request:{argv:string[];timeoutSecond
       fs.mkdirSync(path.dirname(worktree),{recursive:true});git(audit.repo.root,'worktree','add','--detach',worktree,base);
     }
     const head=git(worktree,'rev-parse','HEAD');
+    const statusBefore=gitRaw(worktree,'status','--porcelain=v1','--untracked-files=all');
+    const testedTree=statusBefore ? null : git(worktree,'rev-parse','HEAD^{tree}');
+    const beforeFingerprint=worktreeFingerprint(worktree,statusBefore);
+    const workingTreeFingerprint=statusBefore ? beforeFingerprint : null;
     fs.mkdirSync(out,{recursive:true});a=fs.openSync(path.join(out,'stdout.log'),'w');b=fs.openSync(path.join(out,'stderr.log'),'w');
     const r=spawnSync(request.argv[0],request.argv.slice(1),{cwd:worktree,env:{...process.env,...request.env},timeout:request.timeoutSeconds*1000,stdio:['ignore',a,b],shell:false});
-    const candidateStable=git(worktree,'rev-parse','HEAD')===head && (!audit || git(worktree,'status','--porcelain')==='');
-    const receipt={jobId:id,request,worktree,head,base,candidateStable,exitCode:r.status,signal:r.signal,error:r.error?.message,stdout:path.join(out,'stdout.log'),stderr:path.join(out,'stderr.log'),finishedAt:new Date().toISOString()};
+    const statusAfter=gitRaw(worktree,'status','--porcelain=v1','--untracked-files=all');
+    const afterFingerprint=worktreeFingerprint(worktree,statusAfter);
+    const candidateStable=git(worktree,'rev-parse','HEAD')===head && afterFingerprint===beforeFingerprint;
+    const current=read<engine.State>(statePath), ticket=current.jobs.find(x=>x.id===id)?.ticket;
+    const related=ticket && ticket!=='$spec' ? current.tickets.find(x=>x.key===ticket) : undefined;
+    const receipt={jobId:id,request,worktree,candidate:{prHead:related ? current.facts.prs[String(related.pr)]?.head || null : null,
+      targetBase:base,targetBaseAtFinish:current.facts.base,localHead:head,testedHead:head,testedTree,workingTreeFingerprint,
+      integrationHead:related?.integrationHead || null},head,base,candidateStable,
+      statusBefore,statusAfter,exitCode:r.status,signal:r.signal,error:r.error?.message,
+      stdout:path.join(out,'stdout.log'),stderr:path.join(out,'stderr.log'),finishedAt:new Date().toISOString()};
     write(path.join(out,'receipt.json'),receipt);return {...receipt,evidencePath:path.join(out,'receipt.json')};
   } finally {
     if(a!==undefined)fs.closeSync(a);if(b!==undefined)fs.closeSync(b);
@@ -570,7 +765,7 @@ export async function main(argv: string[]): Promise<unknown> {
   const [op, file, extra, fourth] = argv;
   if(op==='version')return {workflow:'spec-delivery',version:workflowVersion};
   if (!op || op === 'help') return { workflow: 'spec-delivery', input: ['spec', 'targetBranch', 'models.L1', 'models.L2', 'models.L3'],
-    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan <state> <plan.json>', 'drive <state>', 'next <state>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'stage <state> <jobId> <result-json>', 'collect <state>', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'test <state> <jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'metrics <state>', 'resume <state>', 'zcode <state>'] };
+    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan <state> <plan.json>', 'drive <state>', 'next <state>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'stage <state> <jobId> <result-json>', 'collect <state>', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'test <state> <jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'recover-workspace <state> <ticket> <decision.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'metrics <state>', 'resume <state>', 'zcode <state>'] };
   engine.ensure(file, '缺少输入文件/状态路径');
   // summary 在 lock() 之前返回：只验证可读协议，不创建/等待/恢复/删除状态锁，也不进入写路径。
   if (op === 'summary') return summarizeLedger(path.resolve(file));
@@ -598,15 +793,15 @@ export async function main(argv: string[]): Promise<unknown> {
       const next=await main(['next',statePath]) as {jobs?:engine.Job[]};
       const current=read<engine.State>(statePath);
       const dead=(j:engine.Job)=>/^command:\d+:/.test(j.nativeId) && !processAlive(Number(j.nativeId.split(':')[1]));
-      const j=current.jobs.find(j=>j.executor!=='agent' && active(j) && (!j.nativeId || (dead(j) && canRecoverCommand(statePath,j))));
-      if(!j) return {...next,collected,completed,recoveryRequired:current.jobs.filter(j=>active(j) && j.executor!=='agent' && dead(j) && !canRecoverCommand(statePath,j)).map(j=>({jobId:j.id,nativeId:j.nativeId,reason:'无命令结果，需核对子进程及外部动作后 reconcile'}))};
+      const j=current.jobs.find(j=>j.executor!=='agent' && active(j) && !recovering(current,j) && (!j.nativeId || (dead(j) && canRecoverCommand(statePath,j))));
+      if(!j) return {...next,collected,completed,recoveryRequired:current.jobs.filter(j=>active(j) && j.executor!=='agent' && !recovering(current,j) && dead(j) && !canRecoverCommand(statePath,j)).map(j=>({jobId:j.id,nativeId:j.nativeId,reason:'无命令结果，需核对子进程及外部动作后 reconcile'}))};
       executeCommand(statePath,j.id); completed.push(j.id);
     }
     return {...await main(['next',statePath]) as object,collected,completed};
   }
   const statePath = path.resolve(file), release = lock(statePath);
   try {
-    const s = read<engine.State>(statePath); supportedLedger(s);
+    let s = read<engine.State>(statePath); supportedLedger(s);
     engine.ensure(s.status !== 'retired', '已退役运行只允许 inspect/metrics/summary，不能自动复活');
     if (op === 'upgrade') {
       engine.ensure(extra && !s.jobs.some(active), '升级前先对账并确认所有在途任务已停止或完整提交');
@@ -629,6 +824,13 @@ export async function main(argv: string[]): Promise<unknown> {
       save(statePath,s);return {statePath,status:s.status,upgraded:true,backupPath:backup};
     }
     if(!['bind','submit','reconcile','retire'].includes(op))requireProtocol(s);
+    if (op === 'recover-workspace') {
+      engine.ensure(extra && fourth, '需要工单 key 与恢复决定文件');
+      s.facts = observe(s);
+      const result = recoverWorkspace(s, statePath, extra, read(fourth));
+      save(statePath, s);
+      return { statePath, status: s.status, revision: s.revision, ...result };
+    }
     if (op === 'zcode') return renderZcode(s, statePath);
     if (op === 'guard') {
       engine.ensure(s.status === 'running', 'workflow 未运行，禁止合并或关闭');
@@ -646,15 +848,19 @@ export async function main(argv: string[]): Promise<unknown> {
       s.facts = observe(s); const sources = gh.subIssues(s.repo, s.spec);
       const p = read<engine.ExecutionPlan>(extra); safeFile(p.evidencePath); engine.applyPlan(s, p, sources);
     } else if (op === 'next') {
-      engine.reconcileFacts(s, observe(s));
+      const observed = observe(s);
+      inspectIdleWorkspaces(s, observed, statePath);
+      engine.reconcileFacts(s, observed);
       if (s.status !== 'running') { save(statePath, s); return { status: s.status, next: 'inspect 中的状态需要 L1 处理；用户暂停时保持暂停' }; }
       const js = engine.reserve(s).filter(j => {
         if (claimLease(s, j, statePath)) return true;
         const t = engine.ticket(s, j.ticket); t.phase = 'blocked'; t.reason = '工单由另一个运行持有'; j.status = 'cancelled'; return false;
       });
-      const packets = s.jobs.filter(j=>j.status==='leased' && !j.nativeId).map(j => { const p = packet(s, j, statePath); const file = path.join(path.dirname(statePath), 'packets', sha(j.id).slice(0, 20) + '.json'); write(file, p); return { ...j, packetPath: file }; });
+      const packets = s.jobs.filter(j=>j.status==='leased' && !j.nativeId && !recovering(s,j)).map(j => { const p = packet(s, j, statePath); const file = path.join(path.dirname(statePath), 'packets', sha(j.id).slice(0, 20) + '.json'); write(file, p); return { ...j, packetPath: file }; });
       save(statePath, s);
-      return { status: s.status, jobs: packets, outstanding: s.jobs.filter(active).map(j => ({id:j.id, nativeId:j.nativeId, status:j.status})), instruction: 'L1 按实际模型派发；没有新任务时等待在途任务或处理明确阻塞，不循环空轮询' };
+      return { status: s.status, jobs: packets, outstanding: s.jobs.filter(active).map(j => ({id:j.id, nativeId:j.nativeId, status:j.status})),
+        recoveries: s.tickets.filter(t => t.phase === 'recovery').map(t => ({ticket:t.key,...t.recovery})),
+        instruction: 'L1 按实际模型派发；工作区恢复先核对执行者并调用 recover-workspace；没有新任务时等待在途任务或处理明确阻塞' };
     } else if (op === 'bind') {
       engine.ensure(extra && fourth, '需要 jobId 与宿主 binding.json'); engine.bind(s, extra, read(fourth));
     } else if (op === 'reconfigure') {
@@ -681,9 +887,16 @@ export async function main(argv: string[]): Promise<unknown> {
     } else if (op === 'submit') {
       engine.ensure(extra && fourth, '需要 jobId 与结果 JSON');
       const j = s.jobs.find(j => j.id === extra); engine.ensure(j, '未知 job'); const r = read<engine.Result>(fourth);
-      if (j.status !== 'done') {engine.ensure(!j.testExecution,'测试进程未完成');s.facts = observe(s,[j]); validateResult(s, j, r); }
-      engine.submit(s, extra, r);
-      archiveResult(statePath,j);
+      const trial = structuredClone(s), trialJob = trial.jobs.find(x => x.id === extra)!;
+      try {
+        if (trialJob.status !== 'done') {engine.ensure(!trialJob.testExecution,'测试进程未完成');trial.facts = observe(trial,[trialJob]); validateResult(trial, trialJob, r); }
+        engine.submit(trial, extra, r);
+      } catch (error) {
+        recoverOnRejectedResult(s, j, statePath, error as Error);
+        if (s.tickets.some(t => t.phase === 'recovery' && t.recovery?.sourceJobId === j.id)) save(statePath, s);
+        throw error;
+      }
+      s = trial; archiveResult(statePath,s.jobs.find(x=>x.id===extra)!);
     } else if (op === 'reconcile') {
       engine.ensure(extra, '需要 L1 查询宿主后生成的 host-status.json');
       const statuses = read<{jobId:string; nativeId:string; state:'running'|'stopped'|'lost'|'completed'; evidencePath:string; userStopped?:boolean;processTreeStopped?:boolean;commandDisposition?:'recover'|'cancel'}[]>(extra);
@@ -694,6 +907,8 @@ export async function main(argv: string[]): Promise<unknown> {
         if (observation.state === 'stopped' || observation.state === 'lost') {
           engine.ensure(!j.testExecution || !processAlive(j.testExecution.pid),'测试进程仍在运行，不能释放预算');
           engine.ensure(!j.testExecution || observation.processTreeStopped===true,'中断测试须核对整个进程树');
+          if(j.executor==='agent' && s.tickets.some(t => t.key === j.ticket && t.worktree))
+            engine.ensure(observation.processTreeStopped===true,'工作区执行者须核对整个进程树后才能释放写权');
           if(j.executor!=='agent' && /^command:\d+:/.test(j.nativeId) && s.protocol!==undefined) {
             engine.ensure(!processAlive(Number(j.nativeId.split(':')[1])) && observation.processTreeStopped===true,'命令恢复须确认父进程与整个进程树已停止');
             if(observation.commandDisposition==='recover') {
@@ -703,6 +918,7 @@ export async function main(argv: string[]): Promise<unknown> {
             delete j.commandRecovery;
           }
           j.status = 'cancelled';
+          j.stopConfirmation = {state:observation.state,evidencePath:observation.evidencePath,processTreeStopped:observation.processTreeStopped===true,at:new Date().toISOString()};
           j.timing??={leasedAt:''};j.timing.cancelledAt=new Date().toISOString();delete j.testExecution;
           if (j.ticket === '$spec') s.specAudit = undefined;
           else engine.ticket(s, j.ticket).reason = '任务已终止；新执行者从持久证据恢复本阶段，不跳过中间验证';
@@ -710,6 +926,7 @@ export async function main(argv: string[]): Promise<unknown> {
         // completed 必须读取并提交原结果，不重做外部动作；running 保留原租约。
       }
       const observed=observe(s);
+      inspectIdleWorkspaces(s, observed, statePath);
       if(s.protocol!==undefined)engine.reconcileFacts(s,observed);else s.facts=observed;
       engine.event(s, '实时核对宿主、GitHub 和候选；没有将 journal 回放当作新验证');
     } else if (op === 'resolve') {

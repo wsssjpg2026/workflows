@@ -34,9 +34,20 @@ export interface TicketPlan {
   deferredDependencies?: { issue: number; target: number; kind: 'acceptance_only'; records: string[] }[];
 }
 export interface ExecutionPlan { capabilities: Capabilities; policy: Policy; tickets: TicketPlan[]; specCriteria: string[]; evidencePath: string }
-export type Phase = 'claim' | 'plan' | 'plan_check' | 'implement' | 'queued' | 'self' | 'verify' | 'publish' | 'review' | 'fresh' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'done' | 'human' | 'blocked';
+export type Phase = 'claim' | 'plan' | 'plan_check' | 'implement' | 'queued' | 'self' | 'verify' | 'publish' | 'review' | 'fresh' | 'accept' | 'integrate' | 'replan' | 'recovery' | 'merge' | 'close' | 'cleanup' | 'done' | 'human' | 'blocked';
 export type Action = 'claim' | 'plan' | 'plan-check' | 'implement' | 'self-standards' | 'self-spec' | 'verify' | 'publish' | 'review-lens' | 'confirm' | 'adjudicate' | 'review-report' | 'accept' | 'integrate' | 'replan' | 'merge' | 'close' | 'cleanup' | 'spec-audit' | 'spec-close';
-export interface Evidence { head: string; base: string; path: string }
+export interface Evidence {
+  head: string; base: string; path: string;
+  /** These are separate observations: a remote PR head need not equal an unpushed local head. */
+  prHead?: string | null; targetBase?: string; testedHead?: string; testedTree?: string;
+  integrationHead?: string | null;
+}
+export interface WorkspaceRecovery {
+  kind: 'wip' | 'conflict' | 'unknown_candidate';
+  reason: string; sourceJobId?: string; activeJobIds: string[];
+  expectedHead: string; observedHead: string | null; base: string;
+  recoveryRef: string | null; snapshotPath: string; at: string;
+}
 export interface Ticket extends TicketPlan {
   key: string; phase: Phase; epoch: number; round: number; stalls: number; escalations: number;
   head: string; base: string; pr: number; branch: string; worktree: string;
@@ -45,6 +56,11 @@ export interface Ticket extends TicketPlan {
   lastProblem: string; reason: string; closeout: boolean;
   cleaned: boolean;
   queueOrder?: number; queueSkips?: number; baseInvalidations?: number;
+  recovery?: WorkspaceRecovery;
+  recoveryHistory?: (WorkspaceRecovery & { resolvedAt: string; resolvedHead: string; resolutionPath: string; sourceEvidencePath?: string })[];
+  recoveryRef?: string;
+  pendingPushHead?: string;
+  integrationHead?: string;
 }
 export interface LivePR { number: number; head: string; base: string; baseRef: string; state: string; draft: boolean; mergeable: string; checks: {id: string; status: string}[] }
 export interface LiveFacts { base: string; issueStates: Record<string, string>; prs: Record<string, LivePR>; at: string }
@@ -69,6 +85,7 @@ export interface Job {
   dispute?: { previous: string; current: string };
   testExecution?: { pid: number; granted: boolean; startedAt: string; worktree?: string; evidenceDirectory?: string };
   commandRecovery?: { nativeId: string; evidencePath: string; at: string };
+  stopConfirmation?: { state: 'stopped' | 'lost'; evidencePath: string; processTreeStopped: boolean; at: string };
 }
 export interface State {
   schema: 1; id: string; revision: number; inputs: Inputs; spec: number;
@@ -103,7 +120,7 @@ function enqueue(s: State, t: Ticket) {
 function admit(s: State) {
   const owner = s.tickets.find(t => t.key === s.validationOwner);
   if (owner?.reason === 'waiting_ci' && s.facts.prs[owner.pr]?.checks.some(c=>c.status==='pending')) return;
-  if (owner && !['done', 'close', 'cleanup', 'human', 'blocked'].includes(owner.phase)) return;
+  if (owner && !['done', 'close', 'cleanup', 'human', 'blocked', 'recovery'].includes(owner.phase)) return;
   if (owner && s.jobs.some(j => j.ticket === owner.key && busy(j))) return;
   s.validationOwner = undefined;
   // 升级旧账本时先排空已有验证 actors，不能在它们运行时启动另一票的合并。
@@ -176,6 +193,7 @@ function dependencyReady(s: State, t: Ticket) {
 }
 function resetCandidate(t: Ticket, head: string, base: string, phase: Phase) {
   t.head = head; t.base = base; t.evidence = {}; t.epoch++; t.phase = phase; t.reason = '';
+  if (phase === 'integrate') t.integrationHead = undefined;
 }
 function problem(s: State, t: Ticket, signature: string, next: Phase) {
   t.round++; t.stalls = signature === t.lastProblem ? t.stalls + 1 : 0; t.lastProblem = signature; t.reason = signature;
@@ -242,7 +260,7 @@ function candidates(s: State): Candidate[] {
   admit(s);
   for (const t of s.tickets) {
     advanceGroups(s, t);
-    if (['done', 'human', 'blocked'].includes(t.phase)) continue;
+    if (['done', 'human', 'blocked', 'recovery'].includes(t.phase)) continue;
     if (validationPhases.includes(t.phase) && s.validationOwner !== t.key) continue;
     if (t.phase === 'claim' && !dependencyReady(s, t)) continue;
     if (t.phase === 'self') { out.push({ t, action: 'self-standards' }, { t, action: 'self-spec' }); continue; }
@@ -269,6 +287,7 @@ function candidates(s: State): Candidate[] {
   // 中途人工技术前置或外部依赖也可能使整张图暂无可运行节点。
   // 交给独立 L1 给出明确人工交接/阻断结论，不能空轮询或假定软件都完成。
   if (out.length === 0 && !s.jobs.some(busy)) {
+    if (s.tickets.some(t => t.phase === 'recovery')) return out;
     if (s.tickets.some(t=>t.reason==='waiting_ci' && s.facts.prs[t.pr]?.checks.some(c=>c.status==='pending'))) return out;
     if (!s.specAudit) out.push({ action: 'spec-audit' });
     else if (s.specAudit.status === 'complete' && s.facts.issueStates[String(s.spec)] !== 'CLOSED') out.push({ action: 'spec-close' });
@@ -346,7 +365,7 @@ export function submit(s: State, id: string, r: Result) {
     t.phase = 'blocked'; t.reason = 'stale'; event(s, `${j.action} 完成时版本已变，不能保留通过结论`); return;
   }
   if (t && !['claim', 'plan', 'plan-check', 'replan', 'cleanup', 'close'].includes(j.action)) {
-    ensure(r.base === j.base && !!r.head, '结果必须绑定派发时的 head/base');
+    ensure(!!r.base && !!r.head && (j.action === 'integrate' ? [j.base, s.facts.base].includes(r.base) : r.base === j.base), '结果必须绑定派发时或已观测的集成 head/base');
     if (!['implement', 'integrate'].includes(j.action)) ensure(r.head === j.head, '只读阶段不能更换候选 SHA');
   }
   const data = r.data || {};
@@ -365,21 +384,37 @@ export function submit(s: State, id: string, r: Result) {
       else problem(s, t, String(data.reason || '计划尚未满足验收'), 'plan'); break;
     case 'implement': case 'integrate':
       ensure(t, '缺少工单');
-      if (r.status === 'replan') { problem(s, t, String(data.reason || '实现边界改变'), 'replan'); break; }
+      if (r.status === 'replan') {
+        ensure(r.handoffPath && typeof data.reason === 'string' && data.reason.trim(), '重规划必须交接真实候选和原因');
+        problem(s, t, data.reason, 'replan');
+        t.head = r.head!; t.base = r.base!; t.pendingPushHead = r.head!;
+        if (j.action === 'integrate') t.integrationHead = r.head!;
+        break;
+      }
       ensure(r.status === 'implemented' && r.handoffPath, '代码修改后必须交接，再进行作者自检');
       resetCandidate(t, r.head!, r.base!, s.validationOwner === t.key ? 'self' : 'queued'); enqueue(s, t);
+      t.pendingPushHead = r.head!;
+      if (j.action === 'integrate') t.integrationHead = r.head!;
       if (data.visualEvidence) t.evidence.visual = { head: t.head, base: t.base, path: String(data.visualEvidence) }; break;
     case 'self-standards': case 'self-spec':
       ensure(t && Array.isArray(r.findings), '双轴自检必须分别返回完整 findings（允许空数组）'); advanceGroups(s, t); break;
     case 'verify':
       ensure(t, '缺少工单');
-      if (r.status === 'pass') { t.evidence.tests = evidence(); t.phase = 'publish'; }
+      if (r.status === 'pass') {
+        t.evidence.tests = { ...evidence(),
+          prHead: typeof data.prHead === 'string' ? data.prHead : null,
+          targetBase: typeof data.targetBase === 'string' ? data.targetBase : t.base,
+          testedHead: typeof data.testedHead === 'string' ? data.testedHead : t.head,
+          testedTree: typeof data.testedTree === 'string' ? data.testedTree : undefined,
+          integrationHead: t.integrationHead || null };
+        t.phase = 'publish';
+      }
       else problem(s, t, String(data.failureSignature || r.status), 'implement'); break;
     case 'publish':
       ensure(t && freshEvidence(t, 'tests') && freshEvidence(t, 'self'), '发布前需要同候选的自检与测试');
       ensure(!t.visual || freshEvidence(t, 'visual'), '适用视觉检查缺失');
       ensure(Number(data.pr) > 0 && data.commentUrl, '需要 PR 以及作者完成评论');
-      t.pr = Number(data.pr); t.phase = 'review'; t.epoch++; break;
+      t.pr = Number(data.pr); t.pendingPushHead = undefined; t.phase = 'review'; t.epoch++; break;
     case 'review-lens': ensure(Array.isArray(r.findings), '每一路审查必须明确返回 findings'); break;
     case 'confirm': case 'adjudicate':
       ensure(Array.isArray(r.findings) && r.findings.length === 1, '逐项独立核实必须返回一个问题');
@@ -455,7 +490,7 @@ export function reconcileFacts(s: State, facts: LiveFacts) {
   if (s.specAudit && s.specAudit.base !== facts.base) { s.specAudit = undefined; s.auditEpoch++; }
   for (const t of s.tickets) {
     if (t.phase === 'human' && facts.issueStates[String(t.number)] === 'CLOSED') t.phase = 'done';
-    if (['done', 'human', 'cleanup', 'close'].includes(t.phase) || s.jobs.some(j => j.ticket === t.key && busy(j))) continue;
+    if (['done', 'human', 'cleanup', 'close', 'recovery'].includes(t.phase) || s.jobs.some(j => j.ticket === t.key && busy(j))) continue;
     const p = facts.prs[String(t.pr)];
     if (p?.state === 'MERGED') {
       const intended = s.jobs.some(j => j.ticket === t.key && j.action === 'merge' && j.head === p.head && j.nativeId);
@@ -465,8 +500,10 @@ export function reconcileFacts(s: State, facts: LiveFacts) {
       t.phase = t.closeout ? 'done' : facts.issueStates[String(t.number)] === 'CLOSED' ? 'cleanup' : 'close'; continue;
     }
     if (p?.state === 'CLOSED') { t.phase = 'blocked'; t.reason = 'PR 已关闭但未合并，保留资源'; continue; }
-    if (p && p.head !== t.head && (['review', 'fresh', 'accept', 'merge'].includes(t.phase) || t.reason === 'stale')) {
-      resetCandidate(t, p.head, facts.base, 'integrate'); t.reason = '已发布候选被外部更新；先同步再验证';
+    if (p && p.head !== t.head && t.pendingPushHead !== t.head &&
+        (['review', 'fresh', 'accept', 'merge'].includes(t.phase) || t.reason === 'stale')) {
+      resetCandidate(t, p.head, facts.base, 'integrate'); t.pendingPushHead = undefined;
+      t.reason = '已发布候选被外部更新；先同步再验证';
     }
     else if (t.base !== facts.base) {
       if (!t.worktree) { resetCandidate(t, t.head, facts.base, 'claim'); }

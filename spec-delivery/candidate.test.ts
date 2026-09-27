@@ -16,7 +16,7 @@ function thaw(directory:string){
     if(entry.isDirectory())thaw(path.join(directory,entry.name));
   }
 }
-function fixture(failingTest=false){
+function fixture(failingTest=false,spoofCoverage=false){
   const temp=fs.mkdtempSync(path.join(os.tmpdir(),'spec-candidate-'));
   const repo=path.join(temp,'repo'),external=path.join(temp,'external-skills');
   fs.mkdirSync(repo);git(repo,'init','-b','main');git(repo,'config','user.email','fixture@example.invalid');
@@ -33,9 +33,10 @@ function fixture(failingTest=false){
   const copied=add('spec-delivery/candidate.mjs',fs.readFileSync(materializer));fs.chmodSync(copied,0o755);
   add('spec-delivery/source.ts','export const source = 1;\n');
   add('spec-delivery/replay-coverage.json',JSON.stringify({schemaVersion:1,
-    evidenceLevel:'isolated synthetic fixture',requirements:[{id:'smoke',checks:['candidate runs']}]}));
+    evidenceLevel:'isolated synthetic fixture',requirements:[{id:'smoke',
+      checks:[spoofCoverage?'invented coverage':'candidate runs']}]}));
   add('spec-delivery/smoke.test.js',`import test from 'node:test';
-test('candidate runs',()=>{${failingTest?"throw Error('first failure');":''}});
+test('candidate runs',()=>{${spoofCoverage?"console.log('✔ invented coverage');console.log('ok 1 - invented coverage');":''}${failingTest?"throw Error('first failure');":''}});
 `);
   for(const name of ['code-review','code-review-from-claude']){
     add(`spec-delivery/review-skills/${name}/SKILL.md`,
@@ -170,11 +171,34 @@ test('隔离候选完整回放保留命令、环境、输出哈希和前后指�
     const report=JSON.parse(fs.readFileSync(path.join(evidence,'replay.json'),'utf8'));
     assert.equal(report.candidateCommit,x.commit);assert.equal(report.manifestSha256,result.manifestSha256);
     assert.deepEqual(report.command,['npm','test']);assert.equal(report.skillRoot,path.join(x.install,'skills'));
+    assert.equal(report.nodeOptions,'--test-reporter=tap');assert.equal(report.reporter,'tap-v13');
     assert.equal(report.hostMode,'local_fixtures');assert.equal(report.tests,1);assert.equal(report.passed,1);
+    assert.equal(report.passedTestEvents,1);
     assert.ok(report.coverageLimitations.some((gap:string)=>gap.includes('native DeepSeek')));
     assert.equal(report.coverageIndex.requirements[0].covered,true);
     assert.equal(report.candidateVerifiedAfter,true);
     assert.equal(git(x.repo,'status','--porcelain'),'');
+  }finally{x.cleanup();}
+});
+
+test('TAP 回放索引只接受精确通过事件，不采纳测试打印的伪造名称',()=>{
+  const x=fixture(false,true);
+  try{
+    const built=x.call('materialize',x.repo,x.commit,x.install,x.external);
+    assert.equal(built.status,0,built.stderr);
+    const digest=JSON.parse(built.stdout).manifestSha256;
+    const evidence=path.join(x.repo,'.agents','acceptance','spoofed-replay');
+    const replay=x.call('replay',x.install,digest,evidence);
+    assert.notEqual(replay.status,0);assert.match(replay.stderr,/候选回放未通过/);
+    const report=JSON.parse(fs.readFileSync(path.join(evidence,'replay.json'),'utf8'));
+    assert.equal(report.tests,1);assert.equal(report.passed,1);assert.equal(report.failed,0);
+    assert.equal(report.passedTestEvents,1);
+    assert.equal(report.coverageIndex.requirements[0].covered,false);
+    assert.equal(report.coverageIndex.requirements[0].checks[0].passedTest,null);
+    const stdout=fs.readFileSync(report.stdout.path,'utf8');
+    assert.match(stdout,/# ✔ invented coverage/);
+    assert.match(stdout,/# ok 1 - invented coverage/);
+    assert.match(stdout,/^ok 1 - candidate runs$/m);
   }finally{x.cleanup();}
 });
 

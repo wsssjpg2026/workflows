@@ -70,13 +70,16 @@ if (argv[0]==='repo' && argv[1]==='view') {
   const head=execFileSync('git',['-C',db.repo,'rev-parse',input.head],{encoding:'utf8'}).trim();
   if (!head) throw Error('unknown PR branch '+input.head);
   db.prs[number]={number,head,base:db.base,headRef:input.head,state:'OPEN',body:input.body};
+  if(db.loseCreateResponse){db.loseCreateResponse=false;db.lostCreateResponses++;save();process.exit(1);}
   save();json({number});
 } else if (argv.includes('--method') && argv.includes('POST') && /\/issues\/\d+\/comments$/.test(endpoint)) {
   const number=numberFrom(/\/issues\/(\d+)\/comments$/);
   const body=JSON.parse(fs.readFileSync(0,'utf8')).body;
   const rows=db.comments[number] ||= [];
   const result={html_url:'https://github.com/example/test/issues/'+number+'#issuecomment-'+(rows.length+1),body};
-  rows.push(result);save();json(result);
+  rows.push(result);
+  if(db.loseCommentResponse){db.loseCommentResponse=false;db.lostCommentResponses++;save();process.exit(1);}
+  save();json(result);
 } else if (endpoint.endsWith('/git/ref/heads/main')) {
   json({ref:'refs/heads/main',object:{type:'commit',sha:db.base}});
 } else if (/\/issues\/\d+\/sub_issues\?/.test(endpoint)) {

@@ -243,12 +243,15 @@ test('确认命令进程树已停止后可取消并退役，无须重新执行�
 });
 test('公开 CLI 创建 PR 与完成评论遇响应丢失后按稳定操作标记对账',()=>{
   const x=setup();try {
+    // This focused operation-intent fixture predates bound author reviews; the
+    // full v3 replay above proves the same lost-response path with live review.
     const remote=deliveryRemote(x,{state:'OPEN'});remote.update({loseCreate:true,loseComment:true});
     x.s.jobs=[];x.t.phase='publish';x.s.validationOwner=x.t.key;
     x.t.evidence.self={head:x.head,base:x.head,path:path.join(x.root,'evidence.md')};
     x.t.evidence.tests={head:x.head,base:x.head,path:path.join(x.root,'evidence.md'),
       testedHead:x.head,testedTree:git(x.root,'rev-parse','HEAD^{tree}'),targetBase:x.head};
-    const j=e.reserve(x.s)[0];j.nativeId='native-publisher';j.status='running';fs.writeFileSync(x.statePath,JSON.stringify(x.s));
+    const j=e.reserve(x.s)[0];j.nativeId='native-publisher';j.status='running';
+    delete x.s.v3!.skillBindings;fs.writeFileSync(x.statePath,JSON.stringify(x.s));
     const body=path.join(x.run,'body.md'),completion=path.join(x.run,'completion.md'),request=path.join(x.run,'publish-request.json');
     fs.writeFileSync(body,'Implements issue criteria.');fs.writeFileSync(completion,'Author checks complete.');
     fs.writeFileSync(request,JSON.stringify({title:'Deliver task',bodyPath:body,completionPath:completion}));
@@ -298,7 +301,8 @@ test('PR 创建请求是否生效未知且远端未出现时，不重发同一�
     x.s.jobs=[];x.t.phase='publish';x.s.validationOwner=x.t.key;
     x.t.evidence.self={head:x.head,base:x.head,path:path.join(x.root,'evidence.md')};
     x.t.evidence.tests={head:x.head,base:x.head,path:path.join(x.root,'evidence.md')};
-    const j=e.reserve(x.s)[0];j.nativeId='native-publisher';j.status='running';fs.writeFileSync(x.statePath,JSON.stringify(x.s));
+    const j=e.reserve(x.s)[0];j.nativeId='native-publisher';j.status='running';
+    delete x.s.v3!.skillBindings;fs.writeFileSync(x.statePath,JSON.stringify(x.s));
     const body=path.join(x.run,'body.md'),completion=path.join(x.run,'completion.md'),request=path.join(x.run,'request.json');
     fs.writeFileSync(body,'body');fs.writeFileSync(completion,'completion');
     fs.writeFileSync(request,JSON.stringify({title:'PR',bodyPath:body,completionPath:completion}));

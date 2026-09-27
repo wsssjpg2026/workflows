@@ -268,6 +268,9 @@ function replay(installInput,expectedSha,outputInput){
     'SPEC_DELIVERY_MAIN_OBSERVER','SPEC_DELIVERY_SKILL_OBSERVER',
     'SPEC_DELIVERY_MIGRATION_OBSERVER',
     'NODE_TEST_CONTEXT'])delete env[key];
+  // npm test remains the tested command. Node's TAP reporter prefixes console
+  // output with "#", so only runner result records can satisfy the index.
+  env.NODE_OPTIONS='--test-reporter=tap';
   const startedAt=new Date().toISOString(),start=Date.now();
   const testRun=spawnSync('npm',['test'],{cwd:before.installPath,env,encoding:'utf8',
     timeout:15*60*1000,maxBuffer:64*1024*1024});
@@ -278,13 +281,17 @@ function replay(installInput,expectedSha,outputInput){
   const coverageIndex=JSON.parse(fs.readFileSync(coveragePath,'utf8'));
   ensure(coverageIndex.schemaVersion===1&&Array.isArray(coverageIndex.requirements)&&
     coverageIndex.requirements.length>0,'候选回放覆盖索引无效');
-  const passedNames=(testRun.stdout||'').split('\n').filter(line=>line.startsWith('✔ '));
+  const stdoutText=testRun.stdout||'',lines=stdoutText.split('\n');
+  const tapVersion=lines.includes('TAP version 13');
+  const passedNames=lines.map(line=>line.match(/^ok [1-9]\d* - (.+)$/)?.[1])
+    .filter(name=>name&&!/ # (?:SKIP|TODO)(?:\s|$)/.test(name));
+  const tapCount=label=>Number(lines.find(line=>line.startsWith(`# ${label} `))?.slice(label.length+3)||0);
   const coverage=coverageIndex.requirements.map(requirement=>{
     ensure(typeof requirement.id==='string'&&Array.isArray(requirement.checks)&&
       requirement.checks.length>0,'候选回放覆盖要求无效');
     const checks=requirement.checks.map(fragment=>{
       ensure(typeof fragment==='string'&&fragment.trim(),'候选回放测试名称无效');
-      return {testIncludes:fragment,passedTest:passedNames.find(name=>name.includes(fragment))||null};
+      return {testName:fragment,passedTest:passedNames.includes(fragment)?fragment:null};
     });
     return {id:requirement.id,checks,covered:checks.every(check=>check.passedTest)};
   });
@@ -293,7 +300,8 @@ function replay(installInput,expectedSha,outputInput){
   catch(error){afterError=error.message;}
   const summary={schemaVersion:1,candidateCommit:before.candidateCommit,
     manifestSha256:expectedSha,workflowVersion:before.workflowVersion,
-    command:['npm','test'],cwd:before.installPath,skillRoot:env.SPEC_DELIVERY_SKILL_ROOT,
+    command:['npm','test'],nodeOptions:env.NODE_OPTIONS,reporter:'tap-v13',
+    cwd:before.installPath,skillRoot:env.SPEC_DELIVERY_SKILL_ROOT,
     hostMode:'local_fixtures',coverageLimitations:[
       'No full native DeepSeek/Codex/ZCode software round',
       'Single-ledger v3 replay delivers issue 101; parallel 102 remains active and dependent 103 remains blocked',
@@ -306,18 +314,16 @@ function replay(installInput,expectedSha,outputInput){
     environment:{node:process.version,npm:toolVersion('npm',['--version']),
       git:toolVersion('git',['--version']),platform:process.platform,arch:process.arch},
     exitCode:testRun.status,signal:testRun.signal,error:testRun.error?.message||null,
-    tests:Number((testRun.stdout||'').match(/ℹ tests (\d+)/)?.[1]||0),
-    passed:Number((testRun.stdout||'').match(/ℹ pass (\d+)/)?.[1]||0),
-    failed:Number((testRun.stdout||'').match(/ℹ fail (\d+)/)?.[1]||0),
-    skipped:Number((testRun.stdout||'').match(/ℹ skipped (\d+)/)?.[1]||0),
-    cancelled:Number((testRun.stdout||'').match(/ℹ cancelled (\d+)/)?.[1]||0),
-    todo:Number((testRun.stdout||'').match(/ℹ todo (\d+)/)?.[1]||0),
+    tests:tapCount('tests'),passed:tapCount('pass'),failed:tapCount('fail'),
+    skipped:tapCount('skipped'),cancelled:tapCount('cancelled'),todo:tapCount('todo'),
+    tapVersion,passedTestEvents:passedNames.length,
     candidateVerifiedBefore:true,candidateVerifiedAfter:afterVerified,afterError,
     stdout:{path:stdoutPath,sha256:sha(fs.readFileSync(stdoutPath))},
     stderr:{path:stderrPath,sha256:sha(fs.readFileSync(stderrPath))}};
   const summaryPath=path.join(output,'replay.json');
   fs.writeFileSync(summaryPath,JSON.stringify(summary,null,2)+'\n',{mode:0o600});
-  ensure(testRun.status===0&&afterVerified&&summary.tests>0&&summary.failed===0&&
+  ensure(testRun.status===0&&afterVerified&&tapVersion&&summary.tests>0&&
+    summary.passedTestEvents===summary.passed&&summary.failed===0&&
     summary.skipped===0&&summary.cancelled===0&&summary.todo===0&&summary.passed===summary.tests&&
     coverage.every(requirement=>requirement.covered),
     `候选回放未通过；原始结果和校验记录：${summaryPath}`);

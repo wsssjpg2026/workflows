@@ -1671,7 +1671,8 @@ test('单账本 v3 组合回放：依赖、并行实现、独立审查、补充�
     const remotePath=path.join(x.temp,'combined-remote.json');
     fs.writeFileSync(remotePath,JSON.stringify({repo:x.root,bare:path.join(x.temp,'origin.git'),
       base:x.head,issues:{100:'OPEN',101:'OPEN',102:'OPEN',103:'OPEN'},
-      prs:{},comments:{},nextPr:201,checkByHead:{},trees:{}}));
+      prs:{},comments:{},nextPr:201,checkByHead:{},trees:{},
+      loseCreateResponse:true,loseCommentResponse:true,lostCreateResponses:0,lostCommentResponses:0}));
     const hostPath=path.join(x.temp,'combined-host.json');
     fs.writeFileSync(hostPath,JSON.stringify({actors:{},starts:0}));
     for(const [fixtureName,targetName] of [
@@ -1832,7 +1833,19 @@ test('单账本 v3 组合回放：依赖、并行实现、独立审查、补充�
     const publishRequest=file('combined-publish-request.json',
       {title:'Complete task 101',bodyPath:file('combined-pr-body.md','Reviewed implementation'),
         completionPath:file('combined-completion.md','Checks and author review passed')});
+    const originalChecks=fs.readFileSync(primary.checksPath);
+    fs.writeFileSync(primary.checksPath,Buffer.concat([originalChecks,Buffer.from('\nchanged after author review\n')]));
+    const stalePublish=x.directCall('publish-pr',statePath,publishedJob.id,publishRequest);
+    assert.notEqual(stalePublish.status,0);
+    assert.match(stalePublish.stderr,/作者自检候选|计划检查范围/);
+    assert.equal(remote().nextPr,201,'来源漂移时不得创建 PR');
+    assert.equal(remote().comments[201]?.length || 0,0,'来源漂移时不得发布完成评论');
+    fs.writeFileSync(primary.checksPath,originalChecks);
     const publishResult=call('publish-pr',statePath,publishedJob.id,publishRequest);
+    assert.equal(remote().lostCreateResponses,1,'PR 写入后丢失响应应按原始标记找回');
+    assert.equal(remote().lostCommentResponses,1,'评论写入后丢失响应应按固定内容找回');
+    assert.equal(remote().nextPr,202);
+    assert.equal(remote().comments[201].length,1);
     finish(publishedJob,publishResult);
     assert.equal(state().tickets.find(value=>value.number===101)?.phase,'review');
     const reviewRound=(phase:'review'|'fresh',blocking:boolean)=>{
@@ -1898,10 +1911,19 @@ test('单账本 v3 组合回放：依赖、并行实现、独立审查、补充�
       value.trees[finalHead]=git(finalTicket.worktree,'rev-parse','HEAD^{tree}');
     });
     const republish=by(next(),101,'publish');dispatch(republish);
-    const republishResult=call('publish-pr',statePath,republish.id,
-      file('combined-republish-request.json',{title:'Complete revised task 101',
-        bodyPath:file('combined-republish-body.md','Revised implementation'),
-        completionPath:file('combined-republish-completion.md','Gap fixed and retested')}));
+    const republishRequest=file('combined-republish-request.json',{title:'Complete revised task 101',
+      bodyPath:file('combined-republish-body.md','Revised implementation'),
+      completionPath:file('combined-republish-completion.md','Gap fixed and retested')});
+    const originalPrBody=remote().prs[201].body;
+    const beforeCommentCount=remote().comments[201].length;
+    updateRemote(value=>{value.prs[201].body='Original ownership marker removed';});
+    const unowned=x.directCall('publish-pr',statePath,republish.id,republishRequest);
+    assert.notEqual(unowned.status,0);
+    assert.match(unowned.stderr,/归属标记|operation marker/);
+    assert.equal(remote().comments[201].length,beforeCommentCount,'失去原始 PR 标记时不得发布新完成评论');
+    assert.equal(remote().nextPr,202,'失去归属标记时不得新建 PR');
+    updateRemote(value=>{value.prs[201].body=originalPrBody;});
+    const republishResult=call('publish-pr',statePath,republish.id,republishRequest);
     assert.equal(republishResult.data.pr,201,'修复候选复用现有 PR 身份');
     finish(republish,republishResult);
     reviewRound('review',false);reviewRound('fresh',false);

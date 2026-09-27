@@ -1344,10 +1344,23 @@ function publishPr(statePath:string,jobId:string,request:{title:string;bodyPath:
   engine.ensure(t.phase==='publish'&&t.epoch===j.epoch&&t.head===j.head&&t.base===j.base&&
     engine.freshEvidence(t,'tests')&&engine.freshEvidence(t,'self')&&
     localHead(t)===t.head&&clean(t),'发布意图的候选或测试证据已过期');
+  if(s.v3?.skillBindings)requireCurrentAuthorReview(s,t);
   engine.ensure(gh.targetHead(s.repo,s.inputs.targetBranch)===t.base,'目标分支已变化，先集成并重审');
   engine.ensure(request.title?.trim(),'PR 需要标题');
   const body=fs.readFileSync(safeFile(request.bodyPath),'utf8');
   const completion=fs.readFileSync(safeFile(request.completionPath),'utf8');
+  // A revised candidate may use the same PR, but the original publish intent
+  // remains its ownership proof. A ledger PR number alone is insufficient.
+  if(t.pr>0) {
+    const original=s.jobs.find(previous=>previous.ticket===t.key&&previous.action==='publish'&&
+      previous.status==='done'&&previous.result?.status==='published'&&
+      previous.result.data?.pr===t.pr&&
+      previous.result.data.operationId===`publish:${sha(previous.id).slice(0,24)}`);
+    engine.ensure(original,'复用 PR 缺少原始发布操作记录');
+    const originalMarker=`<!-- spec-delivery:${s.id}:${t.key}:pr:${original.result!.data!.operationId} -->`;
+    engine.ensure(gh.pullRequestWithMarker(s.repo,t.branch,s.inputs.targetBranch,originalMarker)===t.pr,
+      '原 PR 已失去固定归属标记；不能发布新完成评论');
+  }
   const intent=operationIntent(statePath,j,'publish',{head:t.head,base:t.base,branch:t.branch,
     title:request.title,bodySha256:sha(body),completionSha256:sha(completion)});
   const prMarker=`<!-- spec-delivery:${s.id}:${t.key}:pr:${intent.operationId} -->`;

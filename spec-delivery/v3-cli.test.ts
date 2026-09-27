@@ -401,7 +401,8 @@ const home=process.env.DSH_HOME,id='session-'+path.basename(home).slice(0,16);
 const dir=path.join(home,'sessions','--bootstrap--',id);fs.mkdirSync(dir,{recursive:true});
 const at=Date.now(),events=[{type:'session',id,createdAt:at,cwd:process.cwd()},
 {type:'assistant/message',seq:1,time:at+1,data:{message:{source:{kind:'model',provider:'fixture',model:'large'},
-content:[{type:'text',text:process.env.BOOTSTRAP_PLAN}]},usage:{inputTokens:5,outputTokens:10}}}];
+content:[{type:'text',text:process.env.BOOTSTRAP_PLAN}]},usage:{inputTokens:5,outputTokens:10}}},
+{type:'turn/end',seq:2,time:at+2}];
 const plain=path.join(dir,'events.jsonl');fs.writeFileSync(plain,events.map(e=>JSON.stringify(e)).join('\\n')+'\\n');
 const zipped=spawnSync(${JSON.stringify(zstd)},['-q','-f',plain,'-o',path.join(dir,'session.v3.jsonl.zstd')]);
 if(zipped.status!==0)process.exit(2);

@@ -21,17 +21,27 @@ import fs from 'node:fs';import path from 'node:path';import {spawnSync} from 'n
 if(process.argv.includes('--version')){console.log('fake-dsh 1.0');process.exit(0);}
 const home=process.env.DSH_HOME,id='session-'+path.basename(home).slice(0,16);
 fs.appendFileSync(${JSON.stringify(starts)},id+'\\n');
+const prompt=process.argv.at(-1),resultPath=JSON.parse(prompt.match(/^Result path: (.+)$/m)?.[1]||'null');
+fs.writeFileSync(path.join(home,'prompt.txt'),prompt);
 const dir=path.join(home,'sessions','--fixture--',id);fs.mkdirSync(dir,{recursive:true});
 const now=Date.now();const event=[
   {type:'session',id,createdAt:now,cwd:process.cwd()},
   {type:'assistant/message',seq:1,time:now+1,data:{message:{role:'assistant',source:{kind:'model',provider:process.env.FAKE_PROVIDER,model:process.env.FAKE_MODEL},
     content:[{type:'text',text:process.env.FAKE_FINAL_JSON}]},usage:{inputTokens:11,outputTokens:7,totalTokens:18,cachedInputTokens:3}}},
+  {type:'turn/end',seq:2,time:now+2},
 ];
+if(process.env.FAKE_NO_TURN_END==='1')event.pop();
 const plain=path.join(dir,'events.jsonl');fs.writeFileSync(plain,event.map(x=>JSON.stringify(x)).join('\\n')+'\\n');
 const zip=spawnSync(${JSON.stringify(zstd)},['-q','-f',plain,'-o',path.join(dir,'session.v3.jsonl.zstd')]);
 if(zip.status!==0)process.exit(3);
+if(resultPath&&process.env.FAKE_WRITE_RESULT!=='0'){
+  fs.mkdirSync(path.dirname(resultPath),{recursive:true});
+  if(process.env.FAKE_RESULT_LINK)fs.symlinkSync(process.env.FAKE_RESULT_LINK,resultPath);
+  else fs.writeFileSync(resultPath,process.env.FAKE_RESULT_BYTES??process.env.FAKE_FINAL_JSON);
+}
 await new Promise(resolve=>setTimeout(resolve,Number(process.env.FAKE_HOLD_MS||0)));
 console.log(process.env.FAKE_FINAL_JSON);
+process.exit(Number(process.env.FAKE_EXIT_CODE||0));
 `);
   fs.chmodSync(fake,0o755);
   const settings=path.join(root,'settings.yaml');fs.writeFileSync(settings,'agent-default-model: fixture\n');
@@ -52,13 +62,14 @@ console.log(process.env.FAKE_FINAL_JSON);
   }
   function dispatch(token:string){
     const packetPath=path.join(stateDir,`${token}.packet.json`),outputDirectory=path.join(stateDir,'output',token);
+    const resultPath=path.join(outputDirectory,'result.json');
     fs.writeFileSync(packetPath,JSON.stringify({jobId:`job-${token}`,model:'fixture/model',executor:'agent',
-      dispatchToken:token,repo:{root},worktree:root,outputDirectory,
+      dispatchToken:token,repo:{root},worktree:root,outputDirectory,resultPath,
       adapterProbeTask:'Return exactly the configured probe Result JSON.'}));
     const requestPath=path.join(stateDir,`${token}.request.json`);
     fs.writeFileSync(requestPath,JSON.stringify({token,jobId:`job-${token}`,attempt:1,targetHost:'fixture-dsh',
       requestedModel:'fixture/model',packetPath}));
-    return {requestPath,packetPath,outputDirectory};
+    return {requestPath,packetPath,outputDirectory,resultPath};
   }
   function bootstrap(token:string){
     const promptPath=path.join(root,`${token}.prompt.txt`),requestPath=path.join(root,`${token}.bootstrap.json`);
@@ -100,6 +111,84 @@ test('统一宿主契约：token 先查、启动后同身份查询、逐项收�
     const probe=x.ok('probe');
     assert.equal(probe.routes[0].nativeRouteVerified,false,'只读探测不能冒充真实路由验证');
     assert.equal(probe.capabilities.nativeResume,false);
+  }finally{x.cleanup();}
+});
+
+test('指定结果文件只在真实终态后交付；最终消息保留为非权威原文',()=>{
+  const x=fixture();
+  try{
+    const {requestPath,resultPath}=x.dispatch('file-terminal');
+    const raw=JSON.stringify({complete:true,status:'completed',evidencePath:path.join(x.root,'evidence.md')});
+    const finalText='Work finished. Result is in the designated file.';
+    const started=x.ok('host',['start',requestPath],{env:{FAKE_FINAL_JSON:finalText,
+      FAKE_RESULT_BYTES:raw,FAKE_HOLD_MS:'1500'}});
+    assert.equal(started.state,'running');
+    until(()=>fs.existsSync(resultPath),Boolean);
+    assert.equal(x.ok('host',['query',requestPath]).state,'running',
+      'an early result file cannot establish native completion');
+    const complete=until(()=>x.ok('host',['collect',requestPath]),r=>r.state==='completed');
+    assert.equal(complete.resultFile,'result.json');
+    assert.equal(fs.readFileSync(resultPath,'utf8'),raw);
+    const home=path.join(x.runtime,'runs',sha('file-terminal').slice(0,32));
+    assert.equal(fs.readFileSync(path.join(home,'native-final.txt'),'utf8'),finalText);
+    assert.ok(fs.readFileSync(path.join(home,'prompt.txt'),'utf8').includes(
+      `Result path: ${JSON.stringify(resultPath)}`));
+    const finished=JSON.parse(fs.readFileSync(path.join(home,'finished.json'),'utf8'));
+    assert.equal(finished.resultSha256,sha(raw));
+    assert.equal(finished.rawSha256,sha(finalText));
+  }finally{x.cleanup();}
+});
+
+test('原生失败、缺失和预存结果文件均不能冒充完成',()=>{
+  const x=fixture();
+  try{
+    const failed=x.dispatch('native-failed');
+    x.ok('host',['start',failed.requestPath],{env:{FAKE_EXIT_CODE:'7'}});
+    const failedHome=path.join(x.runtime,'runs',sha('native-failed').slice(0,32));
+    until(()=>fs.existsSync(path.join(failedHome,'finished.json')),Boolean);
+    assert.ok(fs.existsSync(failed.resultPath));
+    assert.equal(x.ok('host',['collect',failed.requestPath]).state,'unknown');
+    assert.equal(x.ok('host',['start',failed.requestPath]).state,'unknown');
+    const missing=x.dispatch('missing-result');
+    x.ok('host',['start',missing.requestPath],{env:{FAKE_WRITE_RESULT:'0'}});
+    const missingHome=path.join(x.runtime,'runs',sha('missing-result').slice(0,32));
+    until(()=>fs.existsSync(path.join(missingHome,'finished.json')),Boolean);
+    assert.equal(x.ok('host',['collect',missing.requestPath]).state,'unknown');
+    const unterminated=x.dispatch('no-turn-end');
+    x.ok('host',['start',unterminated.requestPath],{env:{FAKE_NO_TURN_END:'1'}});
+    const unterminatedHome=path.join(x.runtime,'runs',sha('no-turn-end').slice(0,32));
+    until(()=>fs.existsSync(path.join(unterminatedHome,'finished.json')),Boolean);
+    assert.ok(fs.existsSync(unterminated.resultPath));
+    assert.equal(x.ok('host',['collect',unterminated.requestPath]).state,'unknown');
+    const stale=x.dispatch('stale-result');
+    fs.mkdirSync(stale.outputDirectory,{recursive:true});
+    fs.writeFileSync(stale.resultPath,'{"complete":true}');
+    assert.equal(x.ok('host',['start',stale.requestPath]).state,'unknown');
+    assert.equal(x.ok('host',['collect',stale.requestPath]).state,'unknown');
+    assert.equal(fs.readFileSync(x.starts,'utf8').trim().split('\n').length,3,
+      'stale bytes must stop launch before another native actor');
+  }finally{x.cleanup();}
+});
+
+test('格式错误的指定文件保留原字节；终态后篡改或软链接不再交付',()=>{
+  const x=fixture();
+  try{
+    const malformed=x.dispatch('malformed-file');
+    const raw='```json\n{"complete":true}\n```';
+    x.ok('host',['start',malformed.requestPath],{env:{FAKE_RESULT_BYTES:raw}});
+    const complete=until(()=>x.ok('host',['collect',malformed.requestPath]),r=>r.state==='completed');
+    assert.equal(complete.resultFile,'result.json');
+    assert.equal(fs.readFileSync(malformed.resultPath,'utf8'),raw,
+      'adapter must leave JSON/schema validation and raw archiving to the workflow');
+    fs.appendFileSync(malformed.resultPath,'\nchanged');
+    const changed=x.ok('host',['collect',malformed.requestPath]);
+    assert.equal(changed.state,'unknown');assert.match(changed.reason,/changed/);
+    const linked=x.dispatch('linked-file'),outside=path.join(x.root,'outside.json');
+    fs.writeFileSync(outside,'{"complete":true}');
+    x.ok('host',['start',linked.requestPath],{env:{FAKE_RESULT_LINK:outside}});
+    const linkedHome=path.join(x.runtime,'runs',sha('linked-file').slice(0,32));
+    until(()=>fs.existsSync(path.join(linkedHome,'finished.json')),Boolean);
+    assert.equal(x.ok('host',['collect',linked.requestPath]).state,'unknown');
   }finally{x.cleanup();}
 });
 

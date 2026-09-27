@@ -60,11 +60,12 @@ function request(c,file){
     typeof r.requestedModel==='string'&&path.isAbsolute(r.packetPath),'派发请求与宿主配置不符');
   const route=c.routes.find(x=>x.requestedModel===r.requestedModel);
   assert(route,'请求模型不在已配置路由中');
-  const packet=read(r.packetPath);
+  const packetBytes=fs.readFileSync(r.packetPath),packet=JSON.parse(packetBytes.toString('utf8'));
   assert(packet.jobId===r.jobId&&packet.model===r.requestedModel&&packet.dispatchToken===r.token&&
-    (packet.executor==='agent'||packet.action==='repair-receipt')&&path.isAbsolute(packet.outputDirectory),
+    (packet.executor==='agent'||packet.action==='repair-receipt')&&path.isAbsolute(packet.outputDirectory)&&
+    path.isAbsolute(packet.resultPath)&&packet.resultPath===path.join(packet.outputDirectory,'result.json'),
     '派发 packet 与持久请求不符');
-  return {r,route,packet,digest:sha(raw)};
+  return {r,route,packet,packetDigest:sha(packetBytes),digest:sha(raw)};
 }
 const runId=token=>sha(token).slice(0,32);
 const homeFor=(c,token)=>path.join(c.runtimeRoot,'runs',runId(token));
@@ -76,6 +77,8 @@ function manifest(c,r,digest,kind='host'){
   const m=read(file);
   assert((m.kind||'host')===kind&&m.token===r.token&&m.jobId===r.jobId&&m.targetHost===r.targetHost&&
     m.requestDigest===digest&&m.requestedModel===r.requestedModel,'token 已关联另一派发请求');
+  if(kind==='host')assert(sha(fs.readFileSync(m.packetPath))===m.packetDigest,
+    '已派发 packet 字节发生变化');
   return {...m,home};
 }
 function bootstrapRequest(c,file){
@@ -131,6 +134,21 @@ function uniqueSession(c,home){
   const observation=observeLog(c,logs[0]);
   return {session:logs[0],observation,ambiguity:0};
 }
+function entryExists(file){
+  try{fs.lstatSync(file);return true;}
+  catch(error){if(error.code==='ENOENT')return false;throw error;}
+}
+function resultBytes(m){
+  const file=m.resultPath;
+  if(typeof file!=='string'||path.basename(file)!=='result.json'||
+    path.dirname(file)!==m.outputDirectory)return null;
+  try{
+    const output=fs.realpathSync(m.outputDirectory),stat=fs.lstatSync(file);
+    if(output!==m.outputDirectory||!stat.isFile()||stat.isSymbolicLink()||
+      fs.realpathSync(file)!==file)return null;
+    return fs.readFileSync(file);
+  }catch{return null;}
+}
 function groupAlive(pid){
   if(!Number.isSafeInteger(pid)||pid<=0)return false;
   if(fs.existsSync('/proc')){
@@ -162,8 +180,27 @@ function hostReply(c,r,digest,operation,kind='host'){
   const fields={...base,nativeId,startedAt:new Date(observation.origin.createdAt).toISOString(),usage};
   if(cancelled)return {...fields,state:'cancelled',cancelledAt:cancelled.at};
   if(finished){
+    if(finished.exitCode!==0||finished.signal||finished.spawnError||finished.timedOut||
+      !observation.completeFrame||!observation.turnEnded)
+      return {...fields,state:'unknown',reason:'native task did not reach a successful terminal event'};
+    let evidenceMatches=false;
+    try{evidenceMatches=sha(fs.readFileSync(session.log))===finished.sessionLogSha256&&
+      sha(observation.finalText)===finished.rawSha256&&
+      sha(fs.readFileSync(path.join(m.home,'native-final.txt')))===finished.rawSha256;}
+    catch{/* missing native evidence remains unknown */}
+    if(!evidenceMatches)
+      return {...fields,state:'unknown',reason:'native final/session evidence changed'};
+    const route=m.kind==='bootstrap'?{provider:m.routeProvider,model:m.routeModel}:
+      c.routes[m.routeIndex];
+    if(!route||observation.source.provider!==route.provider||observation.source.model!==route.model)
+      return {...fields,state:'unknown',reason:'native route does not match the dispatched model'};
     const resultFile=finished.resultFile;
     if(!resultFile)return {...fields,state:'unknown',reason:'native task finished without a durable final message'};
+    if((m.kind||'host')==='host'){
+      const bytes=resultBytes(m);
+      if(resultFile!=='result.json'||!bytes||sha(bytes)!==finished.resultSha256)
+        return {...fields,state:'unknown',reason:'designated result file is missing or changed'};
+    }
     return {...fields,state:'completed',completedAt:finished.at,resultFile};
   }
   const launchPath=path.join(m.home,'launch.json');
@@ -173,7 +210,7 @@ function hostReply(c,r,digest,operation,kind='host'){
   return {...fields,state:'running'};
 }
 function start(c,configPath,file){
-  const {r,route,packet,digest}=request(c,file),base={token:r.token,jobId:r.jobId,targetHost:r.targetHost};
+  const {r,route,packet,packetDigest,digest}=request(c,file),base={token:r.token,jobId:r.jobId,targetHost:r.targetHost};
   const existing=manifest(c,r,digest);
   if(existing)return hostReply(c,r,digest,'start');
   const home=homeFor(c,r.token);
@@ -181,18 +218,22 @@ function start(c,configPath,file){
   try{fs.mkdirSync(home,{mode:0o700});}catch(error){if(error.code!=='EEXIST')throw error;return hostReply(c,r,digest,'start');}
   syncDir(path.dirname(home));
   atomic(path.join(home,'manifest.json'),{...base,requestedModel:r.requestedModel,requestDigest:digest,
-    packetPath:r.packetPath,outputDirectory:packet.outputDirectory,startedAt:now(),routeIndex:c.routes.indexOf(route)});
+    packetPath:r.packetPath,packetDigest,outputDirectory:packet.outputDirectory,
+    resultPath:packet.resultPath,startedAt:now(),routeIndex:c.routes.indexOf(route)});
   const child=spawn(process.execPath,[self,'worker',path.resolve(configPath),home],{
     detached:true,stdio:'ignore',env:{...process.env,DSH_ADAPTER_WORKER:'1'}});
   child.unref();
   atomic(path.join(home,'launch.json'),{pid:child.pid,at:now()});
   const until=Date.now()+c.startWaitMs;
+  let lastResult;
   while(Date.now()<until){
     const result=hostReply(c,r,digest,'start');
     if(result.state==='running'||result.state==='completed'||result.state==='cancelled')return result;
+    if(fs.existsSync(path.join(home,'finished.json'))||!groupAlive(child.pid))return result;
+    lastResult=result;
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,100);
   }
-  return {...base,state:'unknown',reason:'native session/model not observable before startup deadline'};
+  return lastResult||{...base,state:'unknown',reason:'native session/model not observable before startup deadline'};
 }
 function host(c,configPath,operation,file){
   const {r,digest}=request(c,file);
@@ -280,13 +321,14 @@ function bootstrap(c,configPath,operation,file){
   return {...base,state:'unknown',reason:'bootstrap native session/model not observable before startup deadline'};
 }
 function actorPrompt(packet,c,configPath){
+  const receipt=`Result path: ${JSON.stringify(packet.resultPath)}\nWrite exactly one UTF-8 Result JSON object to this designated path. Write a sibling temporary file and rename it into place after the complete object is ready. The file is the only authoritative result; your final message should cite its path and may summarize the work, but must not contain another Result JSON. Include complete, status, evidencePath and action-specific fields; omit model and native identity. If blocked, write truthful evidence and set complete:false. The host accepts this file only after your native task ends successfully.`;
   if(typeof packet.adapterProbeTask==='string'){
     assert(c.allowProbeTask===true,'probe task 只允许隔离测试配置');
-    return packet.adapterProbeTask;
+    return `${packet.adapterProbeTask}\n\n${receipt}`;
   }
   assert(c.workflowEntry,'真实工作流任务需要配置 workflowEntry');
   const statePath=path.join(path.dirname(path.dirname(packet.__packetPath)),'state.json');
-  return `You are executing one bounded spec-delivery job. Read the packet at ${JSON.stringify(packet.__packetPath)} and roles at ${JSON.stringify(packet.rolesPath)}. Follow its exact action, approved plan/checks and skill bindings. The public workflow CLI is node ${JSON.stringify(c.workflowEntry)}; its state is ${JSON.stringify(statePath)}. Before invoking a workflow command, poll the read-only inspect command until this job shows a bound native session; the host binds it immediately after observing your first model event. For a bound skill use skill-start, then load the returned original source with node ${JSON.stringify(self)} skill-open ${JSON.stringify(configPath)} ${JSON.stringify(statePath)} <invocationId>, do the skill's work including skill-delegate/skill-continue, write a raw report, run node ${JSON.stringify(self)} skill-complete ${JSON.stringify(configPath)} ${JSON.stringify(statePath)} <invocationId> <rawOutputPath>, then skill-finish. Run tests with the workflow test command. Do not edit workflow state directly or start hidden agents. Return only one Result JSON object with complete/status/evidencePath and action-specific fields. Do not supply model or native identity. If unable to finish, return complete:false with an evidence file.`;
+  return `You are executing one bounded spec-delivery job. Read the packet at ${JSON.stringify(packet.__packetPath)} and roles at ${JSON.stringify(packet.rolesPath)}. Follow its exact action, approved plan/checks and skill bindings. The public workflow CLI is node ${JSON.stringify(c.workflowEntry)}; its state is ${JSON.stringify(statePath)}. Before invoking a workflow command, poll the read-only inspect command until this job shows a bound native session; the host binds it immediately after observing your first model event. For a bound skill use skill-start, then load the returned original source with node ${JSON.stringify(self)} skill-open ${JSON.stringify(configPath)} ${JSON.stringify(statePath)} <invocationId>, do the skill's work including skill-delegate/skill-continue, write a raw report, run node ${JSON.stringify(self)} skill-complete ${JSON.stringify(configPath)} ${JSON.stringify(statePath)} <invocationId> <rawOutputPath>, then skill-finish. Run tests with the workflow test command. Do not edit workflow state directly or start hidden agents.\n\n${receipt}`;
 }
 async function worker(c,home,configPath){
   const m=read(path.join(home,'manifest.json')),route=c.routes[m.routeIndex];
@@ -303,6 +345,13 @@ async function worker(c,home,configPath){
   fs.mkdirSync(path.join(home,'sessions'),{recursive:true});
   const cwd=bootstrap?m.worktree:packet.worktree||packet.repo?.root||path.dirname(path.dirname(m.packetPath));
   assert(path.isAbsolute(cwd)&&fs.statSync(cwd).isDirectory(),'任务 cwd 不可读取');
+  if(!bootstrap){
+    assert(sha(fs.readFileSync(m.packetPath))===m.packetDigest&&packet.resultPath===m.resultPath,
+      '已派发 packet 与宿主快照不符');
+    fs.mkdirSync(m.outputDirectory,{recursive:true,mode:0o700});
+    assert(fs.realpathSync(m.outputDirectory)===m.outputDirectory&&
+      !entryExists(m.resultPath),'启动前已存在结果文件或输出目录不可信');
+  }
   const stdout=fs.openSync(path.join(home,'stdout.log'),'w',0o600),stderr=fs.openSync(path.join(home,'stderr.log'),'w',0o600);
   const prompt=bootstrap
     ? `You are the separately routed L1 execution planner. Follow the instructions below and return exactly one JSON object containing the ExecutionPlan fields, including current inputVersion and sourceVersion. Do not supply decisionNativeId or evidencePath: the host attaches those from your native session and exact final response. Do not modify the workflow ledger.\n\n${fs.readFileSync(path.join(home,'bootstrap-prompt.txt'),'utf8')}`
@@ -320,12 +369,15 @@ async function worker(c,home,configPath){
   clearTimeout(timeout);fs.closeSync(stdout);fs.closeSync(stderr);
   const {session,observation}=uniqueSession(c,home);
   let resultFile=null,resultSha256=null,rawSha256=null;
-  if(session&&observation?.finalText){
+  if(session&&observation){
+    atomic(path.join(home,'native-final.txt'),observation.finalText);
+    rawSha256=sha(observation.finalText);
     fs.mkdirSync(m.outputDirectory,{recursive:true});
-    if(bootstrap&&exitCode.code===0&&!timedOut&&observation.completeFrame){
+    const terminal=exitCode.code===0&&!exitCode.signal&&!exitCode.error&&!timedOut&&
+      observation.completeFrame&&observation.turnEnded&&observation.origin?.id===session.id&&
+      observation.source?.provider===route.provider&&observation.source?.model===route.model;
+    if(bootstrap&&terminal&&observation.finalText){
       try{
-        assert(observation.source?.provider===route.provider&&observation.source?.model===route.model,
-          'bootstrap native route mismatch');
         const authored=JSON.parse(observation.finalText);
         assert(authored&&typeof authored==='object'&&!Array.isArray(authored)&&
           !Object.hasOwn(authored,'decisionNativeId')&&!Object.hasOwn(authored,'evidencePath'),
@@ -333,20 +385,20 @@ async function worker(c,home,configPath){
         const prefix=`dsh-plan-${runId(m.token).slice(0,12)}`;
         const rawPath=path.join(m.outputDirectory,`${prefix}.raw.json`);
         atomic(rawPath,observation.finalText);
-        rawSha256=sha(observation.finalText);
         resultFile=`${prefix}.json`;
         const plan={...authored,evidencePath:rawPath,decisionNativeId:`${runId(m.token)}/${session.id}`};
         const bytes=JSON.stringify(plan,null,2)+'\n';
         atomic(path.join(m.outputDirectory,resultFile),bytes);
         resultSha256=sha(bytes);
       }catch{/* retain the native instance and raw log; an invalid plan is not completed */}
-    }else if(!bootstrap){
-      resultFile=`dsh-final-${runId(m.token).slice(0,12)}.txt`;
-      fs.writeFileSync(path.join(m.outputDirectory,resultFile),observation.finalText,{flag:'wx',mode:0o600});
+    }else if(!bootstrap&&terminal){
+      const bytes=resultBytes(m);
+      if(bytes){resultFile='result.json';resultSha256=sha(bytes);}
     }
   }
   atomic(path.join(home,'finished.json'),{at:now(),exitCode:exitCode.code,signal:exitCode.signal,
-    spawnError:exitCode.error||null,timedOut,resultFile,resultSha256,rawSha256});
+    spawnError:exitCode.error||null,timedOut,resultFile,resultSha256,rawSha256,
+    sessionLogSha256:session?sha(fs.readFileSync(session.log)):null});
 }
 function locateNative(c,nativeId,jobId){
   const match=/^([0-9a-f]{32})\/(session-[A-Za-z0-9-]+)$/.exec(nativeId);

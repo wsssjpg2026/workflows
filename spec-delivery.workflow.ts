@@ -567,8 +567,10 @@ function migrationHostQuiescence(s:engine.State,statePath:string,context:ReturnT
     }
   };
   const actors=s.jobs.filter(j=>j.executor==='agent'&&!!j.nativeId).map(j=>({jobId:j.id,nativeId:j.nativeId,
-    state:j.status==='done'?'completed':'cancelled',observationId:''}));
-  exact(actors,observed.actors,x=>x.jobId,(a,b)=>b.nativeId===a.nativeId&&b.state===a.state,'actor');
+    state:j.status==='done'?'completed':'cancelled',legacyLogicalCancellation:j.status==='cancelled'&&
+      s.v3?.executionPath!=='unified-v03',observationId:''}));
+  exact(actors,observed.actors,x=>x.jobId,(a,b)=>b.nativeId===a.nativeId&&
+    (b.state===a.state || a.legacyLogicalCancellation&&b.state==='completed'),'actor');
   const dispatches=(s.v3?.dispatchRecords||[]).map(d=>({token:d.token,jobId:d.jobId,targetHost:d.targetHost,
     state:d.status==='prepared'?'not_found':d.status,nativeId:d.nativeId,observationId:''}));
   exact(dispatches,observed.dispatches,x=>x.token,(a,b)=>b.jobId===a.jobId&&b.targetHost===a.targetHost&&
@@ -614,7 +616,8 @@ function verifyMigrationQuiescence(s: engine.State, statePath:string, decision: 
     fs.existsSync(h.evidencePath)&&sha(fs.readFileSync(h.evidencePath))===h.evidenceSha256)),
     '历史测试进程 PID 的原始终态或停止证据缺失');
   engine.ensure(!s.jobs.some(j=>j.status==='done'&&!j.result ||
-    j.status==='cancelled'&&!!j.nativeId&&!j.stopConfirmation?.processTreeStopped),
+    j.status==='cancelled'&&!!j.nativeId&&!j.stopConfirmation?.processTreeStopped&&
+      !(j.executor==='agent'&&s.v3?.executionPath!=='unified-v03')),
     '迁移前已结束任务须有原始结果，已取消 actor 须确认整个进程树停止');
   engine.ensure(!(s.v3?.skillChildren||[]).some(c=>c.pending || c.jobIds.some(id=>
     s.jobs.some(j=>j.id===id && active(j)))), '迁移前技能子任务必须逐项收取或停止');

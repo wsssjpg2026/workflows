@@ -40,6 +40,11 @@ function config(file){
     '凭据来源不可读');
   if(c.workflowEntry)assert(path.isAbsolute(c.workflowEntry)&&fs.statSync(c.workflowEntry).isFile(),
     'workflowEntry 不可读取');
+  if(c.legacyRuntimeRoot)assert(path.isAbsolute(c.legacyRuntimeRoot)&&
+    fs.statSync(c.legacyRuntimeRoot).isDirectory(),'legacyRuntimeRoot 必须是已有绝对目录');
+  if(c.migrationExternalObserver)assert(path.isAbsolute(c.migrationExternalObserver)&&
+    fs.statSync(c.migrationExternalObserver).isFile(),
+    'migrationExternalObserver 必须是已有绝对文件');
   c.profile ||= 'headless';
   c.startWaitMs=Math.min(Math.max(Number(c.startWaitMs)||10000,100),60000);
   c.taskTimeoutMs=Math.min(Math.max(Number(c.taskTimeoutMs)||900000,1000),3600000);
@@ -116,7 +121,9 @@ function observeLog(c,session){
     seq:e.seq??null,time:e.time??null,usage:e.data.usage,
   }));
   return {origin,source,sourceCount:sources.length,finalText,usage,
-    completeFrame:output.code===0,readError:output.error||null};
+    completeFrame:output.code===0,turnEnded:events.some(e=>e.type==='turn/end'),
+    toolCallCount:events.filter(e=>e.type==='tool/call').length,
+    readError:output.error||null};
 }
 function uniqueSession(c,home){
   const logs=sessionLogs(home);
@@ -364,6 +371,188 @@ function observe(c,nativeId,jobId){
     observedAt:new Date(origin.createdAt).toISOString(),
     context:{contextId:origin.id,mode:'new',proofId}};
 }
+function migrationHome(c,nativeId){
+  const match=/^([A-Za-z0-9_-]+)\/(session-[A-Za-z0-9-]+)$/.exec(nativeId||'');
+  if(!match)return null;
+  const modern=/^[0-9a-f]{32}$/.test(match[1]);
+  const base=modern?c.runtimeRoot:c.legacyRuntimeRoot;
+  if(!base)return null;
+  const root=path.resolve(base,'runs'),home=path.resolve(root,match[1]);
+  if(!home.startsWith(root+path.sep)||!fs.existsSync(home)||!fs.statSync(home).isDirectory())return null;
+  const realRoot=fs.realpathSync(root),realHome=fs.realpathSync(home);
+  if(!realHome.startsWith(realRoot+path.sep))return null;
+  return {home:realHome,sessionId:match[2],modern};
+}
+function migrationProcesses(homes){
+  if(!fs.existsSync('/proc')||typeof process.getuid!=='function')
+    return {live:[],unreadable:1,observationId:sha('proc-unavailable')};
+  const wanted=new Set(homes),knownGroups=new Set(),live=[],unreadable=[];
+  for(const home of wanted){
+    try{const launch=read(path.join(home,'launch.json'));
+      if(Number.isSafeInteger(launch.pid)&&launch.pid>0)knownGroups.add(launch.pid);
+    }catch{/* Historical homes may not have a process-group record. */}
+  }
+  const related=pid=>{
+    const root=`/proc/${pid}`;
+    try{const stat=fs.readFileSync(path.join(root,'stat'),'utf8');
+      const fields=stat.slice(stat.lastIndexOf(')')+2).split(' ');
+      if(knownGroups.has(Number(fields[1]))||knownGroups.has(Number(fields[2])))return true;
+    }catch{/* Continue with independent native path checks. */}
+    try{const cwd=fs.readlinkSync(path.join(root,'cwd'));
+      if([...wanted].some(home=>cwd===home||cwd.startsWith(home+path.sep)))return true;
+    }catch{/* The process may have another cwd. */}
+    try{const cmdline=fs.readFileSync(path.join(root,'cmdline'),'utf8');
+      if([...wanted].some(home=>cmdline.includes(home)))return true;
+    }catch{/* An unrelated unreadable process is not assigned to this run. */}
+    return false;
+  };
+  for(const name of fs.readdirSync('/proc')){
+    if(!/^\d+$/.test(name)||Number(name)===process.pid)continue;
+    const root=`/proc/${name}`;
+    try{
+      const status=fs.readFileSync(path.join(root,'status'),'utf8');
+      if(Number(status.match(/^Uid:\s+(\d+)/m)?.[1])!==process.getuid()||
+        /^State:\s+Z/m.test(status))continue;
+      const env=fs.readFileSync(path.join(root,'environ')).toString('utf8').split('\0');
+      const home=env.find(x=>x.startsWith('DSH_HOME='))?.slice('DSH_HOME='.length);
+      if(home&&wanted.has(path.resolve(home)))live.push({pid:Number(name),home:path.resolve(home)});
+      else if(related(Number(name)))live.push({pid:Number(name),home:'related-native-process'});
+    }catch(error){
+      if(!fs.existsSync(root))continue;
+      // Only assign an unreadable process to this run with native ancestry or path evidence.
+      try{const status=fs.readFileSync(path.join(root,'status'),'utf8');
+        if(Number(status.match(/^Uid:\s+(\d+)/m)?.[1])===process.getuid()&&
+          related(Number(name)))unreadable.push(Number(name));
+      }catch{if(related(Number(name)))unreadable.push(Number(name));}
+    }
+  }
+  return {live,unreadable:unreadable.length,unreadablePids:unreadable,
+    observationId:sha(JSON.stringify({homes:[...wanted].sort(),live,unreadable:unreadable.sort(),at:now()}))};
+}
+function migrationNative(c,nativeId,jobId,processes){
+  const target=migrationHome(c,nativeId);
+  if(!target)return {state:'unknown',observationId:sha(`missing:${jobId}:${nativeId}`)};
+  const {home,sessionId,modern}=target;
+  if(processes.live.some(x=>x.home===home))return {state:'running',
+    observationId:sha(`live:${nativeId}:${processes.observationId}`)};
+  const sessions=sessionLogs(home);
+  if(sessions.length!==1||sessions[0].id!==sessionId)return {state:'unknown',
+    observationId:sha(`ambiguous:${nativeId}:${sessions.map(x=>x.id).join(',')}`)};
+  const native=observeLog(c,sessions[0]);
+  if(!native.completeFrame||native.origin?.id!==sessionId||!native.source||native.sourceCount!==1)
+    return {state:'unknown',observationId:sha(`incomplete:${nativeId}:${sha(fs.readFileSync(sessions[0].log))}`)};
+  let state='unknown',marker='';
+  if(modern){
+    try{
+      const m=read(path.join(home,'manifest.json'));
+      if(m.jobId!==jobId||runId(m.token)!==path.basename(home))throw Error('manifest mismatch');
+      const r={token:m.token,jobId:m.jobId,targetHost:m.targetHost,requestedModel:m.requestedModel};
+      const reply=hostReply(c,r,m.requestDigest,'query',m.kind||'host');
+      if(reply.nativeId!==nativeId)throw Error('native mismatch');
+      state=reply.state;marker=JSON.stringify({reply,manifestSha:sha(fs.readFileSync(path.join(home,'manifest.json')))});
+      if(['completed','cancelled'].includes(state)&&!native.turnEnded)state='unknown';
+      const launch=path.join(home,'launch.json');
+      if(fs.existsSync(launch)&&groupAlive(read(launch).pid))state='running';
+    }catch{state='unknown';}
+  }else{
+    const finish=path.join(home,'finished-at'),exit=path.join(home,'exit-code');
+    // Old runner did not retain a process group. A tool call could have left an
+    // untracked child or external effect, so its old home cannot prove quiescence.
+    if(native.turnEnded&&native.toolCallCount===0&&fs.existsSync(finish)&&fs.existsSync(exit)){
+      const finishBytes=fs.readFileSync(finish),exitBytes=fs.readFileSync(exit);
+      if(finishBytes.toString('utf8').trim()&&exitBytes.toString('utf8').trim()==='0')state='completed';
+      marker=`${sha(finishBytes)}:${sha(exitBytes)}`;
+    }
+  }
+  return {state,observationId:sha(`${nativeId}:${sha(fs.readFileSync(sessions[0].log))}:${marker}:${processes.observationId}`),
+    nativeEvidence:{sessionLogSha256:sha(fs.readFileSync(sessions[0].log)),
+      terminalMarkerSha256:sha(marker),toolCallCount:native.toolCallCount,turnEnded:native.turnEnded}};
+}
+function migrationExternal(c,request,statePath,pureNativeRead,nativeBasis){
+  if(!c.migrationExternalObserver)return pureNativeRead
+    ?{state:'settled',unknown:0,observationId:sha(`native-zero-tools:${nativeBasis}`),
+      basis:'all-native-sessions-ended-with-zero-tool-calls-and-no-external-intents',
+      nativeBasisSha256:nativeBasis}
+    :{state:'unknown',unknown:1,observationId:sha('external-observer-not-configured')};
+  const result=command(c.migrationExternalObserver,['settled',statePath],{
+    input:JSON.stringify(request),cwd:path.dirname(statePath)});
+  if(result.code!==0)return {state:'unknown',unknown:1,
+    observationId:sha(`external-query-failed:${result.code}:${result.error||''}`)};
+  let value;try{value=JSON.parse(result.stdout);}catch{return {state:'unknown',unknown:1,
+    observationId:sha('external-query-invalid-json')}}
+  if(value?.source!=='native_host'||value.challenge!==request.challenge||
+    value.runId!==request.runId||value.inventorySha256!==request.inventorySha256||
+    value.ledgerSha256!==request.ledgerSha256||
+    !Number.isFinite(Date.parse(value.observedAt))||
+    Math.abs(Date.now()-Date.parse(value.observedAt))>60_000)
+    return {state:'unknown',unknown:1,observationId:sha('external-query-stale-or-mismatched')};
+  return {state:value.state==='settled'&&value.unknown===0?'settled':'unknown',
+    unknown:value.state==='settled'&&value.unknown===0?0:Math.max(1,Number(value.unknown)||1),
+    observationId:sha(result.stdout),externalEvidenceSha256:sha(result.stdout),
+    externalObservation:value};
+}
+function quiescence(c,statePath){
+  const request=JSON.parse(fs.readFileSync(0,'utf8'));
+  const bytes=fs.readFileSync(statePath),state=JSON.parse(bytes);
+  assert(request.schemaVersion===1&&request.runId===state.id&&request.ledgerSha256===sha(bytes)&&
+    typeof request.challenge==='string'&&request.challenge,'迁移查询与原账本不一致');
+  const homes=state.jobs.filter(j=>j.executor==='agent'&&j.nativeId).map(j=>migrationHome(c,j.nativeId)?.home)
+    .filter(Boolean);
+  const processes=migrationProcesses(homes);
+  const actors=state.jobs.filter(j=>j.executor==='agent'&&j.nativeId).map(j=>({jobId:j.id,nativeId:j.nativeId,
+    ...migrationNative(c,j.nativeId,j.id,processes)}));
+  const dispatches=(state.v3?.dispatchRecords||[]).map(d=>{
+    let reply={state:'unknown'};
+    try{if(d.targetHost===c.hostId){const m=read(d.requestPath);
+      if(m.token===d.token&&m.jobId===d.jobId){const digest=sha(fs.readFileSync(d.requestPath));
+        reply=hostReply(c,m,digest,'query');}}
+    }catch{/* A missing intent or uncertain native query is never terminal. */}
+    return {token:d.token,jobId:d.jobId,targetHost:d.targetHost,state:reply.state,
+      nativeId:reply.nativeId,authoritative:reply.authoritative===true,
+      observationId:sha(`token:${d.token}:${JSON.stringify(reply)}:${processes.observationId}`)};
+  });
+  const instances=[...(state.v3?.dispatchRecords||[]).flatMap(d=>d.instances),
+    ...(state.v3?.detachedInstances||[])].filter(i=>i.nativeId).map(i=>{
+    const native=migrationNative(c,i.nativeId,state.jobs.find(j=>j.nativeId===i.nativeId)?.id||'',processes);
+    return {key:i.key,nativeId:i.nativeId,...native,observationId:sha(`${i.key}:${native.observationId}`)};
+  });
+  const processRows=state.jobs.flatMap(j=>{
+    const rows=[];const command=Number(j.nativeId?.match(/^command:(\d+):/)?.[1]);
+    if(command)rows.push({jobId:j.id,kind:'command',pid:command});
+    if(j.testExecution?.pid)rows.push({jobId:j.id,kind:'test',pid:j.testExecution.pid});
+    for(const h of j.testProcessHistory||[])rows.push({jobId:j.id,kind:'test',pid:h.pid});
+    return rows;
+  });
+  for(const d of state.v3?.dispatchRecords||[])if(d.operationPid)
+    processRows.push({jobId:d.jobId,kind:'dispatch',pid:d.operationPid});
+  const observedRows=processRows.map(p=>({ ...p,state:groupAlive(p.pid)?'running':'unknown',
+    descendantsStopped:false,observationId:sha(`untracked:${p.jobId}:${p.kind}:${p.pid}:${processes.observationId}`)}));
+  const unfinished=actors.some(x=>!['completed','cancelled'].includes(x.state))||
+    dispatches.some(x=>!['not_found','completed','cancelled'].includes(x.state))||
+    instances.some(x=>!['completed','cancelled'].includes(x.state));
+  const pureNativeRead=actors.length>0&&actors.every(x=>x.state==='completed'&&
+    x.nativeEvidence?.toolCallCount===0&&x.nativeEvidence?.turnEnded===true)&&
+    state.jobs.length===actors.length&&state.jobs.every(j=>j.executor==='agent'&&j.action==='review-lens'&&
+      !j.testExecution&&!(j.testProcessHistory||[]).length)&&
+    !processRows.length&&!(state.v3?.dispatchRecords||[]).length&&
+    !(state.v3?.detachedInstances||[]).length&&
+    state.tickets.every(t=>!t.pr&&!t.prNumber&&!t.prUrl)&&
+    Object.keys(state.facts?.prs||{}).length===0&&
+    Object.values(state.facts?.issueStates||{}).every(x=>x==='OPEN')&&
+    !fs.existsSync(path.join(path.dirname(statePath),'actions'));
+  const nativeBasis=sha(JSON.stringify({ledgerSha256:request.ledgerSha256,
+    actorEvidence:actors.map(x=>({jobId:x.jobId,nativeId:x.nativeId,
+      sessionLogSha256:x.nativeEvidence?.sessionLogSha256,toolCallCount:x.nativeEvidence?.toolCallCount})),
+    actionsDirectoryAbsent:!fs.existsSync(path.join(path.dirname(statePath),'actions'))}));
+  return {source:'native_host',schemaVersion:1,challenge:request.challenge,runId:request.runId,
+    inventorySha256:request.inventorySha256,ledgerSha256:request.ledgerSha256,observedAt:now(),
+    actors,dispatches,instances,processes:observedRows,
+    processTree:{state:processes.live.length?'running':unfinished||processes.unreadable||observedRows.length?'unknown':'stopped',
+      unknownChildren:processes.unreadable+observedRows.length,
+      unreadablePids:processes.unreadablePids,
+      observationId:sha(`tree:${processes.observationId}:${unfinished}:${observedRows.length}`)},
+    externalActions:migrationExternal(c,request,statePath,pureNativeRead,nativeBasis)};
+}
 function stateAtCwd(){return read(path.join(process.cwd(),'state.json'));}
 function skillCapabilities(c,capability,jobId){
   const state=stateAtCwd();assert(state.jobs.some(j=>j.id===jobId),'技能能力查询的 job 不存在');
@@ -455,13 +644,15 @@ function probe(c){
 function shellQuote(value){return `'${String(value).replaceAll("'","'\\''")}'`;}
 function install(configPath,directory){
   fs.mkdirSync(directory,{recursive:true});
-  const entries={host:'dsh-host',observe:'dsh-observer',skill:'dsh-skill-observer'};
+  const entries={host:'dsh-host',observe:'dsh-observer',skill:'dsh-skill-observer',
+    quiescence:'dsh-migration-observer'};
   for(const [mode,name] of Object.entries(entries)){
     const file=path.join(directory,name);
     fs.writeFileSync(file,`#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(self)} ${mode} ${shellQuote(path.resolve(configPath))} "$@"\n`,{mode:0o700});
   }
   return {host:path.join(directory,entries.host),observer:path.join(directory,entries.observe),
-    skillObserver:path.join(directory,entries.skill)};
+    skillObserver:path.join(directory,entries.skill),
+    migrationObserver:path.join(directory,entries.quiescence)};
 }
 async function main(argv){
   const [mode,configPath,...rest]=argv;
@@ -474,6 +665,10 @@ async function main(argv){
   if(mode==='observe'){
     if(rest[0]==='availability')fail('DSH headless 未提供可证明原 actor 不可恢复的原生接口；停止 context-reconstruct');
     assert(rest[0]==='observe','仅支持 observe');return observe(c,rest[1],rest[2]);
+  }
+  if(mode==='quiescence'){
+    assert(rest[0]==='quiescence'&&path.isAbsolute(rest[1]),'迁移查询需要 quiescence 和绝对账本路径');
+    return quiescence(c,rest[1]);
   }
   if(mode==='skill')return rest[0]==='capabilities'?skillCapabilities(c,rest[1],rest[2]):skillResult(c,rest[1],rest[2]);
   if(mode==='skill-open')return skillOpen(c,rest[0],rest[1]);

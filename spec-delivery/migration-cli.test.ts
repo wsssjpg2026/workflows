@@ -165,6 +165,10 @@ test('在途 actor、测试、子任务、不确定 token 与未绑定实例都�
   ];
   for(const [name,mutate] of cases){const x=fixture(3);try {
     mutate(x.state);x.writeState(x.state);const request=x.decision(),before=fs.readFileSync(x.statePath);
+    if(name==='cancelled process'){
+      const host=JSON.parse(fs.readFileSync(x.hostStatusFile,'utf8'));
+      host.actors['old-review']='running';fs.writeFileSync(x.hostStatusFile,JSON.stringify(host));
+    }
     const result=x.call('migrate-skills',x.statePath,request);
     assert.notEqual(result.status,0,`${name}: ${result.stderr}`);
     assert.deepEqual(fs.readFileSync(x.statePath),before,name);

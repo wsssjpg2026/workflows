@@ -11,6 +11,8 @@ Use Node.js 24+, `dsh` and `zstd`. Keep the config outside the repository and re
   "schema": 1,
   "hostId": "<the plan's capabilities.framework>",
   "runtimeRoot": "/absolute/private/adapter-runtime",
+  "legacyRuntimeRoot": "/absolute/old-dsh-actors",
+  "migrationExternalObserver": "/absolute/trusted/external-action-observer",
   "dshBin": "/absolute/path/to/dsh",
   "zstdBin": "/absolute/path/to/zstd",
   "credentialsFile": "/absolute/private/credentials.yaml",
@@ -39,10 +41,15 @@ node /absolute/isolated/candidate/spec-delivery/adapters/dsh.mjs install /absolu
 export SPEC_DELIVERY_HOST_ADAPTER=/absolute/isolated/candidate/bin/dsh-host
 export SPEC_DELIVERY_HOST_OBSERVER=/absolute/isolated/candidate/bin/dsh-observer
 export SPEC_DELIVERY_SKILL_OBSERVER=/absolute/isolated/candidate/bin/dsh-skill-observer
+export SPEC_DELIVERY_MIGRATION_OBSERVER=/absolute/isolated/candidate/bin/dsh-migration-observer
 export SPEC_DELIVERY_MAIN_OBSERVER=/absolute/isolated/candidate/spec-delivery/adapters/codex-main-observer.mjs
 ```
 
-`probe` checks executable availability and route-file presence **without starting a model**. Its `nativeRouteVerified:false` is intentional. `install` writes only three wrappers in the specified output directory; it does not replace a live installation. Use the same fixed candidate copy of the workflow, adapter and skill bindings for one run. Run `node <workflowEntry> version` and `npm test` from the candidate before using it.
+`probe` checks executable availability and route-file presence **without starting a model**. Its `nativeRouteVerified:false` is intentional. `install` writes four wrappers in the specified output directory; it does not replace a live installation. Use the same fixed candidate copy of the workflow, adapter and skill bindings for one run. Run `node <workflowEntry> version` and `npm test` from the candidate before using it.
+
+`legacyRuntimeRoot` is needed to query old DSH homes and is the parent of their `runs/<legacy-run-id>` directories. `migrationExternalObserver` is needed whenever external action state cannot be ruled out from native evidence. It is a separately trusted, read-only executable called as `settled <state>` with the migration challenge/context on stdin; it must query external action state and echo the challenge, run ID, inventory/ledger hashes, current `observedAt`, `source:"native_host"`, `state:"settled"`, and `unknown:0`. Without this executable, the DSH observer reports `settled` only for an isolated ledger consisting solely of finished `review-lens` agents with **zero native `tool/call` events**, no command/test/dispatch job or PR intent, and no other jobs. All other runs return `unknown` and block. A failed, stale, or pending external query also blocks. Keep these paths outside the candidate tree; do not supply operator-written booleans as a substitute.
+
+The installed `dsh-migration-observer` reads the **existing** old native session log (one exact session ID), requires a complete zstd frame, native `turn/end`, `finished-at`, and `exit-code:0`, and checks current Linux `/proc` for a process retaining that run's `DSH_HOME`. The old runner did not record a process group: an old session containing any `tool/call` may have left an untracked child and remains `unknown`. A native response-only old session can migrate if the separate external-action query also proves settled. Current adapter token manifests are queried through their existing durable identity. The observer also refuses ambiguous/missing native evidence and any untracked command, test, or dispatch PID; an exited parent PID alone does not prove its descendants stopped. This is a read-only query; it never launches or cancels an actor. Use `migration-context` and `upgrade` as described in [MIGRATION.md](../MIGRATION.md). Old homes with tool calls or unknown descendants and any unqueryable external action remain blocked until stronger host evidence exists. Codex and ZCode historical migration remains unsupported.
 
 ## Pre-plan L1 bootstrap and coordinator observation
 

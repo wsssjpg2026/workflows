@@ -268,3 +268,192 @@ test('fresh 父调用强制子任务独立上下文，技能文字不能改写�
     assert.deepEqual(task.objectiveEvidence,{tests:undefined,visual:undefined});
   } finally {x.cleanup();}
 });
+
+function contextFixture(mode:'resumed'|'new') {
+  const x=setup();
+  x.t.phase='review';x.t.epoch=2;x.t.pr=0;
+  x.j.action='review-lens';x.j.part='0';x.j.epoch=1;x.j.tier='L2';x.j.model='middle';x.j.status='done';
+  x.j.contextIntent={kind:'independent',fresh:false,lineage:'101:review-review-lens-0'};
+  x.j.session!.model='middle';
+  x.j.session!.context={contextId:'context-original',mode:'new',proofId:'original-context-proof'};
+  const originalObservation=JSON.stringify({source:'native_host',nativeId:x.j.nativeId,jobId:x.j.id,
+    provider:'fixture',model:'middle',context:x.j.session!.context});
+  fs.writeFileSync(x.j.session!.evidencePath,originalObservation);
+  x.j.session!.evidenceDigest=sha(originalObservation);
+  x.j.contextObservation={source:'native_host',...x.j.session!.context,nativeId:x.j.nativeId,
+    evidencePath:x.j.session!.evidencePath,evidenceDigest:x.j.session!.evidenceDigest};
+  x.j.result={model:'middle',complete:true,status:'reviewed',head:x.t.head,base:x.t.base,
+    evidencePath:x.j.session!.evidencePath,findings:[]};
+  const successor:core.Job={...structuredClone(x.j),id:'job-2',epoch:x.t.epoch,status:'leased',nativeId:'',
+    session:undefined,contextObservation:undefined,result:undefined,part:'0',
+    contextIntent:core.contextIntentFor(x.s,x.t.key,'review-lens','0',false),
+    contextKey:'review-continuation',candidateVersion:core.candidateVersion(x.s,x.t)};
+  assert.equal(successor.contextIntent!.kind,'continue');x.s.jobs.push(successor);
+  const sessionsPath=path.join(x.root,'context-sessions.json');
+  const nativeId=mode==='resumed'?'host/resumed':'host/new';
+  const sessions:Record<string,unknown>={
+    [nativeId]:{source:'native_host',observationId:'observed-successor',jobId:successor.id,nativeId,
+      provider:'fixture',model:'middle',observedAt:new Date().toISOString(),
+      context:mode==='resumed'?{contextId:'context-original',mode:'resumed',resumedFromContextId:'context-original',proofId:'resume-proof'}
+        :{contextId:'context-new',mode:'new',proofId:'new-context-proof'}},
+    'l1-handoff':{source:'native_host',observationId:'observed-l1',jobId:`$handoff:${successor.id}`,nativeId:'l1-handoff',
+      provider:'fixture',model:'large',observedAt:new Date().toISOString(),
+      context:{contextId:'context-l1-verification',mode:'new',proofId:'l1-proof'}}};
+  fs.writeFileSync(sessionsPath,JSON.stringify(sessions));
+  const observer=path.join(x.root,'context-observer');
+  fs.writeFileSync(observer,`#!/usr/bin/env node\nconst fs=require('fs');const [op,id,job]=process.argv.slice(2);const all=JSON.parse(fs.readFileSync(${JSON.stringify(sessionsPath)},'utf8'));\nif(op==='availability'){console.log(JSON.stringify({source:'native_host',nativeId:id,jobId:job,state:'unavailable',observationId:'lost-'+id,observedAt:new Date().toISOString()}));}\nelse if(op==='observe'&&all[id]&&all[id].jobId===job)console.log(JSON.stringify(all[id]));else process.exit(2);\n`);
+  fs.chmodSync(observer,0o755);
+  const bindingPath=path.join(x.root,'context-binding.json');fs.writeFileSync(bindingPath,JSON.stringify({nativeId}));
+  fs.writeFileSync(x.statePath,JSON.stringify(x.s));
+  return {...x,successor,nativeId,observer,bindingPath,sessionsPath,
+    result:():core.Result=>({model:'middle',complete:true,status:'reviewed',head:x.t.head,base:x.t.base,
+      evidencePath:x.j.session!.evidencePath,findings:[]})};
+}
+
+test('可续接与不可续接宿主都保留同一审查结果，且区别真实上下文来源', async () => {
+  for(const mode of ['resumed','new'] as const) {
+    const x=contextFixture(mode),previousObserver=process.env.SPEC_DELIVERY_HOST_OBSERVER;
+    const previousSkillObserver=process.env.SPEC_DELIVERY_SKILL_OBSERVER;
+    try {
+      process.env.SPEC_DELIVERY_HOST_OBSERVER=x.observer;
+      const bound=await main(['bind',x.statePath,x.successor.id,x.bindingPath]);assert.ok(bound);
+      let state=JSON.parse(fs.readFileSync(x.statePath,'utf8')) as core.State;
+      const current=state.jobs.find(j=>j.id===x.successor.id)!;
+      assert.equal(current.contextObservation?.mode,mode);
+      if(mode==='resumed')assert.equal(core.contextReady(current),true);
+      else {
+        assert.equal(core.contextReady(current),false);
+        assert.throws(()=>core.submit(structuredClone(state),current.id,x.result()),/交接/);
+        const outcomePath=path.join(x.root,'handoff-outcome.json');
+        const skillObserver=path.join(x.root,'skill-context-observer');
+        fs.writeFileSync(skillObserver,`#!/usr/bin/env node\nconst fs=require('fs');const [op,id,job]=process.argv.slice(2);\nif(op==='capabilities')console.log(JSON.stringify({source:'native_host',jobId:job,capability:id,capabilities:{sourceExecution:{allowed:true,acceptsOriginalFiles:true}}}));\nelse if(op==='result'){const outcome=JSON.parse(fs.readFileSync(${JSON.stringify(outcomePath)},'utf8'));process.stdout.write(fs.readFileSync(outcome.hostReceiptPath,'utf8'));}\nelse process.exit(2);\n`);
+        fs.chmodSync(skillObserver,0o755);process.env.SPEC_DELIVERY_SKILL_OBSERVER=skillObserver;
+        const skillRequest=path.join(x.root,'handoff-skill-request.json');
+        fs.writeFileSync(skillRequest,JSON.stringify({capability:'handoff'}));
+        const started=await main(['skill-start',x.statePath,x.j.id,skillRequest]) as {invocationId:string;sourceArchivePath:string};
+        state=JSON.parse(fs.readFileSync(x.statePath,'utf8')) as core.State;
+        const invocation=state.v3!.skillInvocations.find(i=>i.id===started.invocationId)!;
+        const call={invocation,source:JSON.parse(fs.readFileSync(started.sourceArchivePath,'utf8')),
+          alreadyStarted:false} as skills.PreparedSkillCall;
+        const handoffText=`# Original actor handoff\n\nSource: ${x.j.session!.evidencePath}\nCurrent candidate: ${x.t.head}/${x.t.base}\n\nsuggested skills: code-review\n`;
+        const handoffOutcome=x.output(call,'pass',false,handoffText);
+        fs.writeFileSync(outcomePath,JSON.stringify(handoffOutcome));
+        assert.equal((await main(['skill-finish',x.statePath,started.invocationId,outcomePath]) as {status:string}).status,'pass');
+        state=JSON.parse(fs.readFileSync(x.statePath,'utf8')) as core.State;
+        const archived=state.v3!.skillInvocations.find(i=>i.id===started.invocationId)!.result!;
+        const skillShaBefore=sha(fs.readFileSync(x.fixture.handoff));
+        assert.equal(sha(fs.readFileSync(archived.rawOutputPath)),sha(handoffText));
+        const verificationPath=path.join(x.root,'l1-handoff-verification.json');
+        fs.writeFileSync(verificationPath,JSON.stringify({jobId:current.id,candidateVersion:current.candidateVersion,
+          head:current.head,base:current.base,sourceJobId:x.j.id,sourceHead:x.j.head,sourceBase:x.j.base,
+          originalPath:archived.rawOutputPath,originalSha256:archived.rawOutputSha256,
+          sourceLinks:[x.j.session!.evidencePath]}));
+        const forwardPath=path.join(x.root,'forward.json');
+        fs.writeFileSync(forwardPath,JSON.stringify({invocationId:started.invocationId,decisionNativeId:'l1-handoff',
+          verificationPath,expectedCandidateVersion:current.candidateVersion}));
+        const staleForward=path.join(x.root,'stale-forward.json');
+        fs.writeFileSync(staleForward,JSON.stringify({invocationId:started.invocationId,decisionNativeId:'l1-handoff',
+          verificationPath,expectedCandidateVersion:'stale-candidate'}));
+        await assert.rejects(main(['context-handoff',x.statePath,current.id,staleForward]),/过期候选/);
+        const forwarded=await main(['context-handoff',x.statePath,current.id,forwardPath]) as {handoffRef:core.HandoffReference};
+        assert.equal(forwarded.handoffRef.kind,'original');
+        assert.equal(forwarded.handoffRef.path,archived.rawOutputPath);
+        assert.equal(sha(fs.readFileSync(x.fixture.handoff)),skillShaBefore);
+        const archivedBytes=fs.readFileSync(archived.rawOutputPath);
+        fs.appendFileSync(archived.rawOutputPath,'tampered');
+        const blockedSkillRequest=path.join(x.root,'blocked-skill-request.json');
+        fs.writeFileSync(blockedSkillRequest,JSON.stringify({capability:'prReview'}));
+        await assert.rejects(main(['skill-start',x.statePath,current.id,blockedSkillRequest]),/交接原文或 L1 核验记录已改变/);
+        fs.writeFileSync(archived.rawOutputPath,archivedBytes);
+        state=JSON.parse(fs.readFileSync(x.statePath,'utf8')) as core.State;
+      }
+      core.submit(state,current.id,x.result());
+      assert.equal(state.jobs.find(j=>j.id===current.id)?.status,'done');
+      assert.equal(state.tickets[0].phase,'review');
+      assert.deepEqual(state.jobs.find(j=>j.id===current.id)?.result?.findings,[]);
+    } finally {
+      if(previousObserver===undefined)delete process.env.SPEC_DELIVERY_HOST_OBSERVER;else process.env.SPEC_DELIVERY_HOST_OBSERVER=previousObserver;
+      if(previousSkillObserver===undefined)delete process.env.SPEC_DELIVERY_SKILL_OBSERVER;else process.env.SPEC_DELIVERY_SKILL_OBSERVER=previousSkillObserver;
+      x.cleanup();
+    }
+  }
+});
+
+test('原 actor 不可恢复时 L1 重建标记未知项；过期候选拒绝交接', async () => {
+  const x=contextFixture('new'),previousObserver=process.env.SPEC_DELIVERY_HOST_OBSERVER;
+  try {
+    process.env.SPEC_DELIVERY_HOST_OBSERVER=x.observer;
+    await main(['bind',x.statePath,x.successor.id,x.bindingPath]);
+    const before=JSON.parse(fs.readFileSync(x.statePath,'utf8')) as core.State;
+    const current=before.jobs.find(j=>j.id===x.successor.id)!;
+    const reconstructedPath=path.join(x.root,'reconstructed.json');
+    fs.writeFileSync(reconstructedPath,JSON.stringify({kind:'l1_reconstructed',jobId:current.id,
+      sourceJobId:x.j.id,candidateVersion:current.candidateVersion,head:current.head,base:current.base,
+      reason:'original actor no longer available',sourceLinks:[x.j.session!.evidencePath],
+      unknowns:['unrecorded conversation details'],suggestedSkills:['code-review']}));
+    const requestPath=path.join(x.root,'reconstruction-request.json');
+    fs.writeFileSync(requestPath,JSON.stringify({decisionNativeId:'l1-handoff',
+      expectedCandidateVersion:current.candidateVersion,reconstructedPath}));
+    const stale=structuredClone(before);stale.tickets[0].head='other-head';fs.writeFileSync(x.statePath,JSON.stringify(stale));
+    await assert.rejects(main(['context-reconstruct',x.statePath,current.id,requestPath]),/候选已过期/);
+    fs.writeFileSync(x.statePath,JSON.stringify(before));
+    const result=await main(['context-reconstruct',x.statePath,current.id,requestPath]) as {handoffRef:core.HandoffReference};
+    assert.equal(result.handoffRef.kind,'reconstructed');
+    assert.deepEqual(result.handoffRef.unknowns,['unrecorded conversation details']);
+    assert.ok(fs.existsSync(result.handoffRef.unavailableEvidencePath!));
+    assert.equal(result.handoffRef.invocationId,undefined);
+    const state=JSON.parse(fs.readFileSync(x.statePath,'utf8')) as core.State;
+    core.submit(state,current.id,x.result());
+    assert.equal(state.jobs.find(j=>j.id===current.id)?.status,'done');
+  } finally {if(previousObserver===undefined)delete process.env.SPEC_DELIVERY_HOST_OBSERVER;
+    else process.env.SPEC_DELIVERY_HOST_OBSERVER=previousObserver;x.cleanup();}
+});
+
+test('独立动作和 fresh 不复用作者或 regular 结论，fresh packet 只给原始来源', () => {
+  const x=contextFixture('new');
+  try {
+    x.s.jobs=x.s.jobs.filter(j=>j.id!==x.successor.id);
+    const reserved=core.reserve(x.s);
+    assert.equal(reserved.find(j=>j.action==='review-lens'&&j.part==='0')?.contextIntent?.predecessorJobId,x.j.id);
+    x.s.jobs=x.s.jobs.filter(j=>!reserved.includes(j));
+    x.s.jobs.push({...structuredClone(x.j),id:'author-prior',action:'implement',part:'',
+      contextIntent:{kind:'independent',fresh:false,lineage:'101:author'}});
+    for(const action of ['implement','publish','integrate'] as core.Action[])
+      assert.equal(core.contextIntentFor(x.s,x.t.key,action,'',false).predecessorJobId,'author-prior');
+    for(const action of ['plan-check','accept','replan','adjudicate','spec-audit'] as core.Action[])
+      assert.equal(core.contextIntentFor(x.s,x.t.key,action,'',false).kind,'independent');
+    assert.equal(core.contextIntentFor(x.s,x.t.key,'review-lens','0',false).kind,'continue');
+    assert.equal(core.contextIntentFor(x.s,x.t.key,'review-lens','0',true).kind,'independent');
+    x.t.evidence.regular={head:x.t.head,base:x.t.base,path:x.j.session!.evidencePath};
+    x.t.reviewHandoff=x.j.session!.evidencePath;x.t.reason='author argued this finding away';
+    const fresh={...x.successor,id:'fresh-job',fresh:true,contextIntent:{kind:'independent' as const,fresh:true},
+      action:'review-lens' as const,contextKey:'fresh-context'};
+    const p=packet(x.s,fresh,x.statePath);
+    assert.deepEqual(p.prior,[]);assert.equal(p.handoffPath,'');assert.equal(p.historyIndexPath,'');
+    assert.equal(p.blockingReason,'');assert.equal(p.finding,null);assert.equal(p.dispute,null);
+    assert.equal(p.rawSources?.candidate.head,x.t.head);
+    assert.equal(fs.existsSync(path.join(path.dirname(x.statePath),'jobs',sha(fresh.id).slice(0,20),'prior-index.json')),false);
+  } finally {x.cleanup();}
+});
+
+test('续接证明来自宿主原生观测；caller 的 context 字段与错误祖先不能冒充', async () => {
+  const x=contextFixture('resumed'),previousObserver=process.env.SPEC_DELIVERY_HOST_OBSERVER;
+  try {
+    process.env.SPEC_DELIVERY_HOST_OBSERVER=x.observer;
+    const sessions=JSON.parse(fs.readFileSync(x.sessionsPath,'utf8'));
+    delete sessions[x.nativeId].context;fs.writeFileSync(x.sessionsPath,JSON.stringify(sessions));
+    fs.writeFileSync(x.bindingPath,JSON.stringify({nativeId:x.nativeId,
+      context:{contextId:'context-original',mode:'resumed',resumedFromContextId:'context-original',proofId:'forged'}}));
+    await assert.rejects(main(['bind',x.statePath,x.successor.id,x.bindingPath]),/宿主未证明实际上下文/);
+    sessions[x.nativeId].context={contextId:'context-original',mode:'resumed',
+      resumedFromContextId:'wrong-ancestor',proofId:'host-proof'};
+    fs.writeFileSync(x.sessionsPath,JSON.stringify(sessions));
+    await assert.rejects(main(['bind',x.statePath,x.successor.id,x.bindingPath]),/宿主续接证明与前序上下文不符/);
+    sessions[x.nativeId].context.resumedFromContextId='context-original';
+    fs.writeFileSync(x.sessionsPath,JSON.stringify(sessions));
+    await main(['bind',x.statePath,x.successor.id,x.bindingPath]);
+    const state=JSON.parse(fs.readFileSync(x.statePath,'utf8')) as core.State;
+    assert.equal(state.jobs.find(j=>j.id===x.successor.id)?.contextObservation?.proofId,'host-proof');
+  } finally {if(previousObserver===undefined)delete process.env.SPEC_DELIVERY_HOST_OBSERVER;
+    else process.env.SPEC_DELIVERY_HOST_OBSERVER=previousObserver;x.cleanup();}
+});

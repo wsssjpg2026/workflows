@@ -51,7 +51,8 @@ else { console.error('unexpected gh '+a.join(' ')); process.exit(2); }
   const sessions = path.join(temp, 'native-sessions.json'); fs.writeFileSync(sessions, '{}');
   const observe = (nativeId: string, jobId: string, model: string, provider = 'fixture') => {
     const all = JSON.parse(fs.readFileSync(sessions, 'utf8'));
-    all[nativeId] = { source: 'native_host', observationId: `event-${nativeId}`, jobId, nativeId, provider, model, observedAt: '2026-09-27T00:00:00.000Z' };
+    all[nativeId] = { source: 'native_host', observationId: `event-${nativeId}`, jobId, nativeId, provider, model,
+      context:{contextId:nativeId,mode:'new',proofId:`context-${nativeId}`},observedAt: '2026-09-27T00:00:00.000Z' };
     fs.writeFileSync(sessions, JSON.stringify(all));
   };
   const observer = path.join(bin, 'native-observer');
@@ -111,7 +112,8 @@ if(op==='query') {
     db.actors[request.token]={state:'running',nativeId,startedAt:'2026-09-27T00:00:00.000Z'};db.starts++;
     const all=JSON.parse(fs.readFileSync(sessions,'utf8'));
     all[nativeId]={source:'native_host',observationId:'host-observed-'+request.token,jobId:request.jobId,
-      nativeId,provider:'fixture',model:request.requestedModel,observedAt:'2026-09-27T00:00:00.000Z'};
+      nativeId,provider:'fixture',model:request.requestedModel,
+      context:{contextId:nativeId,mode:'new',proofId:'context-'+request.token},observedAt:'2026-09-27T00:00:00.000Z'};
     fs.writeFileSync(sessions,JSON.stringify(all));
   }
   save();
@@ -343,12 +345,10 @@ test('每票独立计划复核及过期工件门禁通过公开 CLI 生效', () 
     const next = x.call('next', statePath); assert.equal(next.status, 0, next.stderr);
     const checking = JSON.parse(next.stdout).jobs.find((j: {action:string}) => j.action === 'plan-check'); assert.ok(checking);
     x.observe('same-l1', checking.id, 'large');
-    assert.equal(x.call('bind', statePath, checking.id, binding).status, 0);
-    const same = x.call('stage', statePath, checking.id, JSON.stringify({ complete: true, status: 'pass', evidencePath: x.planEvidence }));
-    assert.notEqual(same.status, 0); assert.match(same.stderr, /独立 L1 原生会话/);
+    const same = x.call('bind', statePath, checking.id, binding);
+    assert.notEqual(same.status, 0); assert.match(same.stderr, /独立任务不能复用已有上下文/);
     const rejectedState = JSON.parse(fs.readFileSync(statePath, 'utf8'));
-    assert.equal(rejectedState.tickets[0].phase, 'replan');
-    assert.equal(rejectedState.tickets[0].failures.at(-1).category, 'receipt_validation');
+    assert.equal(rejectedState.tickets[0].phase, 'plan_check');
     // A fresh run with separate sessions reaches implementation, then a changed check file invalidates the approval.
   } finally { fs.rmSync(x.temp, { recursive: true, force: true }); }
   const y = fixture();

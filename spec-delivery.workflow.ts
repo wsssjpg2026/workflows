@@ -53,6 +53,10 @@ function nativeSession(statePath: string, nativeId: string, jobId: string): engi
   engine.ensure(raw?.source === 'native_host' && raw.jobId === jobId && !!raw.observationId &&
     raw.nativeId === nativeId && !!raw.provider && !!raw.model && Number.isFinite(Date.parse(raw.observedAt)),
     '宿主适配器未返回当前原生会话的可核对观测');
+  if (raw.context) engine.ensure(!!raw.context.contextId && !!raw.context.proofId &&
+    ['new','resumed'].includes(raw.context.mode) &&
+    (raw.context.mode !== 'resumed' || !!raw.context.resumedFromContextId),
+    '宿主上下文观测不完整');
   const evidenceDigest = sha(output);
   const directory = path.join(path.dirname(statePath), 'host-observations');
   fs.mkdirSync(directory, { recursive: true });
@@ -60,7 +64,8 @@ function nativeSession(statePath: string, nativeId: string, jobId: string): engi
   if (!fs.existsSync(evidencePath)) fs.writeFileSync(evidencePath, output + '\n', { flag: 'wx', mode: 0o444 });
   else engine.ensure(fs.readFileSync(evidencePath, 'utf8').trimEnd() === output, '原生会话观测归档发生冲突');
   return { source: 'native_host', observationId: raw.observationId, jobId, nativeId: raw.nativeId,
-    provider: raw.provider, model: raw.model, observedAt: raw.observedAt, evidencePath, evidenceDigest };
+    provider: raw.provider, model: raw.model, observedAt: raw.observedAt, evidencePath, evidenceDigest,
+    context: raw.context };
 }
 function verifySessionArtifact(session: engine.NativeSession) {
   engine.ensure(sha(fs.readFileSync(safeFile(session.evidencePath), 'utf8').trimEnd()) === session.evidenceDigest,
@@ -83,6 +88,128 @@ function skillObservation(statePath: string, operation: 'capabilities' | 'result
 function artifactFingerprint(files: string[]) {
   const unique = [...new Set(files.map(file => path.resolve(file)))];
   return { files: unique, digest: sha(JSON.stringify(unique.map(file => ({ file, digest: sha(fs.readFileSync(safeFile(file))) })))) };
+}
+function verifyHandoffRef(j: engine.Job) {
+  if (!j.handoffRef) return;
+  const ref=j.handoffRef;
+  engine.ensure(ref.appliedCandidateVersion===j.candidateVersion && sha(fs.readFileSync(safeFile(ref.path)))===ref.sha256 &&
+    sha(fs.readFileSync(safeFile(ref.verificationPath)))===ref.verificationDigest,
+    '已转发的交接原文或 L1 核验记录已改变');
+  verifySessionArtifact(ref.verifiedBy);
+}
+function handoffSuccessor(s:engine.State,id:string) {
+  const j=s.jobs.find(x=>x.id===id);
+  engine.ensure(j && active(j) && j.executor==='agent' && j.contextIntent?.kind==='continue' &&
+    j.contextObservation?.mode==='new' && !j.fresh, '只有未续接的在途后继 actor 需要交接');
+  const previous=s.jobs.find(x=>x.id===(j.contextIntent!.predecessorJobId || j.contextIntent!.parentJobId));
+  engine.ensure(previous && previous.session, '前序 actor 身份缺失');
+  engine.ensure(!j.handoffRef, '此后继 actor 已取得交接；不能覆盖原记录');
+  engine.ensure(j.candidateVersion===engine.candidateVersion(s,j.ticket==='$spec'?undefined:s.tickets.find(t=>t.key===j.ticket)),
+    '交接目标候选已过期');
+  return {j,previous};
+}
+function verifiedHandoffL1(s:engine.State,statePath:string,j:engine.Job,nativeId:string) {
+  const session=nativeSession(statePath,nativeId,`$handoff:${j.id}`);
+  engine.verifyNativeSession(s,session,nativeId,'L1');verifySessionArtifact(session);
+  engine.ensure(session.context?.mode==='new' && !s.jobs.some(x=>x.contextObservation?.contextId===session.context?.contextId),
+    '交接核验须由独立的新 L1 上下文完成');
+  engine.ensure(s.mainSession?.source!=='native_host'||s.mainSession.context?.contextId!==session.context.contextId,
+    '主会话不能冒充独立 L1 交接核验');
+  return session;
+}
+function handoffSourceLinks(links:unknown, original:string) {
+  engine.ensure(Array.isArray(links)&&links.length>0&&links.every(x=>typeof x==='string'&&x.length>0),
+    '交接须指向可定位的原始依据');
+  for(const link of links as string[]) {
+    engine.ensure(original.includes(link),'交接原文缺少所声明的原始依据引用');
+    if(/^https:\/\//.test(link)) {const url=new URL(link);engine.ensure(!url.username&&!url.password&&!url.search,
+      '交接引用不能携带凭据或查询参数');}
+    else safeFile(link);
+  }
+}
+function forwardOriginalHandoff(s:engine.State,statePath:string,id:string,request:{invocationId:string;decisionNativeId:string;
+  verificationPath:string;expectedCandidateVersion:string}) {
+  const {j,previous}=handoffSuccessor(s,id);
+  engine.ensure(request.expectedCandidateVersion===j.candidateVersion,'L1 交接核验使用过期候选');
+  const invocation=s.v3?.skillInvocations.find(i=>i.id===request.invocationId);
+  engine.ensure(invocation && invocation.jobId===previous.id && invocation.capability==='handoff' &&
+    invocation.session.nativeId===previous.nativeId && invocation.result?.status==='pass' &&
+    !invocation.result.blocking && !!invocation.result.rawOutputPath,
+    '原 actor 未实际完成已绑定的 handoff 技能调用');
+  skills.verifySkillResultFiles(s,previous,[invocation.id],invocation.result.rawOutputPath);
+  const original=fs.readFileSync(invocation.result.rawOutputPath,'utf8');
+  engine.ensure(/suggested skills/i.test(original),'原始 handoff 缺少 suggested skills 章节');
+  const verificationPath=path.resolve(request.verificationPath), verification=read<{jobId:string;candidateVersion:string;
+    head:string;base:string;sourceJobId:string;sourceHead:string;sourceBase:string;originalPath:string;
+    originalSha256:string;sourceLinks:string[]}>(safeFile(verificationPath));
+  engine.ensure(verification.jobId===j.id&&verification.candidateVersion===j.candidateVersion&&
+    verification.head===j.head&&verification.base===j.base&&verification.sourceJobId===previous.id&&
+    verification.sourceHead===previous.head&&verification.sourceBase===previous.base&&
+    verification.originalPath===invocation.result.rawOutputPath&&
+    verification.originalSha256===invocation.result.rawOutputSha256,
+    'L1 交接核验未绑定来源、原文及当前候选');
+  handoffSourceLinks(verification.sourceLinks,original);
+  const session=verifiedHandoffL1(s,statePath,j,request.decisionNativeId);
+  const at=new Date().toISOString();
+  j.handoffRef={kind:'original',sourceJobId:previous.id,sourceCandidateVersion:previous.candidateVersion || '',
+    appliedCandidateVersion:j.candidateVersion!,path:invocation.result.rawOutputPath,
+    sha256:invocation.result.rawOutputSha256,verificationPath,
+    verificationDigest:sha(fs.readFileSync(verificationPath)),verifiedBy:session,at,invocationId:invocation.id};
+  const artifact=artifactFingerprint([j.handoffRef.path,verificationPath]);
+  engine.recordL1Decision(s,{id:`handoff:${j.id}:${randomUUID()}`,kind:'handoff-verification',scope:j.id,
+    inputVersion:engine.inputVersion(s),sourceVersion:s.planSourceVersion,candidateVersion:j.candidateVersion!,
+    artifactPath:verificationPath,artifactFiles:artifact.files,artifactDigest:artifact.digest,session,at});
+  write(path.join(path.dirname(statePath),'jobs',sha(j.id).slice(0,20),'context-reference.json'),j.handoffRef);
+  engine.event(s,`${j.id} 转发原 actor handoff 原文及 L1 核验引用`);
+  return j.handoffRef;
+}
+function unavailableOriginal(statePath:string,previous:engine.Job) {
+  const observer=process.env.SPEC_DELIVERY_HOST_OBSERVER;
+  engine.ensure(observer&&path.isAbsolute(observer)&&fs.statSync(observer).isFile(),
+    '缺少可信宿主状态查询，不能宣称原 actor 已不可恢复');
+  const output=command(path.dirname(statePath),observer,['availability',previous.nativeId,previous.id]);
+  const raw=JSON.parse(output) as {source:string;nativeId:string;jobId:string;state:string;observationId:string;observedAt:string};
+  engine.ensure(raw.source==='native_host'&&raw.nativeId===previous.nativeId&&raw.jobId===previous.id&&
+    raw.state==='unavailable'&&!!raw.observationId&&Number.isFinite(Date.parse(raw.observedAt)),
+    '宿主未证实原 actor 不可恢复');
+  const file=path.join(path.dirname(statePath),'host-observations',`unavailable-${sha(previous.id+output).slice(0,24)}.json`);
+  if(!fs.existsSync(file))fs.writeFileSync(file,output+'\n',{flag:'wx',mode:0o444});
+  else engine.ensure(fs.readFileSync(file,'utf8').trimEnd()===output,'原 actor 状态证据已改变');
+  return file;
+}
+function reconstructHandoff(s:engine.State,statePath:string,id:string,request:{decisionNativeId:string;
+  expectedCandidateVersion:string;reconstructedPath:string}) {
+  const {j,previous}=handoffSuccessor(s,id);
+  engine.ensure(request.expectedCandidateVersion===j.candidateVersion,'L1 重建交接使用过期候选');
+  engine.ensure(!s.v3?.skillInvocations.some(i=>i.jobId===previous.id&&i.capability==='handoff'&&
+    i.result?.status==='pass'&&!i.result.blocking), '原 actor handoff 原文已归档，应核验并转发原文');
+  const unavailableEvidencePath=unavailableOriginal(statePath,previous);
+  const reconstructedPath=path.resolve(request.reconstructedPath);
+  const raw=read<{kind:string;jobId:string;sourceJobId:string;candidateVersion:string;head:string;base:string;
+    sourceLinks:string[];unknowns:string[];suggestedSkills:string[];reason:string}>(safeFile(reconstructedPath));
+  engine.ensure(raw.kind==='l1_reconstructed'&&raw.jobId===j.id&&raw.sourceJobId===previous.id&&
+    raw.candidateVersion===j.candidateVersion&&raw.head===j.head&&raw.base===j.base&&raw.reason&&
+    Array.isArray(raw.unknowns)&&raw.unknowns.length>0&&raw.unknowns.every(x=>typeof x==='string'&&x.trim())&&
+    Array.isArray(raw.suggestedSkills)&&raw.suggestedSkills.length>0,
+    'L1 重建必须标明未知项、当前候选和建议技能，不能冒称原 actor 交接');
+  handoffSourceLinks(raw.sourceLinks,fs.readFileSync(reconstructedPath,'utf8'));
+  const session=verifiedHandoffL1(s,statePath,j,request.decisionNativeId);
+  const archived=path.join(path.dirname(statePath),'handoffs',`${sha(j.id).slice(0,20)}-reconstructed.json`);
+  fs.mkdirSync(path.dirname(archived),{recursive:true});
+  if(!fs.existsSync(archived))fs.copyFileSync(reconstructedPath,archived,fs.constants.COPYFILE_EXCL);
+  else engine.ensure(fs.readFileSync(archived).equals(fs.readFileSync(reconstructedPath)),'重建交接归档不能覆盖');
+  const at=new Date().toISOString();
+  j.handoffRef={kind:'reconstructed',sourceJobId:previous.id,sourceCandidateVersion:previous.candidateVersion || '',
+    appliedCandidateVersion:j.candidateVersion!,path:archived,sha256:sha(fs.readFileSync(archived)),
+    verificationPath:reconstructedPath,verificationDigest:sha(fs.readFileSync(reconstructedPath)),
+    verifiedBy:session,unavailableEvidencePath,unknowns:raw.unknowns,at};
+  const artifact=artifactFingerprint([archived,reconstructedPath,unavailableEvidencePath]);
+  engine.recordL1Decision(s,{id:`handoff-reconstructed:${j.id}:${randomUUID()}`,kind:'handoff-verification',scope:j.id,
+    inputVersion:engine.inputVersion(s),sourceVersion:s.planSourceVersion,candidateVersion:j.candidateVersion!,
+    artifactPath:reconstructedPath,artifactFiles:artifact.files,artifactDigest:artifact.digest,session,at});
+  write(path.join(path.dirname(statePath),'jobs',sha(j.id).slice(0,20),'context-reference.json'),j.handoffRef);
+  engine.event(s,`${j.id} 原 actor 不可恢复；L1 依据持久证据重建并标明未知项`);
+  return j.handoffRef;
 }
 function decisionArtifacts(s: engine.State, j: engine.Job, r: engine.Result) {
   const t = s.tickets.find(t => t.key === j.ticket);
@@ -475,7 +602,9 @@ export function packet(s: engine.State, j: engine.Job, statePath: string) {
       old.epoch===j.epoch&&old.action===j.action&&old.candidateVersion===j.candidateVersion));
   const out = path.join(path.dirname(statePath), 'jobs', sha(j.id).slice(0, 20));
   const authored = ['implement', 'publish', 'integrate', 'replan'].includes(j.action);
-  const prior = (child ? [] : s.jobs.filter(x => x.ticket === j.ticket && x.status === 'done' && x.result &&
+  const freshInitial = j.fresh && j.action === 'review-lens';
+  const freshChild = !!child && j.fresh;
+  const prior = (child || freshInitial ? [] : s.jobs.filter(x => x.ticket === j.ticket && x.status === 'done' && x.result &&
     (j.action === 'review-report' ? x.epoch === j.epoch && ['review-lens', 'confirm', 'adjudicate'].includes(x.action)
       : !j.fresh && (authored || ['review-lens', 'confirm', 'review-report'].includes(x.action)))))
     .map(x => { archiveResult(statePath,x); return { action: x.action, epoch: x.epoch, head: x.head, base: x.base, status: x.result!.status,
@@ -483,11 +612,13 @@ export function packet(s: engine.State, j: engine.Job, statePath: string) {
   // 旧结果保持完整归档；每次派发只带当前轮的索引，完整历史按需读取。
   const relevant = prior.filter(x => x.epoch === j.epoch || x.head === j.head);
   const priorPath = path.join(out, 'prior-index.json');
-  write(priorPath, prior);
+  if (!freshInitial && !freshChild) write(priorPath, prior);
   const objective = j.fresh && (child || ['review-lens', 'confirm'].includes(j.action))
     ? { tests: t?.evidence.tests, visual: t?.evidence.visual } : t?.evidence || {};
   return { jobId: j.id, action: j.action, tier: j.tier, model: j.model, executor: j.executor, fresh: j.fresh, contextKey: j.contextKey,
-    contextIntent: j.contextIntent || null,
+    contextIntent:j.contextIntent || null, contextObservation:j.contextObservation || null,
+    contextReferencePath:path.join(out,'context-reference.json'),
+    handoffRef:freshInitial || freshChild ? null : j.handoffRef || null,
     skillChild: child ? { requestId: child.id, parentInvocationId: child.parentInvocationId,
       instruction: child.instruction, required: child.required, independent: child.independent,
       candidateVersion: child.candidateVersion, inputVersion: child.inputVersion,
@@ -502,11 +633,17 @@ export function packet(s: engine.State, j: engine.Job, statePath: string) {
     branch: t?.branch || '', worktree: t?.worktree || '', pr: t?.pr || 0, expectedHead: j.head, expectedBase: j.base,
     criteria: t?.criteria || s.specCriteria, visualRequired: t?.visual || false, closeout: t?.closeout || false,
     blockingReason: j.fresh && (child || ['review-lens','confirm'].includes(j.action)) ? '' : t?.reason || t?.lastProblem || '',
-    planPath: j.fresh && j.action !== 'plan-check' ? '' : t?.planPath || '', checksPath: t?.checksPath || '',
+    planPath: j.fresh && j.action !== 'plan-check' ? '' : t?.planPath || '',
+    checksPath: freshInitial || freshChild ? '' : t?.checksPath || '',
     handoffPath: j.fresh && j.action !== 'replan' ? '' : authored ? t?.handoffPath || '' : t?.reviewHandoff || '',
     sourceUrl: `https://${s.repo.host}/${s.repo.slug}/issues/${t?.number || s.spec}`,
-    objectiveEvidence: objective, prior: relevant.slice(-20), historyIndexPath: j.fresh && j.action !== 'review-report' ? '' : priorPath, finding: j.finding || null,
-    dispute: j.dispute ? Object.fromEntries(Object.entries(j.dispute).map(([key, id]) => [key, resultPaths(statePath, id).result])) : null,
+    objectiveEvidence: objective, prior: relevant.slice(-20), historyIndexPath: freshInitial || j.fresh && j.action !== 'review-report' ? '' : priorPath,
+    rawSources: freshInitial ? {specUrl:`https://${s.repo.host}/${s.repo.slug}/issues/${s.spec}`,
+      issueUrl:`https://${s.repo.host}/${s.repo.slug}/issues/${t?.number || s.spec}`,
+      candidate:{head:j.head,base:j.base,worktree:t?.worktree || ''},tests:t?.evidence.tests || null,
+      visual:t?.evidence.visual || null,standards:['AGENTS.md','CLAUDE.md'].map(name=>path.join(s.repo.root,name)).filter(fs.existsSync)} : null,
+    finding: freshInitial ? null : j.finding || null,
+    dispute: freshInitial ? null : j.dispute ? Object.fromEntries(Object.entries(j.dispute).map(([key, id]) => [key, resultPaths(statePath, id).result])) : null,
     remainingWork: j.ticket === '$spec' ? s.tickets.map(x => ({number:x.number,phase:x.phase,dependencies:x.dependencies,reason:x.reason})) : [],
     lens: j.action === 'review-lens' ? engine.lenses[Number(j.part)] : '',
     skillBindings: s.v3?.skillBindings?.map(b => ({ capability: b.capability, name: b.name,
@@ -534,6 +671,7 @@ function claimLease(s: engine.State, j: engine.Job, statePath: string) {
   catch (e) { if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false; throw e; }
 }
 function validateResult(s: engine.State, j: engine.Job, r: engine.Result) {
+  verifyHandoffRef(j);
   safeFile(r.evidencePath);
   if (r.handoffPath) safeFile(r.handoffPath);
   if (s.v3?.skillBindings && r.data?.skillInvocationIds) {
@@ -965,7 +1103,7 @@ export function consumeStaged(statePath: string, ids?: string[]) {
   const release = lock(statePath);
   try {
     let s = read<engine.State>(statePath); allowCompletion(s);
-    const jobs = s.jobs.filter(j => active(j) && j.nativeId && j.executor === 'agent' &&
+    const jobs = s.jobs.filter(j => active(j) && j.nativeId && j.executor === 'agent' && engine.contextReady(j) &&
       s.tickets.find(t => t.key === j.ticket)?.phase !== 'recovery' && (!ids || ids.includes(j.id)) &&
       (!s.v3?.dispatchRecords.find(d => d.jobId === j.id)?.managed ||
         s.v3.dispatchRecords.find(d => d.jobId === j.id)?.status === 'completed') &&
@@ -977,7 +1115,7 @@ export function consumeStaged(statePath: string, ids?: string[]) {
       try {
         const r = normalizeResult(s, j, read(resultPaths(statePath, j.id).result));
         const trial = structuredClone(s), job = trial.jobs.find(x => x.id === j.id)!;
-        if (trial.protocol === engine.currentProtocol) { engine.ensure(job.session, '模型任务缺少原生会话观测'); verifySessionArtifact(job.session); }
+        if (trial.protocol === engine.currentProtocol) { engine.ensure(job.session, '模型任务缺少原生会话观测'); verifySessionArtifact(job.session); verifyHandoffRef(job); }
         engine.ensure(!job.testExecution,'测试进程未完成，不能提交任务');
         job.timing ??= {leasedAt:''}; job.timing.resultAt=read<{at:string}>(resultPaths(statePath,j.id).ready).at;
         if (trial.protocol === engine.currentProtocol && job.tier === 'L1') {
@@ -998,6 +1136,7 @@ export function stageResult(statePath: string, id: string, value: unknown) {
   try {
     const s = read<engine.State>(statePath), j = s.jobs.find(j => j.id === id); allowCompletion(s);
     engine.ensure(j && j.executor === 'agent' && (active(j) || j.status === 'done'), '只能接收已登记的 agent 任务结果');
+    if(engine.contextReady(j))verifyHandoffRef(j);
     const r = normalizeResult(s, j, value), files = resultPaths(statePath, id);
     if(j.status==='done') engine.ensure(JSON.stringify(j.result)===JSON.stringify(r),'已完成任务的回执不能改变');
     safeFile(r.evidencePath); if (r.handoffPath) safeFile(r.handoffPath);
@@ -1109,7 +1248,7 @@ export async function main(argv: string[]): Promise<unknown> {
   const [op, file, extra, fourth] = argv;
   if(op==='version')return {workflow:'spec-delivery',version:workflowVersion};
   if (!op || op === 'help') return { workflow: 'spec-delivery', input: ['spec', 'targetBranch', 'models.L1', 'models.L2', 'models.L3'],
-    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan-context <state>', 'decision-context <state>', 'plan <state> <plan.json>', 'observe-main <state> <native-id>', 'drive <state>', 'next <state>', 'dispatch <state> <jobId>', 'dispatch-cancel <state> <jobId>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'skill-start <state> <jobId> <host-capabilities.json>', 'skill-delegate <state> <invocationId> <children.json>', 'skill-continue <state> <invocationId>', 'skill-retry <state> <invocationId> <keys.json>', 'skill-resume <state> <invocationId> <resume.json>', 'skill-finish <state> <invocationId> <outcome.json>', 'migrate-skills <state> <migration.json>', 'stage <state> <jobId> <result-json>', 'collect <state> [jobId]', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'test <state> <jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'recover-workspace <state> <ticket> <decision.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'metrics <state>', 'resume <state>', 'zcode <state>'] };
+    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan-context <state>', 'decision-context <state>', 'plan <state> <plan.json>', 'observe-main <state> <native-id>', 'drive <state>', 'next <state>', 'dispatch <state> <jobId>', 'dispatch-cancel <state> <jobId>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'context-handoff <state> <jobId> <verification.json>', 'context-reconstruct <state> <jobId> <reconstruction.json>', 'skill-start <state> <jobId> <host-capabilities.json>', 'skill-delegate <state> <invocationId> <children.json>', 'skill-continue <state> <invocationId>', 'skill-retry <state> <invocationId> <keys.json>', 'skill-resume <state> <invocationId> <resume.json>', 'skill-finish <state> <invocationId> <outcome.json>', 'migrate-skills <state> <migration.json>', 'stage <state> <jobId> <result-json>', 'collect <state> [jobId]', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'test <state> <jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'recover-workspace <state> <ticket> <decision.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'metrics <state>', 'resume <state>', 'zcode <state>'] };
   engine.ensure(file, '缺少输入文件/状态路径');
   // summary 在 lock() 之前返回：只验证可读协议，不创建/等待/恢复/删除状态锁，也不进入写路径。
   if (op === 'summary') return summarizeLedger(path.resolve(file));
@@ -1194,6 +1333,16 @@ export async function main(argv: string[]): Promise<unknown> {
       save(statePath,s);return {statePath,status:s.status,upgraded:true,backupPath:backup};
     }
     if(!['bind','submit','reconcile','retire'].includes(op))requireProtocol(s);
+    if (op === 'context-handoff') {
+      engine.ensure(extra&&fourth,'需要后继 jobId 与 L1 核验请求');
+      const ref=forwardOriginalHandoff(s,statePath,extra,read(fourth));save(statePath,s);
+      return {jobId:extra,handoffRef:ref,revision:s.revision};
+    }
+    if (op === 'context-reconstruct') {
+      engine.ensure(extra&&fourth,'需要后继 jobId 与 L1 重建请求');
+      const ref=reconstructHandoff(s,statePath,extra,read(fourth));save(statePath,s);
+      return {jobId:extra,handoffRef:ref,revision:s.revision};
+    }
     if (op === 'skill-start') {
       engine.ensure(extra && fourth, '需要 jobId 与宿主技能能力文件');
       const j = s.jobs.find(j => j.id === extra); engine.ensure(j, '未知技能执行 job');
@@ -1204,6 +1353,8 @@ export async function main(argv: string[]): Promise<unknown> {
         const child=s.v3?.skillChildren?.find(x=>x.id===j.childRequestId);
         engine.ensure(child?.skillCapability===request.capability, '子任务只能调用已声明并固定版本的引用技能');
       }
+      if(request.capability!=='handoff')engine.ensure(engine.contextReady(j),'新会话尚未取得 L1 核验的交接引用');
+      verifyHandoffRef(j);
       const observation = skillObservation(statePath, 'capabilities', request.capability, j.id);
       engine.ensure(observation.raw.capability === request.capability && observation.raw.capabilities,
         '技能宿主未返回当前能力的实际调用入口');
@@ -1338,8 +1489,12 @@ export async function main(argv: string[]): Promise<unknown> {
         const p = packet(s, j, statePath); const file = path.join(path.dirname(statePath), 'packets', sha(j.id).slice(0, 20) + '.json'); write(file, p);
         if (j.executor === 'agent' && s.protocol === engine.currentProtocol && !record) {
           const requestPath = path.join(path.dirname(statePath), 'dispatch', `${sha(j.id).slice(0, 20)}.json`);
+          const previous = s.jobs.find(x=>x.id===j.contextIntent?.predecessorJobId || x.id===j.contextIntent?.parentJobId);
           const request = { token: j.dispatchToken!, jobId: j.id, attempt: Number(j.id.match(/try-(\d+)$/)?.[1] || 1),
-            targetHost: s.capabilities?.framework || 'unknown', requestedModel: j.model, packetPath: file };
+            targetHost: s.capabilities?.framework || 'unknown', requestedModel: j.model, packetPath: file,
+            contextIntent:j.contextIntent || null,
+            resumeFrom: previous?.contextObservation ? {jobId:previous.id,nativeId:previous.nativeId,
+              contextId:previous.contextObservation.contextId} : null };
           write(requestPath, request);
           const at = new Date().toISOString();
           s.v3!.dispatchRecords.push({ ...request, requestPath, requestDigest:sha(fs.readFileSync(requestPath)),
@@ -1441,7 +1596,8 @@ export async function main(argv: string[]): Promise<unknown> {
         if (trialJob.status !== 'done') {
           engine.ensure(!trialJob.testExecution,'测试进程未完成');
           if (trial.protocol === engine.currentProtocol && trialJob.executor === 'agent') {
-            engine.ensure(trialJob.session, '缺少原生会话观测'); verifySessionArtifact(trialJob.session);
+          engine.ensure(trialJob.session, '缺少原生会话观测'); verifySessionArtifact(trialJob.session);
+          verifyHandoffRef(trialJob);
             if (trialJob.tier === 'L1') {
               const artifact = decisionArtifacts(trial, trialJob, r);
               trialJob.decisionArtifactDigest = artifact.digest; trialJob.decisionArtifactFiles = artifact.files;

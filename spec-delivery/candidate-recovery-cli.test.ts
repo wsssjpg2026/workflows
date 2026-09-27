@@ -86,7 +86,8 @@ console.log(JSON.stringify({data:{repository}}));
   const observe = (nativeId: string, jobId: string, model: string) => {
     const all = JSON.parse(fs.readFileSync(sessions, 'utf8'));
     all[nativeId] = { source: 'native_host', observationId: `event-${nativeId}`, jobId,
-      nativeId, provider: 'fixture', model, observedAt: '2026-09-27T00:00:00.000Z' };
+      nativeId, provider: 'fixture', model, context:{contextId:nativeId,mode:'new',proofId:`context-${nativeId}`},
+      observedAt: '2026-09-27T00:00:00.000Z' };
     fs.writeFileSync(sessions, JSON.stringify(all));
   };
   const observer = path.join(bin, 'native-observer');

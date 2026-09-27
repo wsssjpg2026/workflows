@@ -33,7 +33,7 @@
 1. `init <input.json>`：在目标仓库初始化，取得 `statePath`、原始来源和 `decisionContext`。主会话身份能由宿主观测时记录，否则为 `unknown`。已有运行返回原账本。
 2. `plan <state> <plan.json>`：真实 L1 提交执行图、验收映射、能力检查与资源预算。计划包含 `init` 或 `plan-context <state>` 返回的 `inputVersion/sourceVersion`，以及原生 L1 会话的 `decisionNativeId`。来源或模型配置变化后，旧计划会被拒绝。
 3. `drive <state>`：收取已完成 actor 的结果，在有界步数内推进确定性命令，返回所有尚未派发 jobs 和 packet 路径。配置派发适配器时，它也启动新 agent 任务；命令任务包含认领、验证、关闭与清理。
-4. 按 job 的 `model/fresh/contextKey` 派发，取得真实宿主身份后立即绑定。完成事件到达即调用 `collect` 或 `drive`；独立工单和同批快 actor 无需等待慢 actor。
+4. 按 job 的 `model/contextIntent` 派发，取得真实宿主身份与上下文证明后立即绑定。完成事件到达即调用 `collect` 或 `drive`；独立工单和同批快 actor 无需等待慢 actor。
 5. 无可运行 job 时，查询在途任务或按退避等待 CI。明确阻断、等待人工、用户暂停或完成时返回相应状态，避免空轮询。
 
 `next <state>` 是只预留、不执行命令的底层接口；它也会返回之前未派发的租约。每个 agent 租约同时写入不可变的派发请求：job、attempt、随机 token、目标宿主、请求模型和 packet 路径。`execute <state> <jobId>` 执行单个核心签发的确定性 job。主控操作状态的读改写由 CLI 加锁；actor 通过宿主 `stage` 返回内容，不直接编辑账本。
@@ -79,7 +79,13 @@ TypeScript 宿主也可使用 `spec-delivery/skills.ts` 的 `invokeBoundSkill`�
 
 `observe-main <state> <native-id>` 可记录当前主会话观测；省略或查询失败时 `init/reconfigure/resume` 记为 `unknown`。主会话观测不能代替 L1 计划、计划复核或审计证据。每个 L1 决策记录输入版本、作用范围、候选版本、产物路径及指纹和原生会话；每票计划与计划复核必须来自两个不同的原生会话。改变输入或产物后旧决策不能进入下一门禁。
 
-同模型且宿主确实支持恢复上下文时使用 `contextKey`；跨模型、跨 ZCode run 或不可恢复时读持久化 handoff。fresh 始终使用新上下文。packet 只内联当前证据索引；有历史需求再按 `historyIndexPath` 读取，避免每轮复制所有旧结果。fresh 初审排除旧结论，完整 diff 和原始证据仍须读取。
+`contextKey` 是宿主路由提示。每个模型 job 的 `contextIntent` 指明 `independent` 或 `continue`；作者实现/修复与 regular 同一审查职责可寻找前序 actor，计划复核、fresh、独立验收、重规划、裁决及最终审计要求新上下文。派发请求带前序 nativeId/contextId。可信 `SPEC_DELIVERY_HOST_OBSERVER` 的 `observe` 响应还须带 `context:{contextId,mode:"new"|"resumed",resumedFromContextId?,proofId}`；CLI 将原始响应归档，核对续接祖先或新上下文身份。`binding.json` 自填这些字段没有证明力。不能证明续接时，宿主创建新上下文，并经交接门禁后执行；未知身份不会被写成已续接。
+
+原 actor 可用时，由该 actor 显式调用固定版本的 `handoff` 技能，原文先落 OS 临时目录，再由 `skill-finish` 逐字归档。后继新会话的 `context-handoff <state> <jobId> <verification.json>` 接收 `{invocationId,decisionNativeId,verificationPath,expectedCandidateVersion}`。`verificationPath` 是 L1 的 JSON 核验记录，绑定后继 job、当前候选 head/base、前序 job/head/base、原文归档路径与 SHA-256，以及原文实际引用的 `sourceLinks`。CLI 查询独立 L1 会话，登记决策，向后继者转发原文路径和核验引用；不会把 L1 摘要当作原始 handoff。后继从 packet 的 `contextReferencePath` 读取此引用，复核当前候选。
+
+原 actor 已不可恢复时，宿主 `availability <nativeId> <jobId>` 必须返回 `state:"unavailable"` 的可信观测；然后 L1 可用 `context-reconstruct <state> <jobId> <reconstruction.json>`。请求包含 `decisionNativeId`、`expectedCandidateVersion` 和 `reconstructedPath`；重建 JSON 明确写 `kind:"l1_reconstructed"`、当前 job/候选、前序 job、`sourceLinks`、非空 `unknowns`、`suggestedSkills` 与理由。账本将其标为 `reconstructed`，保留原 actor 不可恢复证据。新会话在交接核验前不能启动其它绑定技能或提交结果。交接原文、核验文件及宿主观测的指纹变化会拒绝继续。
+
+fresh 首轮 packet 只传原始 spec/issue 链接、候选 head/base/worktree、仓库规范路径及原始测试/视觉证据；不传作者交接、regular 判断、辩解或历史索引。独立审查完成后再比较历史。普通 packet 只内联当前有限索引；完整历史按 `historyIndexPath` 读取。
 
 `collect <state>` 批量收取已完成、已绑定的暂存结果，并共享一次易变事实观测。检查返回的 `rejected[]`；被拒绝的原始结果会保留，不能覆盖成成功。主控核对错误、候选和原生终态后决定恢复或重派。`stage` 的存在须来自宿主完成事件，不能靠扫描 actor 自行写出的文件判定任务完成。
 

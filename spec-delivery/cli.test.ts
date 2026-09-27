@@ -27,7 +27,8 @@ function setup() {
   const sessions=path.join(run,'native-sessions.json');
   const observe=(nativeId:string,jobId:string,model:string,provider='fixture')=>{
     const all=fs.existsSync(sessions)?JSON.parse(fs.readFileSync(sessions,'utf8')):{};
-    all[nativeId]={source:'native_host',observationId:`observed-${nativeId}`,jobId,nativeId,provider,model,observedAt:'2026-09-27T00:00:00.000Z'};
+    all[nativeId]={source:'native_host',observationId:`observed-${nativeId}`,jobId,nativeId,provider,model,
+      context:{contextId:nativeId,mode:'new',proofId:`context-${nativeId}`},observedAt:'2026-09-27T00:00:00.000Z'};
     fs.writeFileSync(sessions,JSON.stringify(all));
   };
   const observer=path.join(root,'bin','observer');

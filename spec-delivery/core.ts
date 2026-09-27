@@ -54,6 +54,22 @@ export interface Capabilities { framework: string; mainModel?: string; modelRout
 export interface NativeSession {
   source: 'native_host'; observationId: string; jobId: string; nativeId: string; provider: string; model: string;
   observedAt: string; evidencePath: string; evidenceDigest: string;
+  /** Supplied by the trusted native observer, never by a binding request or actor result. */
+  context?: { contextId: string; mode: 'new' | 'resumed'; resumedFromContextId?: string; proofId: string };
+}
+export interface ContextIntent {
+  kind: 'independent' | 'continue'; parentJobId?: string; fresh: boolean;
+  lineage?: string; predecessorJobId?: string;
+}
+export interface ContextObservation {
+  source: 'native_host'; contextId: string; mode: 'new' | 'resumed'; resumedFromContextId?: string;
+  proofId: string; nativeId: string; evidencePath: string; evidenceDigest: string;
+}
+export interface HandoffReference {
+  kind: 'original' | 'reconstructed'; sourceJobId: string; sourceCandidateVersion: string;
+  appliedCandidateVersion: string; path: string; sha256: string; verificationPath: string;
+  verificationDigest: string; verifiedBy: NativeSession; at: string;
+  invocationId?: string; unavailableEvidencePath?: string; unknowns?: string[];
 }
 export interface HostEventRef { kind: 'start' | 'query' | 'collect' | 'cancel' | 'capabilities' | 'error'; evidencePath: string; digest: string; at: string }
 export interface HostInstanceRecord {
@@ -71,7 +87,7 @@ export interface DispatchRecord {
   events: HostEventRef[]; instances: HostInstanceRecord[];
 }
 export interface L1DecisionRecord {
-  id: string; kind: 'execution-plan' | 'ticket-plan' | 'plan-check' | 'replan' | 'adjudication' | 'spec-audit' | 'resolve';
+  id: string; kind: 'execution-plan' | 'ticket-plan' | 'plan-check' | 'replan' | 'adjudication' | 'spec-audit' | 'resolve' | 'handoff-verification';
   scope: string; inputVersion: string; sourceVersion?: string; candidateVersion: string; appliesToCandidateVersion?: string;
   artifactPath: string; artifactFiles: string[]; artifactDigest: string;
   session: NativeSession; at: string;
@@ -154,6 +170,7 @@ export interface Job {
   head: string; base: string; tests: number; status: 'leased' | 'running' | 'done' | 'cancelled';
   nativeId: string; result?: Result; finding?: Finding;
   dispatchToken?: string;
+  contextIntent?: ContextIntent; contextObservation?: ContextObservation; handoffRef?: HandoffReference;
   inputVersion?: string; candidateVersion?: string; session?: NativeSession; decisionArtifactDigest?: string; decisionArtifactFiles?: string[];
   timing?: { leasedAt: string; boundAt?: string; startedAt?: string; resultAt?: string; completedAt?: string; cancelledAt?: string };
   usage?: { inputTokens?: number; outputTokens?: number; cost?: number; currency?: string; modelMs?: number };
@@ -162,8 +179,6 @@ export interface Job {
   commandRecovery?: { nativeId: string; evidencePath: string; at: string };
   stopConfirmation?: { state: 'stopped' | 'lost'; evidencePath: string; processTreeStopped: boolean; at: string };
   parentInvocationId?: string; childRequestId?: string;
-  contextIntent?: { kind: 'independent' | 'continue'; parentJobId?: string; fresh: boolean;
-    lineage?: string; predecessorJobId?: string };
 }
 export interface State {
   schema: 1; id: string; revision: number; inputs: Inputs; spec: number;
@@ -202,6 +217,10 @@ export function verifyNativeSession(s: State, session: NativeSession, nativeId: 
     !!session.nativeId && !!session.provider && !!session.model && Number.isFinite(Date.parse(session.observedAt)),
     '缺少宿主原生会话观测；配置模型或 persona 不能证明实际角色');
   ensure(session.nativeId === nativeId, '宿主原生会话身份与任务不符');
+  if(session.context)ensure(!!session.context.contextId&&!!session.context.proofId&&
+    ['new','resumed'].includes(session.context.mode)&&
+    (session.context.mode!=='resumed'||!!session.context.resumedFromContextId),
+    '宿主上下文身份或续接证明不完整');
   const configured = s.inputs.models[tier];
   ensure((configured.includes('/') ? `${session.provider}/${session.model}` : session.model) === configured,
     `实际 ${tier} provider/model 与配置不符`);
@@ -501,9 +520,12 @@ export function reserve(s: State): Job[] {
       ensure(c.t && currentDecision(s, 'plan-check', c.t.key, candidateVersion(s, c.t)),
         `#${c.t?.number} 缺少当前输入与候选的独立 L1 计划复核`);
     const fresh = c.t?.phase === 'fresh' || ['plan', 'plan-check', 'accept', 'replan', 'spec-audit', 'adjudicate'].includes(c.action);
-    const continuity = ['implement', 'publish'].includes(c.action) ? 'author' : ['review-lens', 'confirm', 'review-report'].includes(c.action) ? `review-${part}` : c.action;
+    const contextIntent=contextIntentFor(s,key,c.action,part,fresh);
+    const predecessor=s.jobs.find(x=>x.id===contextIntent.predecessorJobId);
+    const lineage=contextIntent.lineage!;
     const j: Job = { id, ticket: key, epoch, action: c.action, part, tier, model: s.inputs.models[tier], executor, fresh,
-      contextKey: `${s.id}:${key}:${continuity}${fresh ? `:fresh-${epoch}` : ''}`, head: c.t?.head || '', base: c.t?.base || s.facts.base,
+      contextKey: predecessor ? `${s.id}:${lineage}` : `${id}:new`, contextIntent,
+      head: c.t?.head || '', base: c.t?.base || s.facts.base,
       tests: hasTests(c.action), status: 'leased', nativeId: '', finding: c.finding, dispute: c.dispute,
       inputVersion: inputVersion(s), candidateVersion: candidateVersion(s, c.t), timing: { leasedAt: new Date().toISOString() } };
     if (c.action === 'replan' && c.t) {
@@ -515,10 +537,20 @@ export function reserve(s: State): Job[] {
   if (created.length) event(s, `已预留 ${created.length} 个任务，含所有显式审查 actors`);
   return created;
 }
+export function contextIntentFor(s:State,ticketKey:string,action:Action,part:string,fresh:boolean):ContextIntent {
+  const continuity=['implement','publish','integrate'].includes(action)?'author'
+    : ['review-lens','confirm','review-report'].includes(action)?`review-${action}-${part}`:action;
+  const canContinue=!fresh&&(continuity==='author'||continuity.startsWith('review-'));
+  const lineage=`${ticketKey}:${continuity}`;
+  const predecessor=canContinue?s.jobs.findLast(x=>x.ticket===ticketKey&&x.status==='done'&&
+    x.executor==='agent'&&!x.fresh&&x.contextIntent?.lineage===lineage&&!!x.session):undefined;
+  return {kind:predecessor?'continue':'independent',fresh,lineage,predecessorJobId:predecessor?.id};
+}
 export function bind(s: State, id: string, ref: { nativeId: string; model?: string; session?: NativeSession }) {
   ensure(s.status === 'running', '当前 workflow 未运行，不能派发新任务');
   const j = s.jobs.find(j => j.id === id); ensure(j && busy(j), '任务不是待执行状态');
   ensure(!!ref.nativeId, '缺少宿主原生任务身份');
+  let contextObservation:ContextObservation|undefined;
   if (s.protocol === currentProtocol && j.executor === 'agent') {
     ensure(ref.session, '模型任务需要宿主原生会话观测，不能使用配置模型或 persona 冒充');
     verifyNativeSession(s, ref.session, ref.nativeId, j.tier);
@@ -536,10 +568,34 @@ export function bind(s: State, id: string, ref: { nativeId: string; model?: stri
         ensure(ref.nativeId !== sibling.nativeId && ref.session.observationId !== sibling.session!.observationId,
           '独立技能子任务不能复用兄弟会话');
     }
+    if (j.contextIntent) {
+      const observed = ref.session.context;
+      ensure(observed && observed.contextId && observed.proofId && ['new','resumed'].includes(observed.mode),
+        '宿主未证明实际上下文身份与新建/续接状态');
+      if (j.contextIntent.kind === 'independent') {
+        ensure(observed.mode === 'new' && !s.jobs.some(x => x.id !== j.id &&
+          x.contextObservation?.contextId === observed.contextId), '独立任务不能复用已有上下文');
+      } else {
+        const previousId = j.contextIntent.predecessorJobId || j.contextIntent.parentJobId;
+        const previous = s.jobs.find(x => x.id === previousId);
+        ensure(previous && (previous.status === 'done' ||
+          (j.contextIntent.parentJobId === previousId && previous.status === 'running')),
+          '续接任务缺少可核对的前序 actor');
+        if (observed.mode === 'resumed') ensure(previous.model===j.model && previous.contextObservation &&
+          observed.resumedFromContextId === previous.contextObservation.contextId &&
+          observed.contextId === previous.contextObservation.contextId,
+          '宿主续接证明与前序上下文不符');
+        else ensure(!s.jobs.some(x => x.id !== j.id && x.contextObservation?.contextId === observed.contextId),
+          '新会话不能冒用前序上下文身份');
+      }
+      contextObservation = { source: 'native_host', ...observed, nativeId: ref.nativeId,
+        evidencePath: ref.session.evidencePath, evidenceDigest: ref.session.evidenceDigest };
+    }
     if (j.session) ensure(JSON.stringify(j.session) === JSON.stringify(ref.session), '同一租约的会话观测不能被替换');
-    j.session = ref.session;
   } else ensure(ref.model === j.model, '实际派发模型与任务不符');
   ensure(!j.nativeId || j.nativeId === ref.nativeId, '同一租约不能重复绑定另一任务');
+  if(ref.session)j.session=ref.session;
+  if(contextObservation)j.contextObservation=contextObservation;
   j.nativeId = ref.nativeId; j.status = 'running';
   j.timing ??= { leasedAt: '' }; j.timing.boundAt ??= new Date().toISOString();
   event(s, `已绑定 ${j.action} 的原生任务`);
@@ -557,6 +613,11 @@ function validateSkillLinks(s: State, j: Job, r: Result) {
       '技能调用版本与当前绑定不符');
     return invocation;
   });
+  if (j.action === 'review-report' && r.handoffPath) {
+    const handoff=linked.find(x=>x.capability==='handoff');
+    ensure(handoff?.result?.status==='pass'&&!handoff.result.blocking,
+      'review 交接路径必须来自原 actor 实际完成的 handoff 技能');
+  }
   if (j.action !== 'implement') return;
   const professional = linked.filter(x => x.capability === 'implementation' || x.capability === 'diagnosis');
   if (!r.complete) return;
@@ -568,12 +629,23 @@ function validateSkillLinks(s: State, j: Job, r: Result) {
     const handoff = linked.find(x => x.capability === 'handoff');
     ensure(handoff?.result?.status === 'pass' && !handoff.result.blocking && !!r.handoffPath,
       '实现后的交接须实际调用已绑定 handoff 并归档原文');
+  } else if (r.status === 'replan') {
+    const handoff=linked.find(x=>x.capability==='handoff');
+    ensure(handoff?.result?.status==='pass'&&!handoff.result.blocking&&!!r.handoffPath,
+      '实现阶段重规划须由原 actor 调用 handoff 并归档原文');
   }
+}
+export function contextReady(j: Job) {
+  return !j.contextIntent || j.contextIntent.kind === 'independent' || j.contextObservation?.mode === 'resumed' ||
+    !!(j.handoffRef && j.handoffRef.appliedCandidateVersion === j.candidateVersion &&
+      j.handoffRef.sourceJobId === (j.contextIntent.predecessorJobId || j.contextIntent.parentJobId));
 }
 export function submit(s: State, id: string, r: Result) {
   ensure(s.status !== 'retired', '已退役运行不能接收执行结果');
   const paused = s.status === 'paused';
   const j = s.jobs.find(j => j.id === id); ensure(j, '未知任务');
+  if (j.executor === 'agent' && s.protocol === currentProtocol) ensure(contextReady(j),
+    '新上下文尚无 L1 核验的原始交接或标明未知项的重建交接');
   if (j.status === 'done') { ensure(JSON.stringify(j.result) === JSON.stringify(r), '重复回执内容不一致'); return; }
   ensure(busy(j) && j.nativeId, '先绑定实际任务，才能提交结果');
   ensure(r.model === j.model && !!r.evidencePath, '回执必须包含实际模型及证据路径');
@@ -698,7 +770,7 @@ export function submit(s: State, id: string, r: Result) {
       if (j.action === 'adjudicate') ensure(r.findings[0].assessment?.rationale, '裁决必须解释同候选判定分歧，不能用重复抽样代替证据');
       ensure(r.findings[0].confidence! < 50 || r.findings[0].confirmed === true, '>=50 的问题必须被独立证据确认'); break;
     case 'review-report': {
-      ensure(t && data.commentUrl && r.handoffPath, '审查必须留下完成评论和持久交接');
+      ensure(t && data.commentUrl, '审查必须留下完成评论');
       const cs = jobsAt(s, t, 'confirm').flatMap(x =>
         (jobsAt(s, t, 'adjudicate').find(d => d.part === x.part)?.result || x.result)?.findings || []);
       const blockers = cs.filter(f => f.confidence! >= 50);

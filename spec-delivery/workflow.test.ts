@@ -61,6 +61,14 @@ test('人工尾项保持父 spec 打开并产生交接', () => {
   const s = fixture(true); until(s, () => s.status === 'waiting_human', {human:true});
   assert.equal(s.facts.issueStates[100], 'OPEN'); assert.equal(s.tickets[0].cleaned, true);
 });
+test('人工 issue 被重新打开后不能凭旧 done 阶段关闭父 spec',()=>{
+  const s=fixture(true);s.tickets.forEach(t=>t.phase='done');
+  s.facts.issueStates[102]='OPEN';
+  const j=e.reserve(s)[0];assert.equal(j.action,'spec-audit');
+  e.bind(s,j.id,{nativeId:'audit',model:j.model});
+  assert.throws(()=>e.submit(s,j.id,response(s,j)),/未完成人工工单/);
+  assert.equal(s.facts.issueStates[100],'OPEN');
+});
 test('>=50 回到修复；49 不阻塞', () => {
   for (const score of [49, 50]) {
     const s = fixture(); until(s, () => s.jobs.some(j => j.action === 'review-report' && j.status === 'done'), {finding:score});
@@ -84,8 +92,55 @@ test('CI 实际失败不可豁免；缺 CI 需明确证据', () => {
   const r = { data: {ciWaiver:{reason:'billing',evidence:'bill',notStartedIds:['1']}} } as unknown as e.Result;
   assert.equal(e.ciAllowed(pr, r), false);
   assert.equal(e.ciAllowed({...pr,checks:[]}), false);
-  assert.equal(e.ciAllowed({...pr,checks:[]}, {...r,data:{ciConfigured:false,ciWaiver:{reason:'no_ci',evidence:'inspected'}}}), true);
+  assert.equal(e.ciAllowed({...pr,head:'H',base:'B',checks:[]}, {...r,data:{ciConfigured:false,
+    ciWaiver:{reason:'no_ci',evidence:'inspected',observedHead:'H',observedBase:'B',verification:'remote'}}}), true);
   assert.equal(e.ciAllowed({...pr,checks:[{id:'1',status:'pending'}]}, r), false);
+  assert.equal(e.ciAllowed({...pr,head:'H',base:'B',checks:[]}, {...r,data:{ciConfigured:false,
+    ciWaiver:{reason:'no_ci',evidence:'no check results yet',observedHead:'H',observedBase:'B'}}}), false);
+  assert.equal(e.ciAllowed({...pr,head:'H',base:'B',checks:[{id:'run',status:'startup_failure'}]},
+    {...r,data:{ciWaiver:{reason:'billing',evidence:'billing notice',notStartedIds:['run'],
+      observedHead:'H',observedBase:'B',verification:'remote'}}}), true);
+  assert.equal(e.ciAllowed({...pr,head:'H',base:'B',checks:[{id:'run',status:'startup_failure'},{id:'test',status:'failed'}]},
+    {...r,data:{ciWaiver:{reason:'billing',evidence:'billing notice',notStartedIds:['run','test'],
+      observedHead:'H',observedBase:'B',verification:'remote'}}}), false);
+});
+test('L2 验收缺口保存 issue 条件；L1 明确范围和测试边界后才回实现',()=>{
+  const s=fixture();until(s,()=>s.tickets[0].phase==='accept');
+  const accept=e.reserve(s)[0];e.bind(s,accept.id,{nativeId:'accept',model:accept.model});
+  const gap=response(s,accept);gap.status='gap';gap.data={planPath:'/fixture/supplement',
+    missingCriteria:['software'],reason:'missing observable behavior'};
+  e.submit(s,accept.id,gap);
+  const t=s.tickets[0];assert.equal(t.phase,'replan');assert.deepEqual(t.acceptanceGap?.missingCriteria,['software']);
+  const replan=e.reserve(s)[0];e.bind(s,replan.id,{nativeId:'replan',model:replan.model});
+  assert.throws(()=>e.submit(structuredClone(s),replan.id,response(s,replan)),/范围和测试边界/);
+  const approved=response(s,replan);approved.data={...approved.data,
+    gapEvidencePath:t.acceptanceGap!.evidencePath,scopeDecision:'add missing issue behavior',
+    testBoundary:'isolated command and public CLI regression'};
+  e.submit(s,replan.id,approved);assert.equal(t.phase,'plan_check');
+  finish(s,e.reserve(s)[0]);assert.equal(t.phase,'implement');assert.equal(t.acceptanceGap,undefined);
+});
+test('验收必须属于远端当前 head/base 和指定目标',()=>{
+  const s=fixture();until(s,()=>s.tickets[0].phase==='accept');
+  const j=e.reserve(s)[0];e.bind(s,j.id,{nativeId:'accept',model:j.model});
+  s.facts.prs[201].head='another-head';
+  e.submit(s,j.id,response(s,j));assert.equal(s.tickets[0].phase,'blocked');
+  assert.equal(s.tickets[0].reason,'stale');
+  assert.equal(s.tickets[0].evidence.accept,undefined);
+});
+test('人工延期仅接收真实原生人工依赖，且需两端不同记录',()=>{
+  const p=(kind:'software'|'human',records:string[])=>({capabilities:{framework:'fixture',mainModel:'large',modelRouting:'per_agent' as const,
+    models:['large','middle','small']},policy:{agents:3,issues:1,tests:1,noProgress:2,rounds:3},
+    tickets:[{number:101,kind:'software' as const,dependencies:[],criteria:['software'],visual:false,
+      deferredDependencies:[{issue:102,target:100,kind:'acceptance_only' as const,records}]},
+      {number:102,kind,dependencies:[],criteria:['onsite'],visual:false}],
+    specCriteria:['spec'],evidencePath:'/fixture/plan'});
+  const discovered=[{number:101,state:'OPEN',blockedBy:[{repo:'example/test',number:102,state:'OPEN'}]},
+    {number:102,state:'OPEN',blockedBy:[]}];
+  const replanned=()=>{const s=fixture();s.status='planning';return s;};
+  assert.throws(()=>e.applyPlan(replanned(),p('software',['source','target']),discovered),/人工验收工单/);
+  assert.throws(()=>e.applyPlan(replanned(),p('human',['same','same']),discovered),/两端/);
+  const s=fixture();s.status='planning';e.applyPlan(s,p('human',['source','target']),discovered);
+  assert.equal(e.reserve(s).some(j=>j.ticket==='101'&&j.action==='claim'),true);
 });
 test('修复已提交尚未推送时，旧远端 head 不覆盖本地新候选', () => {
   const s = fixture(); until(s, () => s.tickets[0].phase === 'implement' && s.tickets[0].round > 0, {finding:50});
@@ -109,6 +164,12 @@ test('中途人工技术前置触发交接而不是空转或提前完成', () =>
   assert.throws(() => e.submit(structuredClone(s),audit.id,response(s,audit)));
   e.submit(s,audit.id,response(s,audit,{human:true})); assert.equal(s.status,'waiting_human');
 });
+test('未解决的软件阻断不能标为 waiting_human',()=>{
+  const s=fixture();s.tickets[0].phase='blocked';s.tickets[0].reason='CI failed';
+  const audit=e.reserve(s)[0];assert.equal(audit.action,'spec-audit');
+  e.bind(s,audit.id,{nativeId:'audit',model:audit.model});
+  assert.throws(()=>e.submit(s,audit.id,response(s,audit,{human:true})),/技术工作/);
+});
 test('审查单路丢失可重派，其余上下文与结果保留', () => {
   const s = fixture(); until(s, () => s.tickets[0].phase === 'review');
   const js = e.reserve(s); js[0].status = 'cancelled';
@@ -119,7 +180,7 @@ test('审查单路丢失可重派，其余上下文与结果保留', () => {
 test('恢复次数不消耗实际收尾轮数', () => {
   const s=fixture(); s.tickets[0].phase='done'; s.auditEpoch=100;
   const j=e.reserve(s)[0]; e.bind(s,j.id,{nativeId:'audit',model:j.model});
-  const r=response(s,j); r.status='needs_closeout'; r.data={planPath:'/fixture/plan',remainingCriteria:['missing']};
+  const r=response(s,j); r.status='needs_closeout'; r.data={planPath:'/fixture/plan',remainingCriteria:['spec']};
   e.submit(s,j.id,r); assert.equal(s.tickets.filter(t=>t.closeout).length,1); assert.equal(s.status,'running');
 });
 test('父 spec 提前被关闭仍会清理已验收的收尾资源', () => {

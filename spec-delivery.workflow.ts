@@ -576,7 +576,8 @@ export function observe(s: engine.State, jobs?: engine.Job[]): engine.LiveFacts 
   const prs: Record<string, engine.LivePR> = { ...s.facts.prs };
   for (const [n, p] of Object.entries(fresh.prs)) {
     const old = s.facts.prs[n];
-    prs[n] = { ...p, checks: old?.head === p.head && old.base === p.base ? old.checks : [] };
+    prs[n] = { ...p, checks: old?.head === p.head && old.base === p.base && old.ciMergeHead === p.ciMergeHead ? old.checks : [],
+      ciMergeTree: old?.ciMergeHead === p.ciMergeHead ? old?.ciMergeTree : undefined };
   }
   const ci = selected.filter(t => jobs
     ? jobs.some(j => (j.ticket === t.key && ['accept', 'merge', 'cleanup'].includes(j.action)) || j.ticket === '$spec')
@@ -770,16 +771,60 @@ function claimLease(s: engine.State, j: engine.Job, statePath: string) {
   try { fs.writeFileSync(file, JSON.stringify({ stateId: s.id, statePath, issue: t.number }), { flag: 'wx' }); return true; }
   catch (e) { if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false; throw e; }
 }
-function validateResult(s: engine.State, j: engine.Job, r: engine.Result) {
+function validateResult(s: engine.State, j: engine.Job, r: engine.Result, statePath: string) {
   verifyHandoffRef(j);
   safeFile(r.evidencePath);
   if (r.handoffPath) safeFile(r.handoffPath);
+  if(j.action==='spec-audit'&&r.status==='waiting_human') {
+    const url=String(r.data?.humanHandoffUrl||'');
+    const issues=[gh.issue(s.repo,s.spec),...s.tickets.filter(t=>t.kind==='human').map(t=>gh.issue(s.repo,t.number))];
+    const criteria=new Set([...s.specCriteria,...s.tickets.flatMap(t=>t.criteria)]);
+    engine.ensure(issues.some(issue=>issue.comments.some(c=>c.url===url))&&
+      Array.isArray(r.data?.pendingCriteria)&&
+      (r.data.pendingCriteria as unknown[]).every(c=>typeof c==='string'&&criteria.has(c)),
+      '人工交接须已发布在既有人工 issue 或父 spec，列明原 spec 待验条件');
+  }
+  if(j.action==='spec-audit'&&r.status==='needs_closeout')safeFile(String(r.data?.planPath||''));
   if (s.v3?.skillBindings && r.data?.skillInvocationIds) {
     engine.ensure(Array.isArray(r.data.skillInvocationIds) && r.data.skillInvocationIds.every(x => typeof x === 'string'),
       '技能调用引用必须是 ID 数组');
     skills.verifySkillResultFiles(s, j, r.data.skillInvocationIds as string[], r.handoffPath);
   }
   const t = s.tickets.find(t => t.key === j.ticket); if (!t || !r.complete) return;
+  if (s.protocol === engine.currentProtocol && ['publish','merge'].includes(j.action)) {
+    const kind=j.action, file=path.join(path.dirname(statePath),'actions',`${sha(j.id).slice(0,20)}.${kind}.intent.json`);
+    const intent=read<{operationId:string;jobId:string;head:string;base:string;pr?:number}>(safeFile(file));
+    engine.ensure(intent.jobId===j.id&&intent.head===j.head&&intent.base===j.base&&
+      r.data?.operationId===intent.operationId&&r.evidencePath===path.join(path.dirname(statePath),'actions',
+        `${sha(j.id).slice(0,20)}.${kind}.json`),
+      'PR/合并结果缺少当前候选的稳定操作意图与远端对账证据');
+  }
+  if (j.action === 'accept' && r.status === 'ready' && r.data?.ciWaiver) {
+    const waiver = r.data.ciWaiver as Record<string, unknown>;
+    const file = path.resolve(String(waiver.evidence || ''));
+    const record=s.ciAttestations?.find(a=>a.path===file&&a.jobId===j.id&&a.reason===waiver.reason&&
+      a.head===t.head&&a.base===t.base);
+    engine.ensure(record && file.startsWith(path.join(path.dirname(statePath),'ci')+path.sep) &&
+      fs.statSync(file).isFile() && sha(fs.readFileSync(file))===record.sha256,
+      'CI 豁免必须引用当前运行 ci-attest 的原始远端观测');
+    const attestation = read<{jobId:string;reason:string;pr:number;head:string;base:string;checks:gh.CheckFact[];
+      inventory?:ReturnType<typeof gh.workflowInventory>;required?:string[];
+      notices?:ReturnType<typeof gh.checkRunNotice>[]}>(file);
+    engine.ensure(attestation.jobId === j.id && attestation.pr === t.pr &&
+      attestation.head === t.head && attestation.base === t.base &&
+      attestation.reason === waiver.reason && waiver.verification === 'remote' &&
+      waiver.observedHead === t.head && waiver.observedBase === t.base &&
+      JSON.stringify(attestation.checks) === JSON.stringify(s.facts.prs[String(t.pr)]?.checks),
+      'CI 豁免观测与当前 job、候选或远端检查不一致');
+    if (waiver.reason === 'no_ci') engine.ensure(attestation.inventory?.length === 0 && attestation.required?.length === 0 &&
+      attestation.checks.length === 0 && r.data.ciConfigured === false,
+      '无 CI 豁免须有空检查和空工作流清单');
+    else engine.ensure(waiver.reason === 'billing' && Array.isArray(waiver.notStartedIds) &&
+      (waiver.notStartedIds as unknown[]).length > 0 &&
+      (waiver.notStartedIds as unknown[]).every(id => attestation.notices?.some(n => n.id === id &&
+        /bill(?:ing)?|payment|spending limit|额度|计费|付款/i.test(`${n.title} ${n.summary}`))),
+      '计费豁免须逐项引用远端未启动检查及计费通知');
+  }
   if (s.v3?.skillBindings && j.action==='implement' && r.status==='implemented') {
     const professional=(r.data?.skillInvocationIds as string[] || []).map(id=>s.v3!.skillInvocations.find(i=>i.id===id))
       .find(i=>i?.capability==='implementation' || i?.capability==='diagnosis');
@@ -1056,12 +1101,121 @@ function publishReviewReport(s:engine.State,j:engine.Job):engine.Result {
 function closeIssue(s:engine.State,j:engine.Job,statePath:string):engine.Result {
   const t=s.tickets.find(t=>t.key===j.ticket), number=t?.number || s.spec;
   if(j.action==='spec-close') engine.ensure(s.specAudit?.status==='complete' && s.specAudit.base===s.facts.base && j.base===s.facts.base,'spec 验收已过期');
-  else engine.ensure(t && s.facts.prs[t.pr]?.state==='MERGED' && s.facts.prs[t.pr].baseRef===s.inputs.targetBranch && engine.freshEvidence(t,'accept'),'工单未合并或缺少有效验收，不能关闭');
+  else {
+    engine.ensure(t && s.facts.prs[t.pr]?.state==='MERGED' && s.facts.prs[t.pr].baseRef===s.inputs.targetBranch &&
+      engine.freshEvidence(t,'accept'),'工单未合并或缺少有效验收，不能关闭');
+    const live=gh.pr(s.repo,t.pr),target=gh.targetHead(s.repo,s.inputs.targetBranch);
+    engine.ensure(live.state==='MERGED'&&live.head===t.head&&live.baseRef===s.inputs.targetBranch&&
+      !!live.mergedHead,'关闭前远端 PR 候选或目标分支已改变');
+    git(s.repo.root,'fetch','--no-tags',selectRemote(s),s.inputs.targetBranch);
+    git(s.repo.root,'merge-base','--is-ancestor',live.mergedHead,target);
+    engine.ensure(gh.targetHead(s.repo,s.inputs.targetBranch)===target,
+      '关闭核对期间目标分支变化，先重新观察');
+  }
+  const intent=operationIntent(statePath,j,'close',{issue:number,pr:t?.pr||null,
+    head:t?.head||null,base:j.base,target:s.inputs.targetBranch});
   if(s.facts.issueStates[number]!=='CLOSED') command(s.repo.root,'gh',['issue','close',String(number),'--repo',`https://${s.repo.host}/${s.repo.slug}`,'--reason','completed']);
   const issue=gh.issue(s.repo,number);engine.ensure(issue.state==='CLOSED','尚未观察到 issue 关闭');
   const evidencePath=path.join(path.dirname(statePath),'actions',sha(j.id).slice(0,20)+'.close.json');
-  write(evidencePath,{jobId:j.id,issue:number,state:issue.state,base:s.facts.base,acceptance:t?.evidence.accept || s.specAudit});
-  return {model:j.model,complete:true,status:'closed',base:j.base,evidencePath};
+  write(evidencePath,{jobId:j.id,operationId:intent.operationId,issue:number,state:issue.state,
+    base:s.facts.base,acceptance:t?.evidence.accept || s.specAudit});
+  return {model:j.model,complete:true,status:'closed',base:j.base,evidencePath,
+    data:{operationId:intent.operationId}};
+}
+function operationIntent<T extends object>(statePath:string,j:engine.Job,kind:string,input:T) {
+  const operationId=`${kind}:${sha(j.id).slice(0,24)}`;
+  const file=path.join(path.dirname(statePath),'actions',`${sha(j.id).slice(0,20)}.${kind}.intent.json`);
+  const intent={operationId,jobId:j.id,kind,...input};
+  if(fs.existsSync(file))engine.ensure(JSON.stringify(read(file))===JSON.stringify(intent),
+    '远端操作意图已固定；不能在响应不确定后改变目标或内容');
+  else write(file,intent);
+  return {operationId,file};
+}
+function publishPr(statePath:string,jobId:string,request:{title:string;bodyPath:string;completionPath:string}):engine.Result {
+  const s=read<engine.State>(statePath);requireProtocol(s);
+  const j=s.jobs.find(j=>j.id===jobId);engine.ensure(j?.action==='publish'&&active(j)&&j.nativeId,
+    '只允许已绑定的当前发布任务创建 PR');
+  const t=engine.ticket(s,j.ticket);
+  engine.ensure(t.phase==='publish'&&t.epoch===j.epoch&&t.head===j.head&&t.base===j.base&&
+    engine.freshEvidence(t,'tests')&&engine.freshEvidence(t,'self')&&
+    localHead(t)===t.head&&clean(t),'发布意图的候选或测试证据已过期');
+  engine.ensure(gh.targetHead(s.repo,s.inputs.targetBranch)===t.base,'目标分支已变化，先集成并重审');
+  engine.ensure(request.title?.trim(),'PR 需要标题');
+  const body=fs.readFileSync(safeFile(request.bodyPath),'utf8');
+  const completion=fs.readFileSync(safeFile(request.completionPath),'utf8');
+  const intent=operationIntent(statePath,j,'publish',{head:t.head,base:t.base,branch:t.branch,
+    title:request.title,bodySha256:sha(body),completionSha256:sha(completion)});
+  const prMarker=`<!-- spec-delivery:${s.id}:${t.key}:pr:${intent.operationId} -->`;
+  const commentMarker=`<!-- spec-delivery:${s.id}:${t.key}:published:${intent.operationId} -->`;
+  const prBody=`${prMarker}\n\n${body.trimEnd()}\n`;
+  const commentBody=`${commentMarker}\n\n${completion.trimEnd()}\n`;
+  let number=gh.pullRequestWithMarker(s.repo,t.branch,s.inputs.targetBranch,prMarker);
+  if(!number) {
+    const attempt=path.join(path.dirname(statePath),'actions',`${sha(j.id).slice(0,20)}.pr-create.attempt.json`);
+    engine.ensure(!fs.existsSync(attempt),'PR 创建曾发出但远端尚未确认；保留操作意图，不能盲目重发');
+    write(attempt,{operationId:intent.operationId,head:t.head,base:t.base,at:new Date().toISOString()});
+    try {number=gh.createPullRequest(s.repo,{title:request.title,headRef:t.branch,
+      baseRef:s.inputs.targetBranch,body:prBody});}
+    catch(error){number=gh.pullRequestWithMarker(s.repo,t.branch,s.inputs.targetBranch,prMarker);if(!number)throw error;}
+  }
+  engine.ensure(gh.pullRequestWithMarker(s.repo,t.branch,s.inputs.targetBranch,prMarker)===number,
+    '创建后未能按固定操作标记核对远端 PR');
+  const pr=gh.pr(s.repo,number);
+  engine.ensure(pr.state==='OPEN'&&!pr.draft&&pr.head===t.head&&pr.base===t.base&&
+    pr.baseRef===s.inputs.targetBranch&&pr.headRef===t.branch,'创建后 PR 不是预期候选');
+  const existing=gh.prComments(s.repo,number).find(c=>c.body.includes(commentMarker));
+  engine.ensure(!existing||existing.body===commentBody,'已有完成评论内容与固定发布意图不一致');
+  let commentUrl=existing?.url;
+  if(!commentUrl) {
+    const attempt=path.join(path.dirname(statePath),'actions',`${sha(j.id).slice(0,20)}.pr-comment.attempt.json`);
+    engine.ensure(!fs.existsSync(attempt),'完成评论曾发出但远端尚未确认；不能盲目重发');
+    write(attempt,{operationId:intent.operationId,pr:number,at:new Date().toISOString()});
+    try {commentUrl=gh.postIssueComment(s.repo,number,commentBody);}
+    catch(error){const posted=gh.prComments(s.repo,number).find(c=>c.body===commentBody);
+      if(!posted)throw error;commentUrl=posted.url;}
+  }
+  engine.ensure(gh.prComments(s.repo,number).some(c=>c.url===commentUrl&&c.body===commentBody),
+    '发布后未能按固定操作标记核对完成评论');
+  const evidencePath=path.join(path.dirname(statePath),'actions',`${sha(j.id).slice(0,20)}.publish.json`);
+  write(evidencePath,{...intent,pr:number,commentUrl,head:pr.head,base:pr.base,at:new Date().toISOString()});
+  return {model:j.model,complete:true,status:'published',head:j.head,base:j.base,evidencePath,
+    data:{pr:number,commentUrl,operationId:intent.operationId}};
+}
+function mergePr(statePath:string,jobId:string,request:{strategy:'merge'|'squash'|'rebase'}):engine.Result {
+  const s=read<engine.State>(statePath);requireProtocol(s);
+  const j=s.jobs.find(j=>j.id===jobId);engine.ensure(j?.action==='merge'&&active(j)&&j.nativeId,
+    '只允许已绑定的当前合并任务操作 PR');
+  const t=engine.ticket(s,j.ticket);
+  engine.ensure(t.epoch===j.epoch&&t.head===j.head&&t.base===j.base&&
+    ['merge','blocked'].includes(t.phase),'合并任务候选或轮次已改变');
+  engine.ensure(['merge','squash','rebase'].includes(request.strategy),'合并策略必须显式指定');
+  const intent=operationIntent(statePath,j,'merge',{pr:t.pr,head:t.head,base:t.base,
+    target:s.inputs.targetBranch,strategy:request.strategy});
+  const marker=`spec-delivery operation ${intent.operationId}`;
+  const observed=observe(s,[j]);s.facts=observed;
+  const live=observed.prs[String(t.pr)];
+  let uncertain='';
+  if(live?.state!=='MERGED') {
+    const attempt=path.join(path.dirname(statePath),'actions',`${sha(j.id).slice(0,20)}.merge.attempt.json`);
+    if(fs.existsSync(attempt)) uncertain='已有合并请求但远端仍开放；等待平台结果或显式 L1 对账';
+    else {
+      if(s.v3?.skillBindings)requireCurrentAuthorReview(s,t);
+      if(s.protocol===engine.currentProtocol)verifyReviewEvidenceFiles(s,t);
+      engine.ensure(engine.mergeGate(s,t),'合并前远端 head/base、审查、验收或 CI 门禁已改变');
+      write(attempt,{operationId:intent.operationId,pr:t.pr,head:t.head,base:t.base,at:new Date().toISOString()});
+      try {gh.mergePullRequest(s.repo,t.pr,t.head,request.strategy,marker);}
+      catch(error){const after=gh.pr(s.repo,t.pr);if(after.state!=='MERGED')uncertain=(error as Error).message;}
+    }
+  }
+  const after=gh.pr(s.repo,t.pr);
+  engine.ensure(after.head===t.head&&after.baseRef===s.inputs.targetBranch,
+    '合并后远端 PR 候选或目标不符');
+  const status=after.state==='MERGED'?'merged':'waiting_merge';
+  if(status==='merged')engine.ensure(!!after.mergedHead,'远端尚未给出合并提交');
+  const evidencePath=path.join(path.dirname(statePath),'actions',`${sha(j.id).slice(0,20)}.merge.json`);
+  write(evidencePath,{...intent,status,mergedHead:after.mergedHead,uncertain,at:new Date().toISOString()});
+  return {model:j.model,complete:true,status,head:j.head,base:j.base,evidencePath,
+    data:{operationId:intent.operationId,mergedHead:after.mergedHead}};
 }
 function commandReceipt(statePath:string,id:string) {return path.join(path.dirname(statePath),'commands',sha(id).slice(0,20)+'.json');}
 function hasCommandReceipt(statePath:string,j:engine.Job) {
@@ -1098,7 +1252,7 @@ function executeCommand(statePath: string, id: string) {
   release = lock(statePath);
   try {
     const latest = read<engine.State>(statePath); latest.facts = observe(latest,[j]);
-    if(j.action==='claim' || j.action==='review-report' && latest.protocol===engine.currentProtocol) validateResult(latest,j,r);
+    if(j.action==='claim' || j.action==='review-report' && latest.protocol===engine.currentProtocol) validateResult(latest,j,r,statePath);
     engine.submit(latest, j.id, r); archiveResult(statePath,latest.jobs.find(x=>x.id===j.id)!); save(statePath, latest);
     return { statePath, status: latest.status, revision: latest.revision, result: r };
   } finally { release(); }
@@ -1406,7 +1560,7 @@ export function consumeStaged(statePath: string, ids?: string[]) {
           const artifact = decisionArtifacts(trial, job, r);
           job.decisionArtifactDigest = artifact.digest; job.decisionArtifactFiles = artifact.files;
         }
-        validateResult(trial, job, r); engine.submit(trial, job.id, r); journalBoundSession(trial, job);
+        validateResult(trial, job, r, statePath); engine.submit(trial, job.id, r); journalBoundSession(trial, job);
         const accepted = trial.v3?.receiptRecords?.find(x => x.jobId === j.id)?.revisions.find(x => x.id === revision?.id);
         if (accepted) accepted.status = 'accepted';
         const record = trial.v3?.receiptRecords?.find(x => x.jobId === j.id);
@@ -1881,7 +2035,7 @@ export async function main(argv: string[]): Promise<unknown> {
   const [op, file, extra, fourth] = argv;
   if(op==='version')return {workflow:'spec-delivery',version:workflowVersion};
   if (!op || op === 'help') return { workflow: 'spec-delivery', input: ['spec', 'targetBranch', 'models.L1', 'models.L2', 'models.L3'],
-    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan-context <state>', 'decision-context <state>', 'plan <state> <plan.json>', 'observe-main <state> <native-id>', 'drive <state>', 'next <state>', 'dispatch <state> <jobId>', 'dispatch-cancel <state> <decision.json>', 'recover-result <state> <decision.json>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'context-handoff <state> <jobId> <verification.json>', 'context-reconstruct <state> <jobId> <reconstruction.json>', 'skill-start <state> <jobId> <host-capabilities.json>', 'skill-delegate <state> <invocationId> <children.json>', 'skill-continue <state> <invocationId>', 'skill-retry <state> <invocationId> <keys.json>', 'skill-resume <state> <invocationId> <resume.json>', 'skill-finish <state> <invocationId> <outcome.json>', 'migrate-skills <state> <migration.json>', 'stage <state> <jobId> <result-json>', 'stage-raw <state> <jobId> <raw-file>', 'collect <state> [jobId]', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'test <state> <jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'recover-workspace <state> <ticket> <decision.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'record-wait <state> <observation.json>', 'metrics <state>', 'metrics-compare <before-state> <after-state>', 'resume <state>', 'zcode <state>'] };
+    version:workflowVersion,readme: path.join(home, 'spec-delivery', 'README.md'), commands: ['version','summary <state.json>', 'init <input.json>', 'inspect <state>', 'plan-context <state>', 'decision-context <state>', 'plan <state> <plan.json>', 'observe-main <state> <native-id>', 'drive <state>', 'next <state>', 'dispatch <state> <jobId>', 'dispatch-cancel <state> <decision.json>', 'recover-result <state> <decision.json>', 'bind <state> <jobId> <binding.json>', 'bind-batch <state> <binding.json>', 'context-handoff <state> <jobId> <verification.json>', 'context-reconstruct <state> <jobId> <reconstruction.json>', 'skill-start <state> <jobId> <host-capabilities.json>', 'skill-delegate <state> <invocationId> <children.json>', 'skill-continue <state> <invocationId>', 'skill-retry <state> <invocationId> <keys.json>', 'skill-resume <state> <invocationId> <resume.json>', 'skill-finish <state> <invocationId> <outcome.json>', 'migrate-skills <state> <migration.json>', 'stage <state> <jobId> <result-json>', 'stage-raw <state> <jobId> <raw-file>', 'collect <state> [jobId]', 'submit <state> <jobId> <result.json>', 'execute <state> <jobId>', 'publish-pr <state> <jobId> <request.json>', 'merge-pr <state> <jobId> <request.json>', 'test <state> <jobId> <request.json>', 'ci-attest <state> <accept-jobId> <request.json>', 'guard <state> <jobId>', 'reconcile <state> <host-status.json>', 'recover-workspace <state> <ticket> <decision.json>', 'resolve <state> <decisions.json>', 'reconfigure <state> <models.json>', 'upgrade <state> <evidence.json>', 'retire <state> <reason.json>', 'record-host <state> <observations.json>', 'record-wait <state> <observation.json>', 'metrics <state>', 'metrics-compare <before-state> <after-state>', 'resume <state>', 'zcode <state>'] };
   engine.ensure(file, '缺少输入文件/状态路径');
   // summary 在 lock() 之前返回：只验证可读协议，不创建/等待/恢复/删除状态锁，也不进入写路径。
   if (op === 'summary') return summarizeLedger(path.resolve(file));
@@ -1908,6 +2062,12 @@ export async function main(argv: string[]): Promise<unknown> {
       tickets: s.tickets.map(t => ({ ticket: t.key, phase: t.phase, candidateVersion: engine.candidateVersion(s, t) })) };
   }
   if (op === 'execute') { engine.ensure(extra, '需要 command jobId'); return executeCommand(path.resolve(file), extra); }
+  if (op === 'publish-pr' || op === 'merge-pr') {
+    engine.ensure(extra&&fourth,'需要 jobId 与固定远端操作请求文件');
+    const statePath=path.resolve(file),release=lock(statePath);
+    try {return op==='publish-pr'?publishPr(statePath,extra,read(fourth)):mergePr(statePath,extra,read(fourth));}
+    finally {release();}
+  }
   if (op === 'test') {engine.ensure(extra && fourth,'需要 jobId 与测试请求文件');return runTest(path.resolve(file),extra,read(fourth));}
   if (op === 'stage' || op === 'stage-raw') {
     engine.ensure(extra && fourth, '需要 jobId 与结果 JSON 内容或原文文件');
@@ -1963,6 +2123,40 @@ export async function main(argv: string[]): Promise<unknown> {
   try {
     let s = read<engine.State>(statePath); supportedLedger(s);
     engine.ensure(s.status !== 'retired', '已退役运行只允许 inspect/metrics/summary，不能自动复活');
+    if (op === 'ci-attest') {
+      engine.ensure(extra && fourth, '需要验收 jobId 与豁免请求');
+      const j=s.jobs.find(j=>j.id===extra), request=read<{reason:'no_ci'|'billing';notStartedIds?:string[]}>(fourth);
+      engine.ensure(j && j.action==='accept' && active(j) && s.status==='running',
+        '只允许在途验收任务读取当前 CI 豁免事实');
+      const t=engine.ticket(s,j.ticket);
+      s.facts=observe(s,[j]);const pr=s.facts.prs[String(t.pr)];
+      engine.ensure(pr?.state==='OPEN' && pr.head===t.head && pr.base===t.base &&
+        pr.baseRef===s.inputs.targetBranch,'CI 观测候选不是当前 PR/目标分支');
+      const inventory=request.reason==='no_ci'?gh.workflowInventory(s.repo):undefined;
+      const required=request.reason==='no_ci'?gh.requiredStatusChecks(s.repo,s.inputs.targetBranch):undefined;
+      const notices=request.reason==='billing'?(request.notStartedIds||[]).map(id=>gh.checkRunNotice(s.repo,id)):undefined;
+      if(request.reason==='no_ci')engine.ensure(pr.checks.length===0 && inventory?.length===0 && required?.length===0,
+        '远端有 CI 检查、工作流或保护规则，不能声明无 CI');
+      else engine.ensure(request.reason==='billing' && notices?.length &&
+        (request.notStartedIds||[]).every(id=>pr.checks.some(c=>c.id===id&&c.status==='startup_failure') &&
+          notices.some(n=>n.id===id&&/bill(?:ing)?|payment|spending limit|额度|计费|付款/i.test(`${n.title} ${n.summary}`))),
+        '远端没有逐项证明因计费而未启动的检查');
+      const attestation={jobId:j.id,reason:request.reason,pr:t.pr,head:t.head,base:t.base,
+        checks:pr.checks,inventory,required,notices,at:s.facts.at};
+      const digest=sha(JSON.stringify(attestation));
+      const evidencePath=path.join(path.dirname(statePath),'ci',`${sha(j.id).slice(0,20)}-${digest.slice(0,20)}.json`);
+      if(!fs.existsSync(evidencePath))write(evidencePath,attestation);
+      else engine.ensure(JSON.stringify(read(evidencePath))===JSON.stringify(attestation),
+        'CI 原始观测归档已经改变');
+      s.ciAttestations??=[];
+      if(!s.ciAttestations.some(a=>a.path===evidencePath))s.ciAttestations.push({jobId:j.id,
+        reason:request.reason,head:t.head,base:t.base,path:evidencePath,
+        sha256:sha(fs.readFileSync(evidencePath)),at:s.facts.at});
+      engine.event(s,`${t.key} CI 豁免远端观测已归档：${request.reason}`);save(statePath,s);
+      return {ciWaiver:{reason:request.reason,evidence:evidencePath,verification:'remote',
+        observedHead:t.head,observedBase:t.base,notStartedIds:request.notStartedIds||[]},
+        ciConfigured:request.reason==='no_ci'?false:undefined};
+    }
     if (op === 'upgrade') {
       engine.ensure(extra && !s.jobs.some(active), '升级前先对账并确认所有在途任务已停止或完整提交');
       const proof=read<{evidencePath:string}>(extra);safeFile(proof.evidencePath);
@@ -2128,6 +2322,13 @@ export async function main(argv: string[]): Promise<unknown> {
       engine.ensure(extra, '需要 L1 自行生成的 plan.json');
       s.facts = observe(s); const parent = gh.issue(s.repo, s.spec), sources = gh.subIssues(s.repo, s.spec);
       const p = read<engine.ExecutionPlan & { decisionNativeId?: string }>(extra); safeFile(p.evidencePath);
+      for(const item of p.tickets)for(const deferred of item.deferredDependencies||[]) {
+        const source=sources.find(x=>x.number===item.number);
+        const target=deferred.target===s.spec?parent:sources.find(x=>x.number===deferred.target);
+        engine.ensure(source?.comments.some(c=>c.url===deferred.records[0])&&
+          target?.comments.some(c=>c.url===deferred.records[1]),
+          '延期人工验收的两端评论必须真实存在于原工单与接收工单/spec');
+      }
       engine.ensure(p.inputVersion === engine.inputVersion(s) && p.sourceVersion === sourceVersion(parent, sources),
         'L1 执行计划的输入或 spec/sub-issue 来源版本已过期');
       engine.ensure(p.decisionNativeId, '执行图与资源策略需要真实 L1 原生会话');
@@ -2357,7 +2558,7 @@ export async function main(argv: string[]): Promise<unknown> {
               trialJob.decisionArtifactDigest = artifact.digest; trialJob.decisionArtifactFiles = artifact.files;
             }
           }
-          trial.facts = observe(trial,[trialJob]); validateResult(trial, trialJob, r);
+          trial.facts = observe(trial,[trialJob]); validateResult(trial, trialJob, r, statePath);
         }
         engine.submit(trial, extra, r); journalBoundSession(trial, trialJob);
       } catch (error) {

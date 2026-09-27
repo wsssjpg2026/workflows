@@ -197,8 +197,13 @@ export interface Ticket extends TicketPlan {
   reviewDisagreementId?: string;
   failures?: FailureEvent[];
   failureBudget?: FailureBudget;
+  acceptanceGap?: { head: string; base: string; evidencePath: string; planPath: string;
+    reason: string; missingCriteria: string[] };
 }
-export interface LivePR { number: number; head: string; base: string; baseRef: string; state: string; draft: boolean; mergeable: string; checks: {id: string; status: string}[] }
+export interface LivePR { number: number; head: string; base: string; baseRef: string; state: string; draft: boolean; mergeable: string;
+  checks: {id: string; status: string; url?: string; testedHead?: string; testedTree?: string}[];
+  /** Current synthetic merge ref, when GitHub supplied one. */
+  ciMergeHead?: string; ciMergeTree?: string; mergedHead?: string }
 export interface LiveFacts { base: string; issueStates: Record<string, string>; prs: Record<string, LivePR>; at: string }
 export interface Result {
   /** 宿主实际选择的模型；command/main 工作用已绑定的主控模型。 */
@@ -240,6 +245,8 @@ export interface State {
   mainSession?: NativeSession | { source: 'unknown'; at: string };
   tickets: Ticket[]; jobs: Job[]; facts: LiveFacts; auditEpoch: number; specAudit?: Result;
   validationOwner?: string; queueSequence?: number;
+  ciAttestations?: { jobId: string; reason: 'no_ci' | 'billing'; path: string; sha256: string;
+    head: string; base: string; at: string }[];
   telemetry?: { ghInvocations: number; retries: number; observationMs: number };
   waitIntervals?: { id: string; kind: 'recovery' | 'external'; scope: string; startedAt: string;
     endedAt?: string; evidencePath: string; evidenceDigest: string;
@@ -385,7 +392,11 @@ export function applyPlan(s: State, p: ExecutionPlan, discovered: { number: numb
     t.externalDependencies = source.blockedBy.filter(b => b.repo !== s.repo.slug && b.state !== 'CLOSED').map(b => `${b.repo}#${b.number}`);
     ensure(t.criteria.length > 0, `#${t.number} 缺少验收条件`);
     for (const d of t.deferredDependencies || []) {
-      ensure(d.kind === 'acceptance_only' && d.records.length >= 2, '延期人工验收必须保留两端已发布的追溯记录');
+      ensure(d.kind === 'acceptance_only' && d.records.length >= 2 && d.records[0] !== d.records[1],
+        '延期人工验收必须保留两端已发布的追溯记录');
+      ensure(source.blockedBy.some(b => b.repo === s.repo.slug && b.number === d.issue && b.state !== 'CLOSED') &&
+        p.tickets.find(i => i.number === d.issue)?.kind === 'human',
+        '只有真实原生依赖中的人工验收工单可延期；技术前置仍须阻塞');
       ensure(d.target === s.spec || p.tickets.some(i => i.number === d.target && i.kind === 'human'), '人工验收只能移交现有人工工单或父 spec');
     }
     for (const b of source.blockedBy) {
@@ -415,7 +426,8 @@ function dependencyReady(s: State, t: Ticket) {
 }
 function resetCandidate(t: Ticket, head: string, base: string, phase: Phase) {
   t.head = head; t.base = base; t.evidence = {}; t.authorReview = undefined;
-  t.reviewDisagreementId = undefined; t.epoch++; t.phase = phase; t.reason = '';
+  t.reviewDisagreementId = undefined; t.acceptanceGap = undefined;
+  t.epoch++; t.phase = phase; t.reason = '';
   if (phase === 'integrate') t.integrationHead = undefined;
 }
 /** Count a failed attempt exactly once, independently of its lease, replacement job and phase epoch. */
@@ -461,19 +473,29 @@ function problem(s: State, t: Ticket, signature: string, next: Phase, category: 
 export function ciAllowed(pr: LivePR, r?: Result) {
   const checks = pr.checks;
   if (checks.some(c => c.status === 'failed')) return false;
+  if (checks.some(c => c.testedHead && c.testedHead !== pr.head && c.testedHead !== pr.ciMergeHead)) return false;
   if (checks.length && checks.every(c => c.status === 'pass')) return true;
-  const waiver = r?.data?.ciWaiver as { reason?: string; evidence?: string; notStartedIds?: string[] } | undefined;
-  if (!waiver?.evidence) return false;
+  const waiver = r?.data?.ciWaiver as { reason?: string; evidence?: string; notStartedIds?: string[];
+    observedHead?: string; observedBase?: string; verification?: string } | undefined;
+  if (!waiver?.evidence || waiver.observedHead !== pr.head || waiver.observedBase !== pr.base ||
+      waiver.verification !== 'remote') return false;
   if (waiver.reason === 'no_ci') return checks.length === 0 && r?.data?.ciConfigured === false;
-  if (waiver.reason === 'billing') return checks.every(c => c.status === 'pass' ||
+  if (waiver.reason === 'billing') return checks.length > 0 && checks.every(c => c.status === 'pass' ||
     (c.status === 'startup_failure' && waiver.notStartedIds?.includes(c.id)));
   return false;
 }
 export function mergeGate(s: State, t: Ticket) {
   const live = s.facts.prs[String(t.pr)];
+  const tests = t.evidence.tests;
+  const testedCandidate = s.protocol !== currentProtocol || !!tests?.testedTree && tests.testedHead === t.head &&
+    tests.targetBase === t.base && (tests.integrationHead || null) === (t.integrationHead || null);
+  const ciTreeMatched = s.protocol !== currentProtocol || !live || live.checks.every(c => c.status !== 'pass' ||
+    !!c.testedHead && !!c.testedTree &&
+    (c.testedHead === live.head ? c.testedTree === tests?.testedTree :
+      c.testedHead === live.ciMergeHead && c.testedTree === live.ciMergeTree));
   return s.validationOwner === t.key && !!live && live.state === 'OPEN' && !live.draft && live.head === t.head && live.base === t.base &&
     live.baseRef === s.inputs.targetBranch && s.facts.base === t.base && live.mergeable === 'MERGEABLE' &&
-    ['self', 'tests', 'accept'].every(k => freshEvidence(t, k as keyof Ticket['evidence'])) && matchingReviews(s, t) &&
+    testedCandidate && ciTreeMatched && ['self', 'tests', 'accept'].every(k => freshEvidence(t, k as keyof Ticket['evidence'])) && matchingReviews(s, t) &&
     (!boundAuthorReview(s) || !!t.authorReview && t.authorReview.head === t.head && t.authorReview.base === t.base &&
       t.authorReview.bindingFingerprint === s.v3!.skillBindings!.find(b=>b.capability==='authorReview')?.fingerprint) &&
     (!t.visual || freshEvidence(t, 'visual')) && ciAllowed(live, jobsAt(s, t, 'accept').find(j => j.status === 'done')?.result);
@@ -881,7 +903,7 @@ export function submit(s: State, id: string, r: Result) {
       t.planPath = String(data.planPath); t.checksPath = String(data.checksPath); t.phase = 'plan_check'; break;
     case 'plan-check':
       ensure(t, '缺少工单');
-      if (r.status === 'pass') { if (data.checksPath) t.checksPath = String(data.checksPath); t.phase = 'implement'; }
+      if (r.status === 'pass') { if (data.checksPath) t.checksPath = String(data.checksPath); t.acceptanceGap = undefined; t.phase = 'implement'; }
       else problem(s, t, String(data.reason || '计划尚未满足验收'), 'plan', 'semantic', j.id); break;
     case 'implement': case 'integrate':
       ensure(t, '缺少工单');
@@ -1009,26 +1031,46 @@ export function submit(s: State, id: string, r: Result) {
     }
     case 'accept':
       ensure(t && matchingReviews(s, t), '验收前必须完成同候选、同技能版本的 regular 和 fresh 审查');
+      ensure(live?.state === 'OPEN' && !live.draft && live.head === t.head && live.base === t.base &&
+        live.baseRef === s.inputs.targetBranch && s.facts.base === t.base,
+        '验收必须核对远端当前 PR head/base 与指定目标分支');
       if (r.status === 'ready') {
         ensure(Array.isArray(data.satisfiedCriteria) && t.criteria.every(c => (data.satisfiedCriteria as Json[]).includes(c)), 'issue 验收条件未全部满足');
+        ensure(s.protocol !== currentProtocol || !!t.evidence.tests?.testedTree &&
+          t.evidence.tests.testedHead === t.head && t.evidence.tests.targetBase === t.base,
+          '验收需要当前候选和目标基线的实际测试树');
         t.evidence.accept = evidence();
         if (live?.mergeable === 'CONFLICTING') problem(s, t, '目标分支存在冲突', 'integrate', 'semantic', j.id);
         else if (!live || !ciAllowed(live, r)) { t.phase = 'blocked'; t.reason = 'waiting_ci'; }
         else t.phase = 'merge';
       } else if (r.status === 'gap') {
-        ensure(data.planPath, '验收缺口必须附 L2 补充计划'); t.planPath = String(data.planPath); problem(s, t, String(data.reason || '验收缺口'), 'replan', 'semantic', j.id);
+        const missing = data.missingCriteria;
+        ensure(data.planPath && Array.isArray(missing) && missing.length > 0 &&
+          missing.every(c => typeof c === 'string' && t.criteria.includes(c)),
+          '验收缺口必须指明 issue 条件与 L2 补充计划');
+        t.acceptanceGap = { head: t.head, base: t.base, evidencePath: r.evidencePath,
+          planPath: String(data.planPath), reason: String(data.reason || '验收缺口'), missingCriteria: missing.map(String) };
+        problem(s, t, t.acceptanceGap.reason, 'replan', 'semantic', j.id);
       } else if (r.status === 'conflict') { problem(s, t, '需要集成目标分支', 'integrate', 'semantic', j.id); }
       else if (r.status === 'waiting_ci') { t.phase = 'blocked'; t.reason = 'waiting_ci'; }
       else { t.phase = 'blocked'; t.reason = String(data.reason || r.status); }
       break;
     case 'replan':
       ensure(t && data.planPath && data.checksPath, '独立 L1 重规划需要计划与验证清单');
+      if (t.acceptanceGap) ensure(data.gapEvidencePath === t.acceptanceGap.evidencePath &&
+        typeof data.scopeDecision === 'string' && data.scopeDecision.trim() &&
+        typeof data.testBoundary === 'string' && data.testBoundary.trim(),
+        'L2 验收缺口须经独立 L1 确认补充范围和测试边界');
       t.planPath = String(data.planPath); t.checksPath = String(data.checksPath); t.escalations++;
       t.baseInvalidations = 0;
       t.phase = 'plan_check'; t.epoch++; break;
     case 'merge':
       if (r.status === 'waiting_merge') { ensure(t, '缺少工单'); t.phase = 'blocked'; t.reason = 'waiting_merge'; break; }
-      ensure(t && s.facts.prs[String(t.pr)]?.state === 'MERGED', '尚未观察到远端 PR MERGED');
+      ensure(t && s.facts.prs[String(t.pr)]?.state === 'MERGED' &&
+        s.facts.prs[String(t.pr)].head === t.head &&
+        s.facts.prs[String(t.pr)].baseRef === s.inputs.targetBranch &&
+        (s.protocol !== currentProtocol || !!s.facts.prs[String(t.pr)].mergedHead),
+        '尚未观察到预期候选合入指定目标分支');
       t.phase = t.closeout ? 'done' : 'close'; break;
     case 'close': ensure(t && s.facts.issueStates[String(t.number)] === 'CLOSED', '远端 issue 尚未关闭'); t.phase = 'cleanup'; break;
     case 'cleanup': ensure(t && s.facts.issueStates[String(t.number)] === 'CLOSED' && s.facts.prs[String(t.pr)]?.state === 'MERGED', '清理必须同时满足 MERGED + CLOSED'); t.cleaned = true; t.phase = 'done'; break;
@@ -1037,14 +1079,35 @@ export function submit(s: State, id: string, r: Result) {
       if (r.status === 'needs_closeout') {
         ensure(s.tickets.every(t => t.phase === 'done' || t.phase === 'human'), '仍有未完成的自动工单，不能用收尾 PR 绕过依赖');
         if (s.tickets.filter(t => t.closeout).length >= s.policy!.rounds) { s.status = 'blocked'; event(s, 'Spec 收尾达到 L1 设定的轮次上限，需要重新判断未收敛原因'); break; }
-        ensure(data.planPath && Array.isArray(data.remainingCriteria), '收尾需要现有 spec 内的明确缺口');
+        ensure(data.planPath && Array.isArray(data.remainingCriteria) && data.remainingCriteria.length > 0 &&
+          data.remainingCriteria.every(c => typeof c === 'string' && s.specCriteria.includes(c)),
+          '收尾需要现有 spec 内的明确缺口');
         const task = buildTicket({ number: s.spec, kind: 'software', dependencies: [], criteria: data.remainingCriteria.map(String), visual: data.visual === true }, s.facts.base, true);
         task.key = `spec-final-${s.auditEpoch}`; task.planPath = String(data.planPath); s.tickets.push(task); s.specAudit = undefined; s.auditEpoch++;
-      } else if (r.status === 'waiting_human') { ensure(data.humanHandoffUrl, '人工阶段需要现有 issue/spec 上的交接记录'); s.status = 'waiting_human'; }
+      } else if (r.status === 'waiting_human') {
+        ensure(data.humanHandoffUrl && (s.protocol !== currentProtocol ||
+          Array.isArray(data.pendingCriteria) && data.pendingCriteria.length > 0 &&
+          typeof data.resumeCommand === 'string' && data.resumeCommand.trim()),
+          '人工阶段需要待验条件、现有 issue/spec 交接记录和恢复入口');
+        ensure(s.facts.issueStates[String(s.spec)] === 'OPEN' &&
+          s.tickets.filter(x => x.kind === 'human').every(x => s.facts.issueStates[String(x.number)] !== 'CLOSED' || x.phase === 'done'),
+          '人工缺口未完成时必须保持相关 issue 和父 spec 打开');
+        ensure(s.tickets.filter(x => x.kind === 'software' && x.phase !== 'done').every(x =>
+          x.dependencies.some(n => s.tickets.some(h => h.number === n && h.kind === 'human' &&
+            s.facts.issueStates[String(n)] !== 'CLOSED'))),
+          '有未完成的技术工作或非人工前置，不能标为等待人工验收');
+        s.status = 'waiting_human';
+      }
       else if (r.status !== 'complete') s.status = 'blocked';
       else {
         ensure(s.tickets.every(t => t.phase === 'done'), '仍有未完成工单时不能关闭 spec');
-        ensure(!s.tickets.some(t => t.phase === 'human' && s.facts.issueStates[String(t.number)] !== 'CLOSED'), '未完成人工工单时不能关闭 spec');
+        ensure(s.tickets.every(t => t.kind !== 'software' || !t.pr ||
+          s.facts.prs[String(t.pr)]?.state === 'MERGED' &&
+          s.facts.prs[String(t.pr)].baseRef === s.inputs.targetBranch &&
+          (t.closeout || s.facts.issueStates[String(t.number)] === 'CLOSED')),
+          '最终审计须核对每个软件 PR 合入指定目标且关联 issue 已关闭');
+        ensure(!s.tickets.some(t => t.kind === 'human' && s.facts.issueStates[String(t.number)] !== 'CLOSED'),
+          '未完成人工工单时不能关闭 spec');
         ensure(Array.isArray(data.satisfiedCriteria) && s.specCriteria.every(c => (data.satisfiedCriteria as Json[]).includes(c)), 'spec 条件必须全部满足，包括迁移到父 spec 的人工条件');
       }
       break;
@@ -1076,6 +1139,10 @@ export function reconcileFacts(s: State, facts: LiveFacts) {
   if (s.status === 'retired') return;
   if (s.specAudit && s.specAudit.base !== facts.base) { s.specAudit = undefined; s.auditEpoch++; }
   for (const t of s.tickets) {
+    if (t.kind === 'human' && t.phase === 'done' && facts.issueStates[String(t.number)] === 'OPEN') {
+      t.phase = 'human'; s.specAudit = undefined; s.auditEpoch++;
+      if (s.status === 'complete') s.status = 'running';
+    }
     if (t.phase === 'human' && facts.issueStates[String(t.number)] === 'CLOSED') t.phase = 'done';
     if (['done', 'human', 'cleanup', 'close', 'recovery'].includes(t.phase) || s.jobs.some(j => j.ticket === t.key && busy(j))) continue;
     const p = facts.prs[String(t.pr)];

@@ -40,6 +40,51 @@ function setup() {
   const call=(...args:string[])=>spawnSync(process.execPath,[entry,...args],{cwd:root,env,encoding:'utf8'});
   return {root,run,head,s,t,j,statePath,log,call,observe};
 }
+function deliveryRemote(x:ReturnType<typeof setup>, initial:{state:'OPEN'|'MERGED';checks?:unknown[]}) {
+  const remote=path.join(x.run,'delivery-remote.json');
+  fs.writeFileSync(remote,JSON.stringify({state:initial.state,checks:initial.checks||[],
+    issueState:'OPEN',baseRef:'main',prs:[],comments:[],creates:0,posts:0,merges:0,
+    loseCreate:false,dropCreate:false,loseComment:false,loseMerge:false}));
+  fs.writeFileSync(path.join(x.root,'bin','gh'),`#!/usr/bin/env node
+const fs=require('fs');const a=process.argv.slice(2),file=${JSON.stringify(remote)};
+const d=JSON.parse(fs.readFileSync(file,'utf8')),save=()=>fs.writeFileSync(file,JSON.stringify(d));
+const endpoint=a.at(-1),head=${JSON.stringify(x.head)},pr=()=>({number:201,html_url:'https://github.com/example/test/pull/201',
+  head:{sha:head,ref:'task'},base:{sha:head,ref:d.baseRef},state:d.state==='MERGED'?'closed':'open',
+  merged:d.state==='MERGED',merge_commit_sha:d.state==='MERGED'?head:null,draft:false,mergeable:true});
+if(a.includes('graphql'))console.log(JSON.stringify({data:{repository:{target:{target:{oid:head}},i100:{number:100,state:'OPEN'},
+  i101:{number:101,state:d.issueState},p201:{number:201,url:'https://github.com/example/test/pull/201',state:d.state,
+  headRefOid:head,baseRefOid:head,baseRefName:d.baseRef,headRefName:'task',isDraft:false,mergeable:'MERGEABLE',
+  mergeCommit:d.state==='MERGED'?{oid:head}:null}}}}));
+else if(a[0]==='pr'&&a[1]==='merge'){d.merges++;d.state='MERGED';save();if(d.loseMerge)process.exit(1);console.log('merged');}
+else if(a.includes('--method')&&a.includes('POST')&&endpoint.endsWith('/pulls')){
+  d.creates++;if(d.dropCreate){save();process.exit(1);}
+  d.prs=[{number:201,body:JSON.parse(fs.readFileSync(0,'utf8')).body}];save();
+  if(d.loseCreate)process.exit(1);console.log(JSON.stringify({number:201}));}
+else if(a.includes('--method')&&a.includes('POST')&&endpoint.endsWith('/comments')){
+  d.posts++;d.comments.push({html_url:'https://github.com/example/test/pull/201#issuecomment-1',
+    body:JSON.parse(fs.readFileSync(0,'utf8')).body});save();if(d.loseComment)process.exit(1);
+  console.log(JSON.stringify(d.comments.at(-1)));}
+else if(endpoint.includes('/git/ref/heads/main'))console.log(JSON.stringify({ref:'refs/heads/main',object:{type:'commit',sha:head}}));
+else if(endpoint.includes('/pulls?'))console.log(JSON.stringify([d.prs.map(p=>({...pr(),...p}))]));
+else if(endpoint.endsWith('/pulls/201'))console.log(JSON.stringify(pr()));
+else if(endpoint.endsWith('/issues/101'))console.log(JSON.stringify({number:101,html_url:'https://github.com/example/test/issues/101',
+  title:'Task',body:'Criteria',state:d.issueState.toLowerCase(),assignees:[]}));
+else if(endpoint.includes('/issues/101/dependencies/'))console.log('[[]]');
+else if(endpoint.includes('/issues/101/comments?'))console.log('[[]]');
+else if(endpoint.includes('/issues/201/comments?'))console.log(JSON.stringify([d.comments]));
+else if(endpoint.includes('/check-suites?'))console.log(JSON.stringify([{total_count:0,check_suites:[]}]));
+else if(endpoint.includes('/check-runs?'))console.log(JSON.stringify([{total_count:0,check_runs:[]}]));
+else if(endpoint.includes('/actions/runs?'))console.log(JSON.stringify([{total_count:0,workflow_runs:[]}]));
+else if(endpoint.includes('/actions/workflows?'))console.log(JSON.stringify([{total_count:0,workflows:[]}]));
+else if(endpoint.includes('/protection/required_status_checks'))console.log(JSON.stringify({contexts:[],checks:[]}));
+else if(endpoint.includes('/status?'))console.log(JSON.stringify([{statuses:[]}]));
+else if(endpoint.includes('/git/commits/'))console.log(JSON.stringify({tree:{sha:head}}));
+else throw Error('unexpected gh request '+a.join(' '));
+`);
+  fs.chmodSync(path.join(x.root,'bin','gh'),0o755);
+  return {remote,read:()=>JSON.parse(fs.readFileSync(remote,'utf8')),
+    update:(patch:Record<string,unknown>)=>fs.writeFileSync(remote,JSON.stringify({...JSON.parse(fs.readFileSync(remote,'utf8')),...patch}))};
+}
 test('真实 CLI 批次绑定收取已有结果，只查询一次易变事实并可重复调用',()=>{
   const x=setup();try {
     stageResult(x.statePath,x.j.id,{complete:true,status:'planned',evidencePath:'evidence.md',data:{planPath:'plan.json',checksPath:'plan.json'}});
@@ -163,5 +208,84 @@ test('确认命令进程树已停止后可取消并退役，无须重新执行�
     const proof=path.join(x.run,'retire.json');fs.writeFileSync(proof,JSON.stringify({reason:'stop this run',evidencePath:path.join(x.root,'evidence.md')}));
     const result=x.call('retire',x.statePath,proof);assert.equal(result.status,0,result.stderr);assert.ok(fs.existsSync(x.t.worktree));
     assert.equal(JSON.parse(fs.readFileSync(x.statePath,'utf8')).jobs[0].status,'cancelled');
+  } finally {fs.rmSync(x.root,{recursive:true,force:true});}
+});
+test('公开 CLI 创建 PR 与完成评论遇响应丢失后按稳定操作标记对账',()=>{
+  const x=setup();try {
+    const remote=deliveryRemote(x,{state:'OPEN'});remote.update({loseCreate:true,loseComment:true});
+    x.s.jobs=[];x.t.phase='publish';x.s.validationOwner=x.t.key;
+    x.t.evidence.self={head:x.head,base:x.head,path:path.join(x.root,'evidence.md')};
+    x.t.evidence.tests={head:x.head,base:x.head,path:path.join(x.root,'evidence.md'),
+      testedHead:x.head,testedTree:git(x.root,'rev-parse','HEAD^{tree}'),targetBase:x.head};
+    const j=e.reserve(x.s)[0];j.nativeId='native-publisher';j.status='running';fs.writeFileSync(x.statePath,JSON.stringify(x.s));
+    const body=path.join(x.run,'body.md'),completion=path.join(x.run,'completion.md'),request=path.join(x.run,'publish-request.json');
+    fs.writeFileSync(body,'Implements issue criteria.');fs.writeFileSync(completion,'Author checks complete.');
+    fs.writeFileSync(request,JSON.stringify({title:'Deliver task',bodyPath:body,completionPath:completion}));
+    const first=x.call('publish-pr',x.statePath,j.id,request);assert.equal(first.status,0,first.stderr);
+    const second=x.call('publish-pr',x.statePath,j.id,request);assert.equal(second.status,0,second.stderr);
+    assert.equal(remote.read().creates,1);assert.equal(remote.read().posts,1);
+    assert.equal(JSON.parse(first.stdout).data.operationId,JSON.parse(second.stdout).data.operationId);
+    assert.match(remote.read().prs[0].body,/spec-delivery:cli-fixture:101:pr:/);
+  } finally {fs.rmSync(x.root,{recursive:true,force:true});}
+});
+test('公开 CLI 的无 CI 豁免要求当前 PR 空检查及远端空工作流清单',()=>{
+  const x=setup();try {
+    deliveryRemote(x,{state:'OPEN'});
+    x.s.jobs=[];x.t.phase='accept';x.t.pr=201;x.s.validationOwner=x.t.key;
+    const j=e.reserve(x.s)[0];fs.writeFileSync(x.statePath,JSON.stringify(x.s));
+    const request=path.join(x.run,'ci-request.json');fs.writeFileSync(request,JSON.stringify({reason:'no_ci'}));
+    const result=x.call('ci-attest',x.statePath,j.id,request);assert.equal(result.status,0,result.stderr);
+    const body=JSON.parse(result.stdout);assert.equal(body.ciWaiver.verification,'remote');
+    assert.equal(body.ciConfigured,false);assert.ok(fs.existsSync(body.ciWaiver.evidence));
+    const ledger=JSON.parse(fs.readFileSync(x.statePath,'utf8'));
+    assert.equal(ledger.ciAttestations[0].path,body.ciWaiver.evidence);
+    assert.equal(ledger.ciAttestations[0].sha256,
+      createHash('sha256').update(fs.readFileSync(body.ciWaiver.evidence)).digest('hex'));
+    const invalid=path.join(x.run,'billing.json');fs.writeFileSync(invalid,JSON.stringify({reason:'billing',notStartedIds:[]}));
+    assert.notEqual(x.call('ci-attest',x.statePath,j.id,invalid).status,0);
+  } finally {fs.rmSync(x.root,{recursive:true,force:true});}
+});
+test('合并响应不确定时复用固定意图，远端已合并则不再写入',()=>{
+  const x=setup();try {
+    const remote=deliveryRemote(x,{state:'OPEN'});
+    x.t.phase='merge';x.t.pr=201;x.s.validationOwner=x.t.key;
+    const j=x.j;j.action='merge';j.nativeId='native-merger';j.status='running';fs.writeFileSync(x.statePath,JSON.stringify(x.s));
+    const request=path.join(x.run,'merge-request.json');fs.writeFileSync(request,JSON.stringify({strategy:'merge'}));
+    assert.notEqual(x.call('merge-pr',x.statePath,j.id,request).status,0,'缺少审查和验收不能发起合并');
+    const attempt=path.join(x.run,'actions',createHash('sha256').update(j.id).digest('hex').slice(0,20)+'.merge.attempt.json');
+    fs.writeFileSync(attempt,JSON.stringify({operationId:'persisted-before-lost-response'}));
+    const pending=x.call('merge-pr',x.statePath,j.id,request);assert.equal(pending.status,0,pending.stderr);
+    assert.equal(JSON.parse(pending.stdout).status,'waiting_merge');assert.equal(remote.read().merges,0);
+    remote.update({state:'MERGED'});
+    const result=x.call('merge-pr',x.statePath,j.id,request);assert.equal(result.status,0,result.stderr);
+    assert.equal(JSON.parse(result.stdout).status,'merged');assert.equal(remote.read().merges,0);
+  } finally {fs.rmSync(x.root,{recursive:true,force:true});}
+});
+test('PR 创建请求是否生效未知且远端未出现时，不重发同一写请求',()=>{
+  const x=setup();try {
+    const remote=deliveryRemote(x,{state:'OPEN'});remote.update({dropCreate:true});
+    x.s.jobs=[];x.t.phase='publish';x.s.validationOwner=x.t.key;
+    x.t.evidence.self={head:x.head,base:x.head,path:path.join(x.root,'evidence.md')};
+    x.t.evidence.tests={head:x.head,base:x.head,path:path.join(x.root,'evidence.md')};
+    const j=e.reserve(x.s)[0];j.nativeId='native-publisher';j.status='running';fs.writeFileSync(x.statePath,JSON.stringify(x.s));
+    const body=path.join(x.run,'body.md'),completion=path.join(x.run,'completion.md'),request=path.join(x.run,'request.json');
+    fs.writeFileSync(body,'body');fs.writeFileSync(completion,'completion');
+    fs.writeFileSync(request,JSON.stringify({title:'PR',bodyPath:body,completionPath:completion}));
+    assert.notEqual(x.call('publish-pr',x.statePath,j.id,request).status,0);
+    const retry=x.call('publish-pr',x.statePath,j.id,request);assert.notEqual(retry.status,0);
+    assert.match(retry.stderr,/不能盲目重发/);assert.equal(remote.read().creates,1);
+  } finally {fs.rmSync(x.root,{recursive:true,force:true});}
+});
+test('公开 CLI 清理前再次读取 MERGED+CLOSED，并保留脏 worktree',()=>{
+  const x=setup();try {
+    const remote=deliveryRemote(x,{state:'MERGED'});remote.update({issueState:'CLOSED'});
+    x.s.jobs=[];x.t.phase='cleanup';x.t.pr=201;x.s.validationOwner=undefined;
+    const j=e.reserve(x.s)[0];assert.equal(j.action,'cleanup');
+    fs.writeFileSync(path.join(x.t.worktree,'uncommitted.txt'),'keep this work');
+    fs.writeFileSync(x.statePath,JSON.stringify(x.s));
+    const result=x.call('execute',x.statePath,j.id);assert.notEqual(result.status,0);
+    assert.match(result.stderr,/未保存|worktree/);
+    assert.ok(fs.existsSync(path.join(x.t.worktree,'uncommitted.txt')));
+    assert.equal(remote.read().state,'MERGED');
   } finally {fs.rmSync(x.root,{recursive:true,force:true});}
 });

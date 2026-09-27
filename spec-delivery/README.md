@@ -113,9 +113,15 @@ fresh 首轮 packet 只传原始 spec/issue 链接、候选 head/base/worktree�
 
 所有 agent 的测试/构建/重型核验通过 `test <state> <jobId> <request.json>` 执行，请求格式 `{argv,timeoutSeconds,env?,reason}`。cwd 为任务 worktree。测试配额按实际执行占用；不足时等待，不改用未登记的旁路命令。退出码、候选、日志和失败证据保留，完成后释放配额。最终 spec 审计的测试会临时建立冻结目标 SHA 的 detached worktree，完成后清理干净的审计目录；`candidateStable:false` 的结果不能用于验收。确定性 `verify` 直接使用核心预留的配额。该协议依赖宿主和角色遵守，无法限制框架外的任意 shell 进程。
 
-测试回执的 `candidate` 分别记录观察到的 `prHead`、`targetBase`、`localHead`、`testedHead`、`testedTree` 和适用时的 `integrationHead`。未提交工作参与测试时 `testedTree` 为 `null`，另记工作区内容指纹；不能把 Git HEAD 的树称为实际测试树。确定性 `verify` 对干净工作区记录真实 Git tree，候选变动则撤销旧测试证据。
+测试回执的 `candidate` 分别记录观察到的 `prHead`、`targetBase`、`localHead`、`testedHead`、`testedTree` 和适用时的 `integrationHead`。未提交工作参与测试时 `testedTree` 为 `null`，另记工作区内容指纹；不能把 Git HEAD 的树称为实际测试树。确定性 `verify` 对干净工作区记录真实 Git tree，候选变动则撤销旧测试证据。合并门禁核对本地测试树、集成候选和目标基线；GitHub 检查另记实际检查提交及其 Git tree，PR merge-ref 检查与 head 检查分开对账。
 
-普通观测批量读取目标 SHA、issue 状态和 PR 候选；正文、评论、依赖由需要它们的角色读取。验收、合并和最终审计重新获取适用 CI，合并 actor 操作前调用 `guard <state> <jobId>`。只读瞬时网络故障有界重试，权限/不完整响应明确失败；外部写操作先查状态，不盲目重试。
+普通观测批量读取目标 SHA、issue 状态和 PR 候选；正文、评论、依赖由需要它们的角色读取。验收、合并和最终审计重新获取适用 CI。L2 发现验收缺口时记录未满足的 issue 条件和补充计划；独立 L1 `replan` 的回执引用该缺口，写明 `scopeDecision`、`testBoundary`，再经 `plan-check` 进入实现和重审。
+
+发布 actor 用 `publish-pr <state> <jobId> <request.json>`，请求 `{title,bodyPath,completionPath}`；命令固定 PR/评论操作 ID，把标记放入远端正文，在创建或评论响应丢失时先查询标记并核对候选。合并 actor 用 `merge-pr <state> <jobId> <request.json>`，请求 `{strategy:"merge"|"squash"|"rebase"}`；命令重新观察门禁，以预期 head 约束合并，响应丢失后先核对远端 `MERGED`。两个命令返回可提交的 Result；同一 job 的请求内容不能改写。关闭命令也记录稳定操作 ID，重复执行先读远端 CLOSED。只读瞬时网络故障有界重试，外部写请求不盲目重试。
+
+`ci-attest <state> <accept-jobId> <request.json>` 仅在豁免确有依据时运行。`{"reason":"no_ci"}` 要求当前 PR 无检查、GitHub 工作流清单为空且目标分支无必需检查；`{"reason":"billing","notStartedIds":[...]}` 要求每个未启动检查的远端原文包含计费通知。返回的 `ciWaiver` 和 `ciConfigured` 原样放入当前验收回执；CLI 再核对证据属于同一 job、head/base 和最新检查。正常失败、待运行、未知或跳过都不会成为豁免。分支保护由 GitHub 合并操作继续执行；无检查和未付费账户本身不能证明豁免。若 GitHub API 不提供可核对的计费通知，保持阻断并交 L1 处理。
+
+本仓库的模拟 GitHub 用例只证明适配器契约及故障恢复；实际目标仓库的权限、保护规则和远端合并仍需在真实宿主运行时观察，不将模拟结果记为真实远端验收。
 
 默认作者技能保留双轴自检。v3 的 PR 审查在 regular 和独立 fresh 两轮各执行一次固定版本的 `prReview` 绑定。默认包位于 `spec-delivery/review-skills/code-review-from-claude/`，其 `SKILL.md` 保留五视角、独立确认与 **≥50** 规则；`automation-context.md`、`automation-contract.json` 和 `observation-ledger.ts` 分别说明工作流输入/回执、必需子任务及原始观察与同义事实关联，完整包指纹写入运行账本。`pr-review` 归档原始报告与宿主终态，`review-report` 命令按稳定标记发布报告原文。核心只根据当前候选、技能版本及明确阻断结论推进；替代包可采用其它审查方法。fresh 完成后若同候选同技能版本两轮阻断结论相反，独立 L1 读取原始报告并留下裁决产物，随后仍须独立 L2 验收与 CI。CI 未配置或有证据的计费未启动才可按角色规则豁免；实际执行失败不可豁免，并回到 L3 修复。CI 仍在正常执行时保留队首、等待状态事件；长期环境阻断由 L1 对账、重规划或释放队首，不能改成通过。
 

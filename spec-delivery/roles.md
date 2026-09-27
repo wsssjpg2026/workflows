@@ -111,7 +111,7 @@ regular 可以用真实宿主续接审查侧上下文跟踪修复；fresh 必须
 
 在与实现者、reviewer分离的上下文中逐条核对工单验收条件、当前head/base、适用验证、视觉证据、CI、平台合并条件，以及合并后是否足以关闭工单。
 
-未满足spec内条件时，形成补充计划，交L1复核范围与测试边界，再由L3执行；进入sub loop后仍需重新经过main loop和fresh审查。验收通过不是“review无问题”的同义词。
+未满足spec内条件时，回执列出 `data.missingCriteria`（原 issue 条件）、`data.planPath`、原因和当前候选证据。独立 L1 `replan` 须引用 `data.gapEvidencePath`，明确 `data.scopeDecision` 与 `data.testBoundary`，随后独立 `plan-check` 复核，再由L3实现并重走作者自检、验证、regular/fresh审查及验收。验收通过不是“review无问题”的同义词。
 
 CI按下列规则处理，无需逐次请求用户批准：
 
@@ -130,7 +130,7 @@ CI按下列规则处理，无需逐次请求用户批准：
 
 ## 合并与关闭工单 — L2
 
-取得目标分支的合并权后，再live核对候选head/base、当前审查/验收、CI或合法豁免、平台保护和关闭条件。立即合并前调用`guard <state> <jobId>`，通过后使用平台支持的预期head约束合并；guard失败或观察过期就停止，交主控重新调度。
+取得目标分支的合并权后，再live核对候选head/base、当前审查/验收、CI或合法豁免、平台保护和关闭条件。调用 `merge-pr <state> <jobId> <request.json>` 执行平台支持的预期 head 约束合并；请求仅含明确的 merge/squash/rebase 策略。`guard` 可预览当前门禁，实际 `merge-pr` 仍重新读取远端。返回的 Result 通过正常回执入口提交；不能绕过稳定操作 ID 手写成功结果。
 
 操作超时或中断时先查询是否已合并。远端确认 `MERGED` 后，核对目标分支实际提交和工单状态；关闭关键字只表示意图，不能代替状态确认。非默认目标分支未自动关闭issue时，满足条件后明确关闭并记录依据。
 
@@ -199,21 +199,21 @@ CI按下列规则处理，无需逐次请求用户批准：
 | `implement`、`integrate` | `implemented`、`replan` | 两种完成状态都必须有真实已提交候选`head/base`与`handoffPath`；`replan`另附`data.reason`，适用时`data.visualEvidence`；WIP/冲突由工作区恢复入口保全，不报作已验证候选 |
 | `author-review` | `reviewed` | 诊断或来源变化后的单个补审 job；`data.skillInvocationIds` 引用一次真实通过的 `authorReview` 调用 |
 | `verify` | `pass`、`fail` | 由`execute`生成；失败时`data.failureSignature`及原始日志 |
-| `publish` | `published` | `data:{pr,commentUrl}`，pr为正整数；远端必须是当前候选的开放非draft PR |
+| `publish` | `published` | `publish-pr` 返回 `data:{pr,commentUrl,operationId}`；远端必须是当前候选的开放非draft PR |
 | `pr-review` | `reviewed` | `data.skillInvocationIds` 恰好引用一次当前绑定的 `prReview`；原始报告由技能调用归档，结论来自其 `pass`/`changes_required` 及阻断值 |
 | `review-report` | `posted` | v3 由命令发布技能原文并记录 `data.commentUrl`、`data.reviewInvocationId`；不由 actor 填写报告模板 |
 | `adjudicate` | `resolved` | 仅对 `packet.reviewDisagreement` 的当前候选/技能分歧；`data` 包含分歧 ID、两轮 invocation ID、技能指纹、`blocking`、`rationale`、`skillRuleRefs`，JSON 原文还写入 head/base/candidateVersion |
 | `accept` | `ready` | `data.satisfiedCriteria`逐字包含packet全部criteria；附适用CI事实及下述豁免结构 |
-| `accept` | `gap`、`conflict`、`waiting_ci`、`needs_human`、`blocked` | `gap`必须`data.planPath`，并附`reason`；其它状态附具体原因和证据；补充计划先过L1 `plan-check` |
-| `merge` | `merged`、`waiting_merge` | 真实远端合并证据或等待原因；`merged`仍须核心live观察到MERGED |
+| `accept` | `gap`、`conflict`、`waiting_ci`、`needs_human`、`blocked` | `gap`必须有`data.planPath`、`data.missingCriteria`及原因；其它状态附具体原因和证据；补充计划先经独立 L1 `replan` 和 `plan-check` |
+| `merge` | `merged`、`waiting_merge` | `merge-pr` 返回稳定 `data.operationId`、真实远端合并证据或等待原因；`merged`仍须核心 live 观察到 MERGED |
 | `close`、`spec-close` | `closed` | 由 execute 生成真实远端关闭证据；核对 L2 验收/L1 spec 审计后操作，再观察 CLOSED |
 | `cleanup` | `cleaned` | 仅由`execute`生成；再次核对MERGED与CLOSED及待保全工作 |
 | `spec-audit` | `complete` | `data.satisfiedCriteria`逐字包含packet.criteria中的全部spec条件，含迁移的人工条件 |
 | `spec-audit` | `needs_closeout` | `data:{planPath,remainingCriteria,visual?}`；只生成内部工作项，PR关联原父spec |
-| `spec-audit` | `waiting_human`、`blocked` | 前者必须`data.humanHandoffUrl`指向现有工单/spec人工交接；后者附明确原因和证据 |
+| `spec-audit` | `waiting_human`、`blocked` | 前者必须`data.humanHandoffUrl`指向已发布在现有工单/spec 的人工交接，并列 `data.pendingCriteria` 和 `data.resumeCommand`；后者附明确原因和证据 |
 
 `reviewed/posted`只表示专业审查与报告发布完成；阻断结论以绑定技能的终态为准。
 
-合法CI豁免放在`accept.data.ciWaiver`：`{reason:"no_ci"|"billing",evidence:"<原始依据>",notStartedIds?:["<检查ID>"]}`。`no_ci`同时要求`data.ciConfigured:false`且远端无检查；`billing`列明因计费/额度未启动的检查ID。状态与理由必须符合本文件的CI边界，不能仅填写该对象就宣称豁免成立。
+合法 CI 豁免由 `ci-attest` 返回 `accept.data.ciWaiver`，包含原因、远端观测文件、当前 head/base 和逐项未启动检查 ID。`no_ci` 同时要求 `data.ciConfigured:false`、远端无检查、空工作流清单及目标分支无必需检查；`billing` 须有远端检查原文的计费未启动通知。状态与理由必须符合本文件的 CI 边界，不能仅填写对象宣称豁免。
 
 `checksPath`指向`{scopeReason,commands:[{name,argv,timeoutSeconds,env?}]}` JSON。argv为非空字符串数组，按实际工具拆参数；cwd固定任务worktree，`shell:false`，超时为L1决定的有限正数。选用目标仓库真实验证入口，并使“零用例/全部跳过”能被相应入口判为未验证；不要提交只打印成功的占位命令。

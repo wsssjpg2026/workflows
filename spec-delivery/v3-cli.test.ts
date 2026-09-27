@@ -18,7 +18,7 @@ const sha = (value:string) => createHash('sha256').update(value).digest('hex');
 const git = (cwd: string, ...argv: string[]) => execFileSync('git', argv, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const inputs = { spec: 100, targetBranch: 'main', models: { L1: 'large', L2: 'middle', L3: 'small' } };
 
-function fixture(withStandard = false) {
+function fixture(withStandard = false, withSecondTicket = false) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'workflow-v3-cli-'));
   for (const name of ['implement', 'diagnosing-bugs', 'code-review', 'code-review-from-claude', 'handoff']) {
     const directory = path.join(temp, '.agents', 'skills', name); fs.mkdirSync(directory, { recursive: true });
@@ -40,19 +40,21 @@ function fixture(withStandard = false) {
   const gh = path.join(bin, 'gh');
   fs.writeFileSync(gh, `#!/usr/bin/env node
 const fs=require('fs'),a=process.argv.slice(2),endpoint=a.at(-1);
+const withSecondTicket=${JSON.stringify(withSecondTicket)};
 fs.appendFileSync(${JSON.stringify(ghLog)},JSON.stringify(a)+'\\n');
 const commentsFile=${JSON.stringify(comments)};
 const issue=n=>({number:n,title:n===100?'Spec':'Task',body:fs.readFileSync(${JSON.stringify(issueSource)},'utf8'),html_url:'https://github.com/example/test/issues/'+n,state:'open',assignees:[]});
 if(a[0]==='repo'&&a[1]==='view') console.log(JSON.stringify({nameWithOwner:'example/test',url:'https://github.com/example/test',defaultBranchRef:{name:'main'}}));
-else if(a.includes('graphql')) console.log(JSON.stringify({data:{repository:{target:{target:{oid:${JSON.stringify(head)}}},i100:{number:100,state:'OPEN'},i101:{number:101,state:'OPEN'},p101:{number:101,url:'https://github.com/example/test/pull/101',state:'OPEN',headRefOid:${JSON.stringify(head)},baseRefOid:${JSON.stringify(head)},baseRefName:'main',headRefName:'test-review',isDraft:false,mergeable:'MERGEABLE',mergeCommit:null}}}}));
+else if(a.includes('graphql')) console.log(JSON.stringify({data:{repository:{target:{target:{oid:${JSON.stringify(head)}}},i100:{number:100,state:'OPEN'},i101:{number:101,state:'OPEN'},i102:{number:102,state:'OPEN'},p101:{number:101,url:'https://github.com/example/test/pull/101',state:'OPEN',headRefOid:${JSON.stringify(head)},baseRefOid:${JSON.stringify(head)},baseRefName:'main',headRefName:'test-review',isDraft:false,mergeable:'MERGEABLE',mergeCommit:null}}}}));
 else if(['issue','pr'].includes(a[0])&&a[1]==='comment') {const rows=JSON.parse(fs.readFileSync(commentsFile));rows.push({html_url:'https://github.com/example/test/issues/101#issuecomment-'+(rows.length+1),body:fs.readFileSync(a[a.indexOf('--body-file')+1],'utf8')});fs.writeFileSync(commentsFile,JSON.stringify(rows));console.log(rows.at(-1).html_url);}
 else if(endpoint.endsWith('/git/ref/heads/main')) console.log(JSON.stringify({ref:'refs/heads/main',object:{type:'commit',sha:${JSON.stringify(head)}}}));
-else if(endpoint.endsWith('/issues/100/sub_issues?per_page=100')) console.log(JSON.stringify([[issue(101)]]));
-else if(endpoint.endsWith('/issues/101/sub_issues?per_page=100')) console.log('[[]]');
+else if(endpoint.endsWith('/issues/100/sub_issues?per_page=100')) console.log(JSON.stringify([withSecondTicket?[issue(101),issue(102)]:[issue(101)]]));
+else if(endpoint.endsWith('/issues/101/sub_issues?per_page=100')||endpoint.endsWith('/issues/102/sub_issues?per_page=100')) console.log('[[]]');
 else if(endpoint.includes('/blocked_by?')) console.log('[[]]');
 else if(endpoint.includes('/comments?')) console.log(JSON.stringify([JSON.parse(fs.readFileSync(commentsFile))]));
 else if(endpoint.endsWith('/issues/100')) console.log(JSON.stringify(issue(100)));
 else if(endpoint.endsWith('/issues/101')) console.log(JSON.stringify(issue(101)));
+else if(endpoint.endsWith('/issues/102')) console.log(JSON.stringify(issue(102)));
 else { console.error('unexpected gh '+a.join(' ')); process.exit(2); }
 `);
   fs.chmodSync(gh, 0o755);
@@ -96,8 +98,9 @@ console.log(JSON.stringify({source:'native_host',schemaVersion:1,challenge:reque
   const planPath = path.join(temp, 'plan.json');
   fs.writeFileSync(planPath, JSON.stringify({
     capabilities: { framework: 'test', mainModel: 'large', modelRouting: 'per_agent', models: ['large', 'middle', 'small'] },
-    policy: { agents: 4, issues: 1, tests: 1, noProgress: 2, rounds: 3 },
-    tickets: [{ number: 101, kind: 'software', dependencies: [], criteria: ['delivered'], visual: false }],
+    policy: { agents: 4, issues: withSecondTicket ? 2 : 1, tests: 1, noProgress: 2, rounds: 3 },
+    tickets: [101,...(withSecondTicket ? [102] : [])].map(number =>
+      ({ number, kind: 'software', dependencies: [], criteria: ['delivered'], visual: false })),
     specCriteria: ['delivered'], evidencePath: planEvidence,
   }));
   return { temp, root, head, call, directCall, inputPath, planPath, planEvidence, ghLog, issueSource, observe, sessions, env };
@@ -163,7 +166,7 @@ test('统一新租约拒绝手动 bind/stage/submit 绕过持久派发与宿主�
 });
 function controlledHost(x: ReturnType<typeof fixture>) {
   const store = path.join(x.temp, 'host.json');
-  fs.writeFileSync(store, JSON.stringify({ mode: 'normal', attempts: 0, starts: 0, actors: {} }));
+  fs.writeFileSync(store, JSON.stringify({ mode: 'normal', attempts: 0, starts: 0, startTokens: [], actors: {} }));
   const adapter = path.join(x.temp, 'bin', 'controlled-host');
   fs.writeFileSync(adapter, `#!/usr/bin/env node
 const fs=require('fs'),path=require('path');
@@ -185,7 +188,7 @@ if(op==='query') {
     modelCallId:actor.modelCallId,provider:actor.provider});
   else reply({state:'not_found',authoritative:true});
 } else if(op==='start') {
-  db.attempts++;
+  db.attempts++;db.startTokens.push(request.token);
   if(db.mode==='before-start') {save();process.exit(82);}
   if(!actor) {
     const nativeId='host-actor-'+request.token;
@@ -864,6 +867,55 @@ test('取消保留原生实例、时间与原始事件；任务写权等待独�
     const stopped=JSON.parse(fs.readFileSync(statePath,'utf8'));
     assert.equal(stopped.jobs.find((j:{id:string})=>j.id===planning.id).status,'cancelled');
     assert.equal(stopped.v3.recoveryRecords.at(-1).kind,'confirm-stop');
+  } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('批量 collect 和 drive 跳过已停止但派发仍不确定的任务，继续收取独立任务', () => {
+  const x=fixture(false,true);
+  try {
+    const {statePath}=planned(x),host=controlledHost(x);
+    const initial=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    const a=initial.jobs.find((j:{ticket:string;action:string})=>j.ticket==='101'&&j.action==='plan');
+    const b=initial.jobs.find((j:{ticket:string;action:string})=>j.ticket==='102'&&j.action==='plan');
+    assert.ok(a);assert.ok(b);
+    for(const job of [a,b]) {
+      const started=x.call('dispatch',statePath,job.id);
+      assert.equal(started.status,0,started.stderr);
+      assert.equal(JSON.parse(started.stdout).status,'running');
+    }
+    const tokenA=initial.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===a.id).token;
+    const tokenB=initial.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===b.id).token;
+    assert.equal(host.get().starts,2);
+    host.set(db=>{db.actors[tokenA].state='completed';db.actors[tokenA].result={complete:true,status:'planned',
+      evidencePath:x.planEvidence,data:{planPath:x.planPath}};});
+    const rejected=x.call('collect',statePath,a.id);assert.equal(rejected.status,0,rejected.stderr);
+    assert.equal(JSON.parse(rejected.stdout).polled[0].status,'uncertain');
+    const stopPath=path.join(x.temp,'stopped-a.json');
+    fs.writeFileSync(stopPath,JSON.stringify([{jobId:a.id,nativeId:'host-actor-'+tokenA,
+      state:'stopped',processTreeStopped:true,evidencePath:x.planEvidence}]));
+    const reconciled=x.call('reconcile',statePath,stopPath);assert.equal(reconciled.status,0,reconciled.stderr);
+    const stopped=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(stopped.jobs.find((j:{id:string})=>j.id===a.id).status,'cancelled');
+    const stoppedDispatch=stopped.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===a.id);
+    assert.equal(stoppedDispatch.status,'uncertain');
+    host.set(db=>{db.mode='unknown';});
+    const polled=x.call('collect',statePath);assert.equal(polled.status,0,polled.stderr);
+    assert.deepEqual(JSON.parse(polled.stdout).polled.map((p:{jobId:string})=>p.jobId),[b.id]);
+    assert.equal(JSON.parse(polled.stdout).polled[0].status,'uncertain');
+    assert.equal(host.get().startTokens.filter((token:string)=>token===tokenA).length,1);
+    const checks=path.join(x.temp,'independent-checks.json');
+    fs.writeFileSync(checks,JSON.stringify({scopeReason:'Independent ticket acceptance',
+      commands:[{name:'smoke',argv:['true'],timeoutSeconds:5}]}));
+    host.set(db=>{db.mode='normal';db.actors[tokenB].state='completed';db.actors[tokenB].result={complete:true,status:'planned',
+      evidencePath:x.planEvidence,data:{planPath:x.planPath,checksPath:checks}};});
+    const driven=x.call('drive',statePath);assert.equal(driven.status,0,driven.stderr);
+    assert.deepEqual(JSON.parse(driven.stdout).collected.polled.map((p:{jobId:string})=>p.jobId),[b.id]);
+    const after=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(after.jobs.find((j:{id:string})=>j.id===b.id).status,'done');
+    assert.equal(after.jobs.find((j:{id:string})=>j.id===a.id).status,'cancelled');
+    assert.equal(after.v3.dispatchRecords.find((d:{jobId:string})=>d.jobId===a.id).events.length,
+      stoppedDispatch.events.length);
+    assert.equal(host.get().startTokens.filter((token:string)=>token===tokenA).length,1);
   } finally {fs.rmSync(x.temp,{recursive:true,force:true});}
 });
 

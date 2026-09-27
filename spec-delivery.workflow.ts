@@ -2376,8 +2376,12 @@ export async function main(argv: string[]): Promise<unknown> {
   }
   if (op === 'collect') {
     const statePath = path.resolve(file), state = read<engine.State>(statePath); requireUnified(state);
-    const records = state.v3!.dispatchRecords.filter(d => d.managed && (!extra || d.jobId === extra) &&
-      ['starting','running','completed','uncertain'].includes(d.status));
+    const records = state.v3!.dispatchRecords.filter(d => {
+      if (!d.managed || !['starting','running','completed','uncertain'].includes(d.status)) return false;
+      if (extra) return d.jobId === extra;
+      const job = state.jobs.find(j => j.id === d.jobId);
+      return job && active(job) && !recovering(state, job);
+    });
     const polled = records.map(d => dispatchRound(statePath, d.jobId, false));
     return { polled, ...consumeStaged(statePath, extra ? [extra] : undefined) };
   }

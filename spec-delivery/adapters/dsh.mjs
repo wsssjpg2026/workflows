@@ -13,11 +13,18 @@ const fail=message=>{throw new Error(message);};
 const assert=(condition,message)=>{if(!condition)fail(message);};
 const read=file=>JSON.parse(fs.readFileSync(file,'utf8'));
 const now=()=>new Date().toISOString();
+function syncDir(directory){
+  const fd=fs.openSync(directory,'r');
+  try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
+}
 function atomic(file,value){
   fs.mkdirSync(path.dirname(file),{recursive:true});
   const temp=`${file}.${process.pid}.tmp`;
-  fs.writeFileSync(temp,typeof value==='string'?value:JSON.stringify(value,null,2)+'\n',{flag:'wx',mode:0o600});
+  const fd=fs.openSync(temp,'wx',0o600);
+  try{fs.writeFileSync(fd,typeof value==='string'||Buffer.isBuffer(value)?value:JSON.stringify(value,null,2)+'\n');fs.fsyncSync(fd);}
+  finally{fs.closeSync(fd);}
   fs.renameSync(temp,file);
+  syncDir(path.dirname(file));
 }
 function config(file){
   const c=read(path.resolve(file));
@@ -56,15 +63,27 @@ function request(c,file){
 }
 const runId=token=>sha(token).slice(0,32);
 const homeFor=(c,token)=>path.join(c.runtimeRoot,'runs',runId(token));
-function manifest(c,r,digest){
+function manifest(c,r,digest,kind='host'){
   const home=homeFor(c,r.token);
   if(!fs.existsSync(home))return null;
   const file=path.join(home,'manifest.json');
   if(!fs.existsSync(file))return {home,unsettled:true};
   const m=read(file);
-  assert(m.token===r.token&&m.jobId===r.jobId&&m.targetHost===r.targetHost&&
+  assert((m.kind||'host')===kind&&m.token===r.token&&m.jobId===r.jobId&&m.targetHost===r.targetHost&&
     m.requestDigest===digest&&m.requestedModel===r.requestedModel,'token 已关联另一派发请求');
   return {...m,home};
+}
+function bootstrapRequest(c,file){
+  const raw=fs.readFileSync(file),r=JSON.parse(raw.toString('utf8'));
+  assert(r?.schema===1&&r.targetHost===c.hostId&&r.jobId==='$spec:execution-plan'&&
+    typeof r.token==='string'&&r.token&&typeof r.requestedModel==='string'&&
+    path.isAbsolute(r.worktree)&&
+    path.isAbsolute(r.promptPath)&&
+    path.isAbsolute(r.outputDirectory),'bootstrap 需要固定 job、host、模型和绝对路径');
+  const route=c.routes.find(x=>x.requestedModel===r.requestedModel);
+  assert(route,'bootstrap L1 模型不在已配置路由中');
+  const prompt=fs.existsSync(r.promptPath)?fs.readFileSync(r.promptPath,'utf8'):null;
+  return {r,route,prompt,digest:sha(raw)};
 }
 function sessionLogs(home){
   const root=path.join(home,'sessions');
@@ -120,8 +139,8 @@ function groupAlive(pid){
   }
   try{process.kill(-pid,0);return true;}catch{return false;}
 }
-function hostReply(c,r,digest,operation){
-  const m=manifest(c,r,digest);
+function hostReply(c,r,digest,operation,kind='host'){
+  const m=manifest(c,r,digest,kind);
   const base={token:r.token,jobId:r.jobId,targetHost:r.targetHost,continuationSupported:false};
   if(!m)return {...base,state:'not_found',authoritative:true};
   if(m.unsettled)return {...base,state:'unknown',reason:'token intent exists without manifest'};
@@ -153,6 +172,7 @@ function start(c,configPath,file){
   const home=homeFor(c,r.token);
   fs.mkdirSync(path.dirname(home),{recursive:true});
   try{fs.mkdirSync(home,{mode:0o700});}catch(error){if(error.code!=='EEXIST')throw error;return hostReply(c,r,digest,'start');}
+  syncDir(path.dirname(home));
   atomic(path.join(home,'manifest.json'),{...base,requestedModel:r.requestedModel,requestDigest:digest,
     packetPath:r.packetPath,outputDirectory:packet.outputDirectory,startedAt:now(),routeIndex:c.routes.indexOf(route)});
   const child=spawn(process.execPath,[self,'worker',path.resolve(configPath),home],{
@@ -188,6 +208,70 @@ function host(c,configPath,operation,file){
     atomic(path.join(m.home,'cancelled.json'),{at:now(),pid});
   return hostReply(c,r,digest,'cancel');
 }
+function bootstrapReply(c,r,digest,operation){
+  const m=manifest(c,r,digest,'bootstrap');
+  const base={token:r.token,jobId:r.jobId,targetHost:r.targetHost};
+  if(!m)return {...base,state:'not_found',authoritative:true};
+  if(m.unsettled)return {...base,state:'unknown',reason:'bootstrap token intent exists without manifest'};
+  assert(sha(fs.readFileSync(path.join(m.home,'bootstrap-prompt.txt')))===m.promptDigest,
+    'bootstrap 固定提示词已变化');
+  assert(sha(fs.readFileSync(path.join(m.home,'route-settings.yaml')))===m.routeSettingsDigest,
+    'bootstrap 固定路由配置已变化');
+  const reply=hostReply(c,r,digest,operation,'bootstrap');
+  if(!reply.nativeId)return reply;
+  let native;
+  try{observe(c,reply.nativeId,r.jobId);native=locateNative(c,reply.nativeId,r.jobId);}
+  catch{return {...reply,state:'unknown',reason:'bootstrap native route identity is unverified'};}
+  if(reply.state!=='completed')return reply;
+  const finished=read(path.join(m.home,'finished.json'));
+  const planPath=path.join(m.outputDirectory,reply.resultFile);
+  const rawPath=path.join(m.outputDirectory,`dsh-plan-${runId(r.token).slice(0,12)}.raw.json`);
+  if(path.basename(reply.resultFile)!==reply.resultFile||!fs.existsSync(planPath)||
+    !fs.existsSync(rawPath)||sha(fs.readFileSync(planPath))!==finished.resultSha256||
+    sha(fs.readFileSync(rawPath))!==finished.rawSha256||
+    sha(native.observation.finalText)!==finished.rawSha256)
+    return {...reply,state:'unknown',reason:'bootstrap plan artifact is missing or changed',resultFile:undefined};
+  const plan=read(planPath);
+  if(plan.decisionNativeId!==reply.nativeId||plan.evidencePath!==rawPath)
+    return {...reply,state:'unknown',reason:'bootstrap plan identity or raw evidence changed',resultFile:undefined};
+  return {...reply,planPath,planSha256:finished.resultSha256,rawSha256:finished.rawSha256};
+}
+function bootstrap(c,configPath,operation,file){
+  assert(['query','start','collect'].includes(operation),'未知 bootstrap 操作');
+  const {r,route,prompt,digest}=bootstrapRequest(c,file);
+  if(operation!=='start')return bootstrapReply(c,r,digest,operation);
+  const existing=manifest(c,r,digest,'bootstrap');
+  if(existing)return bootstrapReply(c,r,digest,'start');
+  assert(prompt?.trim(),'bootstrap L1 提示词不存在或为空');
+  assert(fs.statSync(r.worktree).isDirectory(),'bootstrap 工作树不可读取');
+  const promptDigest=sha(prompt);
+  const home=homeFor(c,r.token),base={token:r.token,jobId:r.jobId,targetHost:r.targetHost};
+  fs.mkdirSync(path.dirname(home),{recursive:true});
+  try{fs.mkdirSync(home,{mode:0o700});}
+  catch(error){if(error.code!=='EEXIST')throw error;return bootstrapReply(c,r,digest,'start');}
+  syncDir(path.dirname(home));
+  assert(!fs.existsSync(r.outputDirectory),'bootstrap 输出目录必须尚未存在');
+  fs.mkdirSync(r.outputDirectory,{recursive:true,mode:0o700});
+  syncDir(path.dirname(r.outputDirectory));
+  atomic(path.join(home,'bootstrap-prompt.txt'),prompt);
+  const routeSettings=fs.readFileSync(route.settingsFile);
+  atomic(path.join(home,'route-settings.yaml'),routeSettings);
+  atomic(path.join(home,'manifest.json'),{...base,kind:'bootstrap',requestedModel:r.requestedModel,
+    requestDigest:digest,promptDigest,worktree:r.worktree,outputDirectory:r.outputDirectory,
+    startedAt:now(),routeIndex:c.routes.indexOf(route),routeProvider:route.provider,routeModel:route.model,
+    routeSettingsDigest:sha(routeSettings)});
+  const child=spawn(process.execPath,[self,'worker',path.resolve(configPath),home],{
+    detached:true,stdio:'ignore',env:{...process.env,DSH_ADAPTER_WORKER:'1'}});
+  child.unref();
+  atomic(path.join(home,'launch.json'),{pid:child.pid,at:now()});
+  const until=Date.now()+c.startWaitMs;
+  while(Date.now()<until){
+    const result=bootstrapReply(c,r,digest,'start');
+    if(['running','completed'].includes(result.state))return result;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,100);
+  }
+  return {...base,state:'unknown',reason:'bootstrap native session/model not observable before startup deadline'};
+}
 function actorPrompt(packet,c,configPath){
   if(typeof packet.adapterProbeTask==='string'){
     assert(c.allowProbeTask===true,'probe task 只允许隔离测试配置');
@@ -198,16 +282,24 @@ function actorPrompt(packet,c,configPath){
   return `You are executing one bounded spec-delivery job. Read the packet at ${JSON.stringify(packet.__packetPath)} and roles at ${JSON.stringify(packet.rolesPath)}. Follow its exact action, approved plan/checks and skill bindings. The public workflow CLI is node ${JSON.stringify(c.workflowEntry)}; its state is ${JSON.stringify(statePath)}. Before invoking a workflow command, poll the read-only inspect command until this job shows a bound native session; the host binds it immediately after observing your first model event. For a bound skill use skill-start, then load the returned original source with node ${JSON.stringify(self)} skill-open ${JSON.stringify(configPath)} ${JSON.stringify(statePath)} <invocationId>, do the skill's work including skill-delegate/skill-continue, write a raw report, run node ${JSON.stringify(self)} skill-complete ${JSON.stringify(configPath)} ${JSON.stringify(statePath)} <invocationId> <rawOutputPath>, then skill-finish. Run tests with the workflow test command. Do not edit workflow state directly or start hidden agents. Return only one Result JSON object with complete/status/evidencePath and action-specific fields. Do not supply model or native identity. If unable to finish, return complete:false with an evidence file.`;
 }
 async function worker(c,home,configPath){
-  const m=read(path.join(home,'manifest.json')),route=c.routes[m.routeIndex],packet=read(m.packetPath);
-  packet.__packetPath=m.packetPath;
-  fs.copyFileSync(route.settingsFile,path.join(home,'settings.yaml'));
+  const m=read(path.join(home,'manifest.json')),route=c.routes[m.routeIndex];
+  const bootstrap=m.kind==='bootstrap',packet=bootstrap?null:read(m.packetPath);
+  if(packet)packet.__packetPath=m.packetPath;
+  if(bootstrap){
+    assert(route.provider===m.routeProvider&&route.model===m.routeModel&&
+      sha(fs.readFileSync(path.join(home,'route-settings.yaml')))===m.routeSettingsDigest,
+      'bootstrap route snapshot mismatch');
+    fs.copyFileSync(path.join(home,'route-settings.yaml'),path.join(home,'settings.yaml'));
+  }else fs.copyFileSync(route.settingsFile,path.join(home,'settings.yaml'));
   if(c.credentialsFile)fs.symlinkSync(c.credentialsFile,path.join(home,'.credentials.yaml'));
   fs.writeFileSync(path.join(home,'patch.yml'),'[]\n',{flag:'wx',mode:0o600});
   fs.mkdirSync(path.join(home,'sessions'),{recursive:true});
-  const cwd=packet.worktree||packet.repo?.root||path.dirname(path.dirname(m.packetPath));
+  const cwd=bootstrap?m.worktree:packet.worktree||packet.repo?.root||path.dirname(path.dirname(m.packetPath));
   assert(path.isAbsolute(cwd)&&fs.statSync(cwd).isDirectory(),'任务 cwd 不可读取');
   const stdout=fs.openSync(path.join(home,'stdout.log'),'w',0o600),stderr=fs.openSync(path.join(home,'stderr.log'),'w',0o600);
-  const prompt=actorPrompt(packet,c,configPath);
+  const prompt=bootstrap
+    ? `You are the separately routed L1 execution planner. Follow the instructions below and return exactly one JSON object containing the ExecutionPlan fields, including current inputVersion and sourceVersion. Do not supply decisionNativeId or evidencePath: the host attaches those from your native session and exact final response. Do not modify the workflow ledger.\n\n${fs.readFileSync(path.join(home,'bootstrap-prompt.txt'),'utf8')}`
+    : actorPrompt(packet,c,configPath);
   const args=['--profile',c.profile,'--patch',path.join(home,'patch.yml'),prompt];
   const child=spawn(c.dshBin,args,{cwd,env:{...process.env,DSH_HOME:home,
     DSH_PERMISSION_MODE:c.permissionMode||'danger-full-access'},stdio:['ignore',stdout,stderr]});
@@ -220,14 +312,34 @@ async function worker(c,home,configPath){
   });
   clearTimeout(timeout);fs.closeSync(stdout);fs.closeSync(stderr);
   const {session,observation}=uniqueSession(c,home);
-  let resultFile=null;
+  let resultFile=null,resultSha256=null,rawSha256=null;
   if(session&&observation?.finalText){
     fs.mkdirSync(m.outputDirectory,{recursive:true});
-    resultFile=`dsh-final-${runId(m.token).slice(0,12)}.txt`;
-    fs.writeFileSync(path.join(m.outputDirectory,resultFile),observation.finalText,{flag:'wx',mode:0o600});
+    if(bootstrap&&exitCode.code===0&&!timedOut&&observation.completeFrame){
+      try{
+        assert(observation.source?.provider===route.provider&&observation.source?.model===route.model,
+          'bootstrap native route mismatch');
+        const authored=JSON.parse(observation.finalText);
+        assert(authored&&typeof authored==='object'&&!Array.isArray(authored)&&
+          !Object.hasOwn(authored,'decisionNativeId')&&!Object.hasOwn(authored,'evidencePath'),
+          'bootstrap final must be an L1-authored plan without host proof fields');
+        const prefix=`dsh-plan-${runId(m.token).slice(0,12)}`;
+        const rawPath=path.join(m.outputDirectory,`${prefix}.raw.json`);
+        atomic(rawPath,observation.finalText);
+        rawSha256=sha(observation.finalText);
+        resultFile=`${prefix}.json`;
+        const plan={...authored,evidencePath:rawPath,decisionNativeId:`${runId(m.token)}/${session.id}`};
+        const bytes=JSON.stringify(plan,null,2)+'\n';
+        atomic(path.join(m.outputDirectory,resultFile),bytes);
+        resultSha256=sha(bytes);
+      }catch{/* retain the native instance and raw log; an invalid plan is not completed */}
+    }else if(!bootstrap){
+      resultFile=`dsh-final-${runId(m.token).slice(0,12)}.txt`;
+      fs.writeFileSync(path.join(m.outputDirectory,resultFile),observation.finalText,{flag:'wx',mode:0o600});
+    }
   }
   atomic(path.join(home,'finished.json'),{at:now(),exitCode:exitCode.code,signal:exitCode.signal,
-    spawnError:exitCode.error||null,timedOut,resultFile});
+    spawnError:exitCode.error||null,timedOut,resultFile,resultSha256,rawSha256});
 }
 function locateNative(c,nativeId,jobId){
   const match=/^([0-9a-f]{32})\/(session-[A-Za-z0-9-]+)$/.exec(nativeId);
@@ -242,7 +354,8 @@ function locateNative(c,nativeId,jobId){
 function observe(c,nativeId,jobId){
   const {m,session,observation}=locateNative(c,nativeId,jobId),origin=observation.origin;
   const sourceEvent=observation.source;
-  const route=c.routes.find(r=>r.requestedModel===m.requestedModel);
+  const route=m.kind==='bootstrap'?{provider:m.routeProvider,model:m.routeModel}:
+    c.routes.find(r=>r.requestedModel===m.requestedModel);
   assert(route&&route.provider===sourceEvent.provider&&route.model===sourceEvent.model,
     '真实 provider/model 与请求路由不符');
   const proofId=sha(JSON.stringify({id:origin.id,createdAt:origin.createdAt,cwd:origin.cwd,log:session.log}));
@@ -333,7 +446,8 @@ function probe(c){
   return {adapter:'dsh-v3',hostId:c.hostId,installed:{dsh:dsh.code===0,zstd:zstd.code===0,
     credentialsPresent:!!c.credentialsFile},routes:c.routes.map(r=>({requestedModel:r.requestedModel,
     expectedProvider:r.provider,expectedModel:r.model,settingsPresent:true,nativeRouteVerified:false})),
-    capabilities:{tokenQuery:'adapter-persistent',sessionObservation:'requires-native-probe',
+    capabilities:{tokenQuery:'adapter-persistent',bootstrapPlan:'adapter-persistent-native',
+      actorAvailability:'unverified-stop',sessionObservation:'requires-native-probe',
       skillMode:c.sourceExecution===false?'unavailable':'source_execution',nativeExplicit:false,
       nativeResume:false,rawUsage:'requires-native-probe',stop:'process-group-request-plus-reconcile'},
     note:'This is a read-only installation probe. No provider route, native skill or recovery success is claimed.'};
@@ -351,12 +465,16 @@ function install(configPath,directory){
 }
 async function main(argv){
   const [mode,configPath,...rest]=argv;
-  assert(mode&&configPath,'用法: dsh.mjs <probe|install|host|observe|skill|skill-open|skill-complete|worker> <config.json> ...');
+  assert(mode&&configPath,'用法: dsh.mjs <probe|install|host|bootstrap|observe|skill|skill-open|skill-complete|worker> <config.json> ...');
   const c=config(configPath);
   if(mode==='probe')return probe(c);
   if(mode==='install')return install(configPath,rest[0]);
   if(mode==='host')return host(c,configPath,rest[0],rest[1]);
-  if(mode==='observe'){assert(rest[0]==='observe','仅支持 observe');return observe(c,rest[1],rest[2]);}
+  if(mode==='bootstrap')return bootstrap(c,configPath,rest[0],rest[1]);
+  if(mode==='observe'){
+    if(rest[0]==='availability')fail('DSH headless 未提供可证明原 actor 不可恢复的原生接口；停止 context-reconstruct');
+    assert(rest[0]==='observe','仅支持 observe');return observe(c,rest[1],rest[2]);
+  }
   if(mode==='skill')return rest[0]==='capabilities'?skillCapabilities(c,rest[1],rest[2]):skillResult(c,rest[1],rest[2]);
   if(mode==='skill-open')return skillOpen(c,rest[0],rest[1]);
   if(mode==='skill-complete')return skillComplete(c,rest[0],rest[1],rest[2]);

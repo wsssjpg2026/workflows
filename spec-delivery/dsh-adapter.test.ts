@@ -8,6 +8,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const adapter=fileURLToPath(new URL('./adapters/dsh.mjs',import.meta.url));
+const mainObserver=fileURLToPath(new URL('./adapters/codex-main-observer.mjs',import.meta.url));
 const sha=(value:Buffer|string)=>createHash('sha256').update(value).digest('hex');
 const zstd=execFileSync('which',['zstd'],{encoding:'utf8'}).trim();
 function fixture(){
@@ -59,7 +60,15 @@ console.log(process.env.FAKE_FINAL_JSON);
       requestedModel:'fixture/model',packetPath}));
     return {requestPath,packetPath,outputDirectory};
   }
-  return {root,runtime,statePath,stateDir,configPath,starts,env,call,ok,dispatch,
+  function bootstrap(token:string){
+    const promptPath=path.join(root,`${token}.prompt.txt`),requestPath=path.join(root,`${token}.bootstrap.json`);
+    const outputDirectory=path.join(root,`${token}.bootstrap-output`);
+    fs.writeFileSync(promptPath,'Read the fixed sources and author the execution graph as JSON.\n');
+    fs.writeFileSync(requestPath,JSON.stringify({schema:1,token,jobId:'$spec:execution-plan',
+      targetHost:'fixture-dsh',requestedModel:'fixture/model',worktree:root,promptPath,outputDirectory}));
+    return {requestPath,promptPath,outputDirectory};
+  }
+  return {root,runtime,statePath,stateDir,configPath,starts,env,call,ok,dispatch,bootstrap,
     cleanup:()=>fs.rmSync(root,{recursive:true,force:true})};
 }
 function until<T>(fn:()=>T,ready:(value:T)=>boolean,timeout=5000):T{
@@ -92,6 +101,87 @@ test('统一宿主契约：token 先查、启动后同身份查询、逐项收�
     assert.equal(probe.routes[0].nativeRouteVerified,false,'只读探测不能冒充真实路由验证');
     assert.equal(probe.capabilities.nativeResume,false);
   }finally{x.cleanup();}
+});
+
+test('bootstrap 在 plan 前持久启动真实路由的 L1，并从原生最终消息生成可验身份的计划',()=>{
+  const x=fixture();
+  try{
+    const {requestPath,promptPath}=x.bootstrap('fixed-plan-token');
+    const authored={inputVersion:'input-v1',sourceVersion:'source-v1',
+      capabilities:{framework:'fixture-dsh',mainModel:'coordinator',modelRouting:'per_agent',models:['fixture/model']},
+      policy:{agents:2,issues:1,tests:1,noProgress:2,rounds:2},
+      tickets:[{number:101,kind:'software',dependencies:[],criteria:['done'],visual:false}],specCriteria:['done']};
+    const env={FAKE_FINAL_JSON:JSON.stringify(authored)};
+    assert.equal(x.ok('bootstrap',['query',requestPath]).state,'not_found');
+    const started=x.ok('bootstrap',['start',requestPath],{env});
+    assert.ok(['running','completed'].includes(started.state));assert.ok(started.nativeId);
+    const collected=until(()=>x.ok('bootstrap',['collect',requestPath]),r=>r.state==='completed');
+    assert.equal(collected.nativeId,started.nativeId);
+    assert.equal(collected.jobId,'$spec:execution-plan');
+    assert.equal(collected.usage.events[0].usage.inputTokens,11);
+    const plan=JSON.parse(fs.readFileSync(collected.planPath,'utf8'));
+    assert.equal(plan.decisionNativeId,started.nativeId);
+    assert.equal(plan.inputVersion,'input-v1');assert.equal(plan.sourceVersion,'source-v1');
+    assert.deepEqual(JSON.parse(fs.readFileSync(plan.evidencePath,'utf8')),authored);
+    assert.equal(sha(fs.readFileSync(collected.planPath)),collected.planSha256);
+    assert.equal(sha(fs.readFileSync(plan.evidencePath)),collected.rawSha256);
+    assert.equal(x.ok('observe',['observe',started.nativeId,'$spec:execution-plan']).model,'model');
+    assert.equal(x.ok('bootstrap',['start',requestPath]).nativeId,started.nativeId);
+    assert.equal(fs.readFileSync(x.starts,'utf8').trim().split('\n').length,1);
+    fs.appendFileSync(promptPath,'changed\n');
+    assert.equal(x.ok('bootstrap',['query',requestPath]).nativeId,started.nativeId,
+      '外部提示词变化不影响已固定 token 的查询和原始快照');
+    fs.unlinkSync(promptPath);
+    assert.equal(x.ok('bootstrap',['collect',requestPath]).nativeId,started.nativeId,
+      '提示词来源消失后仍可按持久 manifest 收取');
+    const routeFile=JSON.parse(fs.readFileSync(x.configPath,'utf8')).routes[0].settingsFile;
+    fs.writeFileSync(routeFile,'agent-default-model: changed-after-start\n');
+    assert.equal(x.ok('bootstrap',['query',requestPath]).nativeId,started.nativeId,
+      '外部路由文件变化不能改写已持久化的原生路线证明');
+    fs.appendFileSync(collected.planPath,' ');
+    const tampered=x.ok('bootstrap',['collect',requestPath]);
+    assert.equal(tampered.state,'unknown');assert.match(tampered.reason,/artifact/);
+  }finally{x.cleanup();}
+});
+
+test('bootstrap 模型错配和非 JSON 最终消息不能交付计划；availability 不伪称 unavailable',()=>{
+  const x=fixture();
+  try{
+    const wrong=x.bootstrap('wrong-bootstrap');
+    const started=x.ok('bootstrap',['start',wrong.requestPath],{env:{FAKE_PROVIDER:'other',FAKE_FINAL_JSON:'{}'}});
+    assert.equal(started.state,'unknown');
+    assert.equal(x.ok('bootstrap',['collect',wrong.requestPath]).state,'unknown');
+    assert.equal(fs.existsSync(wrong.outputDirectory)&&fs.readdirSync(wrong.outputDirectory).length,0);
+    const malformed=x.bootstrap('malformed-bootstrap');
+    x.ok('bootstrap',['start',malformed.requestPath],{env:{FAKE_FINAL_JSON:'not a JSON plan'}});
+    const settled=until(()=>x.ok('bootstrap',['collect',malformed.requestPath]),r=>r.state==='unknown'&&!!r.nativeId);
+    assert.match(settled.reason,/durable final message/);
+    const missing=x.call('observe',['availability',settled.nativeId,'$spec:execution-plan']);
+    assert.notEqual(missing.status,0);assert.match(missing.stderr,/不能证明|不可恢复/);
+  }finally{x.cleanup();}
+});
+
+test('Codex 主会话 observer 只从当前 rollout 元数据和 turn_context 提取身份摘要',()=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'codex-main-observer-'));
+  try{
+    const id='01234567-89ab-cdef-0123-456789abcdef';
+    const day=path.join(root,'sessions','2026','09','27');fs.mkdirSync(day,{recursive:true});
+    const file=path.join(day,`rollout-test-${id}.jsonl`);
+    const events=[{type:'session_meta',timestamp:'2026-09-27T00:00:00Z',payload:{id,session_id:id,model_provider:'openai'}},
+      {type:'turn_context',timestamp:'2026-09-27T01:00:00Z',payload:{model:'gpt-6-sol'}}];
+    fs.writeFileSync(file,events.map(e=>JSON.stringify(e)).join('\n')+'\n');
+    const env={...process.env,CODEX_HOME:root,CODEX_SESSION_ID:id,CODEX_THREAD_ID:id};
+    const run=(nativeId:string,jobId='$main',alter={})=>spawnSync(process.execPath,[mainObserver,'observe',nativeId,jobId],
+      {env:{...env,...alter},encoding:'utf8'});
+    const result=run(id);assert.equal(result.status,0,result.stderr);
+    const observed=JSON.parse(result.stdout);
+    assert.equal(observed.nativeId,id);assert.equal(observed.provider,'openai');
+    assert.equal(observed.model,'gpt-6-sol');assert.equal(observed.context.mode,'new');
+    assert.ok(observed.context.proofId);assert.ok(!result.stdout.includes('rollout-test'));
+    assert.notEqual(run('another-session').status,0);
+    assert.notEqual(run(id,'job-1').status,0);
+    assert.notEqual(run(id,'$main',{CODEX_THREAD_ID:'another-session'}).status,0);
+  }finally{fs.rmSync(root,{recursive:true,force:true});}
 });
 
 test('统一技能契约：源码实际加载并归档后才签发 source_execution 回执',()=>{

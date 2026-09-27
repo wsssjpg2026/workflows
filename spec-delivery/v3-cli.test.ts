@@ -11,6 +11,8 @@ import { rawSourcesForJob } from './raw-sources.ts';
 import * as core from './core.ts';
 
 const entry = fileURLToPath(new URL('../spec-delivery.workflow.ts', import.meta.url));
+const dshAdapter = fileURLToPath(new URL('./adapters/dsh.mjs', import.meta.url));
+const codexMainObserver = fileURLToPath(new URL('./adapters/codex-main-observer.mjs', import.meta.url));
 const sha = (value:string) => createHash('sha256').update(value).digest('hex');
 const git = (cwd: string, ...argv: string[]) => execFileSync('git', argv, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const inputs = { spec: 100, targetBranch: 'main', models: { L1: 'large', L2: 'middle', L3: 'small' } };
@@ -299,6 +301,90 @@ test('v3 公开 CLI 从五项输入初始化、规划、认领并登记一次 ag
     assert.equal(counts.deterministicTasks, 1);
     assert.equal(counts.byTier.L1, 2);
   } finally { fs.rmSync(x.temp, { recursive: true, force: true }); }
+});
+
+test('主会话使用独立可信 observer，plan 仍从普通宿主 observer 验证 L1',()=>{
+  const x=fixture();
+  try{
+    const id='01234567-89ab-cdef-0123-456789abcdef';
+    const day=path.join(x.temp,'codex-home','sessions','2026','09','27');fs.mkdirSync(day,{recursive:true});
+    fs.writeFileSync(path.join(day,`rollout-fixture-${id}.jsonl`),[
+      JSON.stringify({type:'session_meta',timestamp:'2026-09-27T00:00:00Z',payload:{id,session_id:id,model_provider:'openai'}}),
+      JSON.stringify({type:'turn_context',timestamp:'2026-09-27T01:00:00Z',payload:{model:'gpt-6-sol'}}),
+    ].join('\n')+'\n');
+    Object.assign(x.env,{SPEC_DELIVERY_MAIN_OBSERVER:codexMainObserver,
+      CODEX_HOME:path.join(x.temp,'codex-home'),CODEX_SESSION_ID:id,CODEX_THREAD_ID:id});
+    const started=x.call('init',x.inputPath);assert.equal(started.status,0,started.stderr);
+    const statePath=JSON.parse(started.stdout).statePath;
+    const observed=x.call('observe-main',statePath,id);assert.equal(observed.status,0,observed.stderr);
+    const bad=x.call('observe-main',statePath,'claimed-other-session');assert.notEqual(bad.status,0);
+    const plan=JSON.parse(fs.readFileSync(x.planPath,'utf8'));
+    Object.assign(plan,JSON.parse(started.stdout).decisionContext,{decisionNativeId:'native-global-plan'});
+    fs.writeFileSync(x.planPath,JSON.stringify(plan));
+    x.observe('native-global-plan','$spec:execution-plan','large');
+    const accepted=x.call('plan',statePath,x.planPath);assert.equal(accepted.status,0,accepted.stderr);
+    const state=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(state.mainSession.model,'gpt-6-sol');
+    assert.equal(state.v3.decisionRecords[0].session.model,'large');
+    assert.notEqual(state.mainSession.nativeId,state.v3.decisionRecords[0].session.nativeId);
+  }finally{fs.rmSync(x.temp,{recursive:true,force:true});}
+});
+
+test('公开 plan CLI 收取 bootstrap 原生 L1 计划并归档 DSH 会话证明',()=>{
+  const x=fixture();
+  try{
+    const started=x.call('init',x.inputPath);assert.equal(started.status,0,started.stderr);
+    const statePath=JSON.parse(started.stdout).statePath;
+    const authored=JSON.parse(fs.readFileSync(x.planPath,'utf8'));
+    delete authored.evidencePath;
+    Object.assign(authored,JSON.parse(started.stdout).decisionContext);
+    const nativeRoot=path.join(x.temp,'native-bootstrap');fs.mkdirSync(nativeRoot);
+    const fake=path.join(nativeRoot,'fake-dsh.mjs');
+    const zstd=execFileSync('which',['zstd'],{encoding:'utf8'}).trim();
+    fs.writeFileSync(fake,`#!/usr/bin/env node
+import fs from 'node:fs';import path from 'node:path';import {spawnSync} from 'node:child_process';
+if(process.argv.includes('--version')){console.log('fixture DSH');process.exit(0);}
+const home=process.env.DSH_HOME,id='session-'+path.basename(home).slice(0,16);
+const dir=path.join(home,'sessions','--bootstrap--',id);fs.mkdirSync(dir,{recursive:true});
+const at=Date.now(),events=[{type:'session',id,createdAt:at,cwd:process.cwd()},
+{type:'assistant/message',seq:1,time:at+1,data:{message:{source:{kind:'model',provider:'fixture',model:'large'},
+content:[{type:'text',text:process.env.BOOTSTRAP_PLAN}]},usage:{inputTokens:5,outputTokens:10}}}];
+const plain=path.join(dir,'events.jsonl');fs.writeFileSync(plain,events.map(e=>JSON.stringify(e)).join('\\n')+'\\n');
+const zipped=spawnSync(${JSON.stringify(zstd)},['-q','-f',plain,'-o',path.join(dir,'session.v3.jsonl.zstd')]);
+if(zipped.status!==0)process.exit(2);
+`);
+    fs.chmodSync(fake,0o755);
+    const settings=path.join(nativeRoot,'settings.yaml');fs.writeFileSync(settings,'agent-default-model: fixture\n');
+    const configPath=path.join(nativeRoot,'config.json');
+    fs.writeFileSync(configPath,JSON.stringify({schema:1,hostId:'test',runtimeRoot:path.join(nativeRoot,'runtime'),
+      dshBin:fake,zstdBin:zstd,routes:[{requestedModel:'large',provider:'fixture',model:'large',settingsFile:settings}],
+      startWaitMs:3000,taskTimeoutMs:10000}));
+    const installed=spawnSync(process.execPath,[dshAdapter,'install',configPath,path.join(nativeRoot,'bin')],
+      {encoding:'utf8'});assert.equal(installed.status,0,installed.stderr);
+    x.env.SPEC_DELIVERY_HOST_OBSERVER=JSON.parse(installed.stdout).observer;
+    x.env.BOOTSTRAP_PLAN=JSON.stringify(authored);
+    const promptPath=path.join(nativeRoot,'prompt.txt');fs.writeFileSync(promptPath,'Read the spec and write the execution graph.\n');
+    const requestPath=path.join(nativeRoot,'request.json');
+    fs.writeFileSync(requestPath,JSON.stringify({schema:1,token:'fixed-cli-plan-token',jobId:'$spec:execution-plan',
+      targetHost:'test',requestedModel:'large',worktree:x.root,promptPath,outputDirectory:path.join(nativeRoot,'output')}));
+    const callBootstrap=(operation:string)=>{
+      const r=spawnSync(process.execPath,[dshAdapter,'bootstrap',configPath,operation,requestPath],
+        {env:x.env,encoding:'utf8',timeout:15000});assert.equal(r.status,0,r.stderr);return JSON.parse(r.stdout);
+    };
+    const launched=callBootstrap('start');assert.ok(launched.nativeId);
+    let collected=callBootstrap('collect');
+    for(let i=0;i<30&&collected.state!=='completed';i++){
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,100);
+      collected=callBootstrap('collect');
+    }
+    assert.equal(collected.state,'completed');
+    const accepted=x.call('plan',statePath,collected.planPath);assert.equal(accepted.status,0,accepted.stderr);
+    const state=JSON.parse(fs.readFileSync(statePath,'utf8'));
+    assert.equal(state.status,'running');
+    assert.equal(state.v3.decisionRecords[0].session.nativeId,launched.nativeId);
+    assert.equal(state.v3.decisionRecords[0].session.model,'large');
+    assert.equal(state.v3.decisionRecords[0].artifactPath,collected.planPath);
+  }finally{fs.rmSync(x.temp,{recursive:true,force:true});}
 });
 
 test('公开 CLI 拒绝伪造配置模型的 L1 与过期输入、来源和决策产物', () => {

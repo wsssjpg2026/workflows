@@ -90,9 +90,12 @@ function refreshAuthorReviews(s: engine.State) {
   }
 }
 function nativeSession(statePath: string, nativeId: string, jobId: string): engine.NativeSession {
-  const observer = process.env.SPEC_DELIVERY_HOST_OBSERVER;
+  const observer = jobId === '$main'
+    ? process.env.SPEC_DELIVERY_MAIN_OBSERVER || process.env.SPEC_DELIVERY_HOST_OBSERVER
+    : process.env.SPEC_DELIVERY_HOST_OBSERVER;
   engine.ensure(observer && path.isAbsolute(observer) && fs.statSync(observer).isFile(),
-    '宿主未提供可信原生会话查询适配器 SPEC_DELIVERY_HOST_OBSERVER');
+    jobId === '$main' ? '宿主未提供可信主会话查询适配器 SPEC_DELIVERY_MAIN_OBSERVER'
+      : '宿主未提供可信原生会话查询适配器 SPEC_DELIVERY_HOST_OBSERVER');
   const output = command(path.dirname(statePath), observer, ['observe', nativeId, jobId]);
   const raw = JSON.parse(output) as engine.NativeSession;
   engine.ensure(raw?.source === 'native_host' && raw.jobId === jobId && !!raw.observationId &&

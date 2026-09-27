@@ -39,15 +39,47 @@ node /absolute/isolated/candidate/spec-delivery/adapters/dsh.mjs install /absolu
 export SPEC_DELIVERY_HOST_ADAPTER=/absolute/isolated/candidate/bin/dsh-host
 export SPEC_DELIVERY_HOST_OBSERVER=/absolute/isolated/candidate/bin/dsh-observer
 export SPEC_DELIVERY_SKILL_OBSERVER=/absolute/isolated/candidate/bin/dsh-skill-observer
+export SPEC_DELIVERY_MAIN_OBSERVER=/absolute/isolated/candidate/spec-delivery/adapters/codex-main-observer.mjs
 ```
 
 `probe` checks executable availability and route-file presence **without starting a model**. Its `nativeRouteVerified:false` is intentional. `install` writes only three wrappers in the specified output directory; it does not replace a live installation. Use the same fixed candidate copy of the workflow, adapter and skill bindings for one run. Run `node <workflowEntry> version` and `npm test` from the candidate before using it.
+
+## Pre-plan L1 bootstrap and coordinator observation
+
+`init` does not create a normal job for `$spec:execution-plan`. Before `plan`, create a private bootstrap request with a stable token. `promptPath` must tell L1 to read the current `plan-context <state>` result, parent spec and actual sub-issues, then author an `ExecutionPlan` JSON with `inputVersion` and `sourceVersion`. The adapter appends `decisionNativeId` and `evidencePath` from the native DSH session and its exact final response. Do not ask L1 to invent those proof fields. `plan` independently refreshes the sources and queries the DSH observer again.
+
+```json
+{
+  "schema": 1,
+  "token": "<stable-private-token>",
+  "jobId": "$spec:execution-plan",
+  "targetHost": "<configured-hostId>",
+  "requestedModel": "<configured-L1-route-ID>",
+  "worktree": "/absolute/entry-worktree",
+  "promptPath": "/absolute/private/l1-plan-prompt.txt",
+  "outputDirectory": "/absolute/private/new-plan-output-directory"
+}
+```
+
+```sh
+node <workflowEntry> plan-context <state> > /absolute/private/plan-context.json
+node <adapter>/dsh.mjs bootstrap <config.json> query <request.json>
+# Call start only after an authoritative not_found; keep the same token and request bytes on retries.
+node <adapter>/dsh.mjs bootstrap <config.json> start <request.json>
+node <adapter>/dsh.mjs bootstrap <config.json> collect <request.json>
+# When collect says completed, use its planPath:
+node <workflowEntry> plan <state> <returned-planPath>
+```
+
+The adapter persists the token, prompt bytes and route settings before spawning DSH. A lost `start` response is reconciled by `query` with the same request; it never launches a second session for that token. `collect` returns `planPath`, `planSha256`, `rawSha256`, native ID and raw usage only after a completed DSH process, one observed provider/model route, and matching plan/raw artifact hashes. Invalid or changed output stays `unknown`, preserving the native instance for inspection. Keep the private prompt, settings, output and runtime out of the repository and published evidence. This bootstrap starts an L1 planning session; it does not bypass the public `plan` validation.
+
+`SPEC_DELIVERY_MAIN_OBSERVER` is a separate trusted executable used only for `observe-main <state> <native-id>`. The supplied `codex-main-observer.mjs` reads the **actual current** Codex coordinator rollout selected by `CODEX_SESSION_ID` and `CODEX_THREAD_ID`, requires both IDs to match the requested native ID, and emits only provider/model, observation time and hashes of the session and latest turn metadata. It does not emit prompts or full logs. It rejects a subagent session, an arbitrary probe session, a missing rollout, or a different requested ID. Run `observe-main` from the real coordinator with its actual `CODEX_SESSION_ID`; when that environment or trusted native log is unavailable, leave main identity unknown and stop any acceptance that requires proof of a different main model. Ordinary DSH jobs and L1 plans continue to use `SPEC_DELIVERY_HOST_OBSERVER`.
 
 ## Dispatch, skills, and recovery
 
 After `init` and a real L1 `plan`, use `drive <state>` or `dispatch <state> <jobId>` with the three environment variables above. The workflow persists the token, attempt, target host and packet before calling `query`, then calls `start` only after an authoritative `not_found`. The adapter creates the token home and manifest before spawning DSH. `query` after a lost response returns the same native session; it cannot start a second session for the token. Once DSH emits a model event, the reply includes its native ID. The workflow immediately calls the session observer, checks the actual provider/model/context, binds that job, and collects each completed actor independently. The adapter returns raw DSH usage events and native times for the instance journal, including instances that fail binding.
 
-The installed DSH headless surface has no demonstrated same-context resume command. The adapter therefore reports `continuationSupported:false` and a genuinely new context ID for every launched actor. For an author or regular continuation, let the original actor invoke the bound `handoff` skill while it is available. The original handoff writes first to an OS temporary file; `skill-finish` archives those exact bytes. A separate L1 session then verifies the archived original with `context-handoff`; the next actor reads that reference. If the original actor is unavailable, use the workflow's `availability` observation and `context-reconstruct` path, including explicit unknowns. Do not claim a DSH context resume from matching `contextKey` text.
+The installed DSH headless surface has no demonstrated same-context resume command. The adapter therefore reports `continuationSupported:false` and a genuinely new context ID for every launched actor. For an author or regular continuation, let the original actor invoke the bound `handoff` skill while it is available. The original handoff writes first to an OS temporary file; `skill-finish` archives those exact bytes. A separate L1 session then verifies the archived original with `context-handoff`; the next actor reads that reference. If the original actor is unavailable, `context-reconstruct` requires a native `availability: unavailable` proof. This DSH headless adapter has no demonstrated interface that proves an actor cannot resume, so its `availability` call fails explicitly and reconstruction stops. Do not infer unavailability from a missing process, or claim a DSH context resume from matching `contextKey` text.
 
 For a bound skill, the actor calls the public `skill-start` command. DSH has no verified native explicit-skill registration, so this adapter advertises only `source_execution`. `skill-open` reads the archived skill bundle, checks every file hash, writes the original files into the actor-specific runtime directory, and prints `SKILL.md`; the actor must read and follow it, including `skill-delegate` / `skill-continue` for requested child work. `skill-complete` records the raw output from that actor. Only then can the observer issue the terminal `source_execution` receipt used by `skill-finish`. A resumed invocation reloads the same bundle under the replacement actor's identity; old actor load/completion records cannot satisfy the new receipt. Implement and handoff source files are read only and are never rewritten by this adapter.
 
@@ -61,6 +93,8 @@ On uncertainty, inspect `inspect <state>` and the adapter's token run home, then
 | Provider/model/native session and raw usage | Bounded real DSH actor observed one provider/model route and raw usage events | Every configured L1/L2/L3 route in a real round |
 | Source-loaded skill | Adapter contract plus one real DSH actor executing `skill-open` and `skill-complete`; the observer returned a terminal `source_execution` receipt and the actor returned valid Result JSON | Public workflow skill-start/finish during a full native role task, original implement/handoff run, and child-skill completion |
 | Native explicit skill call | Unsupported and not advertised | A real DSH registration API with verifiable source fingerprint |
+| Pre-plan L1 bootstrap | Adapter/CLI contract and one bounded real GLM native route probe with one session, matching provider/model, terminal plan and usage | Full spec plan authored against current GitHub sources in T21 |
+| Main coordinator observer | Actual Codex rollout metadata observer plus fixture CLI seam; ordinary jobs remain on DSH | Run from the real T21 coordinator session and verify model difference from L1 |
 | Same-context resume | Unsupported and not advertised | A documented DSH resume API plus native proof |
 | Handoff/new-context and formal receipt recovery | Core public CLI contract; this adapter reports a new context and supports independent repair packets | Native handoff/reconstruction and malformed receipt recovery in T21 |
 | Stop/process-tree reconciliation | Controlled adapter contract only | Real native process-group stop and full workflow reconcile |
